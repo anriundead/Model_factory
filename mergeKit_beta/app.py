@@ -540,9 +540,9 @@ def start_merge_evolutionary():
         "hf_subset_group": hf_subset_raw if hf_subset_raw in [g["id"] for g in (MMLU_SUBSET_GROUPS + CMMMU_SUBSET_GROUPS)] else "",  # 领域 id（如 stem），供本地按领域目录加载
         "hf_split": data.get("hf_split", "test"),
         "hf_split_final": (data.get("hf_split_final") or "").strip() or None,  # 最终评测用 split，如 test
-        "pop_size": int(data.get("pop_size", 20)),
-        "n_iter": int(data.get("n_iter", 15)),
-        "max_samples": int(data.get("max_samples", 64)),
+        "pop_size": max(2, min(128, int(data.get("pop_size", 20)))),
+        "n_iter": max(1, min(50, int(data.get("n_iter", 15)))),
+        "max_samples": max(4, min(512, int(data.get("max_samples", 64)))),
         "dtype": data.get("dtype", "bfloat16"),
         "ray_num_gpus": int(data.get("ray_num_gpus", 1)),
         "created_at": created_at,
@@ -1212,6 +1212,126 @@ def api_recipes_apply():
         task_queue.put((PRIORITY_MAP.get(data.get("priority", "common"), 10), created_at, task_id, task_data))
     _app_logger.info("[API] 提交配方应用 task_id=%s recipe_id=%s", task_id, recipe_id)
     return jsonify({"status": "success", "task_id": task_id})
+
+
+@app.route("/api/search", methods=["GET"])
+def api_search():
+    """搜索功能：支持按任务ID、配方、模型名称搜索融合记录和配方。"""
+    query = (request.args.get("q") or "").strip().lower()
+    if not query:
+        return jsonify({"status": "error", "message": "缺少搜索关键词"}), 400
+
+    results = {"recipes": [], "tasks": [], "models": []}
+
+    # 搜索配方
+    if os.path.isdir(RECIPES_DIR):
+        for f in os.listdir(RECIPES_DIR):
+            if not f.endswith(".json"):
+                continue
+            recipe_id = os.path.splitext(f)[0]
+            if query in recipe_id.lower():
+                try:
+                    path = os.path.join(RECIPES_DIR, f)
+                    with open(path, "r", encoding="utf-8") as fp:
+                        r = json.load(fp)
+                    r["recipe_id"] = recipe_id
+                    if query in (r.get("custom_name") or "").lower() or query in (r.get("task_id") or "").lower():
+                        results["recipes"].append(r)
+                except Exception:
+                    continue
+
+    # 搜索任务记录
+    if os.path.isdir(MERGE_DIR):
+        for tid in os.listdir(MERGE_DIR):
+            if query not in tid.lower():
+                continue
+            meta_path = os.path.join(MERGE_DIR, tid, "metadata.json")
+            if not os.path.isfile(meta_path):
+                continue
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                if query in (meta.get("custom_name") or "").lower() or query in tid.lower():
+                    meta["task_id"] = tid
+                    # 读取进度信息
+                    progress_path = os.path.join(MERGE_DIR, tid, "progress.json")
+                    if os.path.isfile(progress_path):
+                        try:
+                            with open(progress_path, "r", encoding="utf-8") as pf:
+                                prog = json.load(pf)
+                            meta["evolution_progress"] = {
+                                "step": prog.get("step", 0),
+                                "current_best": prog.get("current_best"),
+                                "global_best": prog.get("global_best"),
+                                "best_genotype": prog.get("best_genotype"),
+                            }
+                        except Exception:
+                            pass
+                    results["tasks"].append(meta)
+            except Exception:
+                continue
+
+    # 搜索模型仓库（通过模型名称）
+    try:
+        repo_models = _model_repo_list()
+        for m in repo_models:
+            name = (m.get("name") or "").lower()
+            if query in name:
+                results["models"].append(m)
+    except Exception:
+        pass
+
+    return jsonify({"status": "success", "query": query, "results": results})
+
+
+@app.route("/api/fusion_history", methods=["GET"])
+def api_fusion_history():
+    """获取所有完全融合任务的历史记录，包含性能指标。"""
+    history = []
+    if not os.path.isdir(MERGE_DIR):
+        return jsonify({"status": "success", "history": history})
+
+    for tid in os.listdir(MERGE_DIR):
+        meta_path = os.path.join(MERGE_DIR, tid, "metadata.json")
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            # 只返回完全融合任务
+            if meta.get("type") != "merge_evolutionary":
+                continue
+            meta["task_id"] = tid
+            # 读取进度信息（包含 current_best, global_best）
+            progress_path = os.path.join(MERGE_DIR, tid, "progress.json")
+            if os.path.isfile(progress_path):
+                try:
+                    with open(progress_path, "r", encoding="utf-8") as pf:
+                        prog = json.load(pf)
+                    meta["evolution_progress"] = {
+                        "step": prog.get("step", 0),
+                        "current_best": prog.get("current_best"),
+                        "global_best": prog.get("global_best"),
+                        "best_genotype": prog.get("best_genotype"),
+                    }
+                except Exception:
+                    pass
+            # 检查是否有配方
+            recipe_path = os.path.join(RECIPES_DIR, "%s.json" % tid)
+            meta["has_recipe"] = os.path.isfile(recipe_path)
+            history.append(meta)
+        except Exception:
+            continue
+
+    # 按创建时间倒序
+    history.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+    return jsonify({"status": "success", "history": history})
+
+
+@app.route("/fusion_history")
+def fusion_history_page():
+    """融合历史页面路由。"""
+    return render_template("fusion_history.html")
 
 
 if __name__ == "__main__":

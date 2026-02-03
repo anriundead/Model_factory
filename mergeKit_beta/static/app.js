@@ -1121,9 +1121,9 @@ function setupEvolutionaryMerge() {
             return;
         }
         const customName = (document.getElementById('evolutionary-custom-name') && document.getElementById('evolutionary-custom-name').value.trim()) || ('进化融合-' + Date.now());
-        const popSize = parseInt(document.getElementById('evolutionary-pop-size')?.value || 20, 10);
-        const nIter = parseInt(document.getElementById('evolutionary-n-iter')?.value || 15, 10);
-        const maxSamples = parseInt(document.getElementById('evolutionary-max-samples')?.value || 64, 10);
+        const popSize = Math.max(2, Math.min(128, parseInt(document.getElementById('evolutionary-pop-size')?.value, 10) || 20));
+        const nIter = Math.max(1, Math.min(50, parseInt(document.getElementById('evolutionary-n-iter')?.value, 10) || 15));
+        const maxSamples = Math.max(4, Math.min(512, parseInt(document.getElementById('evolutionary-max-samples')?.value, 10) || 64));
         const datasetType = document.getElementById('evolutionary-dataset-type')?.value || 'mmlu';
         const hfSubsetGroup = document.getElementById('evolutionary-mmlu-subset')?.value || (datasetType === 'cmmmu' ? 'health_medicine' : 'biology_medicine');
         const customHfInput = document.getElementById('evolutionary-hf-dataset-input');
@@ -1192,6 +1192,8 @@ function setupEvolutionaryMerge() {
                     if (pctEl) pctEl.textContent = '100%';
                     if (stageEl) stageEl.textContent = '';
                     loadHistoryList();
+                    // 显示完成弹窗
+                    showTaskCompletionModal(data.task_id, s, evo);
                     return;
                 }
                 if (s.status === 'error') {
@@ -1207,10 +1209,19 @@ function setupEvolutionaryMerge() {
                 const nIter = od.n_iter || 15;
                 const popSize = od.pop_size || 20;
                 const totalSteps = Math.max(1, nIter * popSize * 2);
-                const pct = Math.min(100, Math.round((step / totalSteps) * 100));
+                // 进度条更新：如果step为0但任务在运行，使用时间估算或显示最小进度
+                let pct = 0;
+                if (step > 0) {
+                    pct = Math.min(100, Math.round((step / totalSteps) * 100));
+                } else if (s.status === 'running' || s.status === 'queued') {
+                    // 任务运行中但step未更新：使用轮询次数估算最小进度（避免一直0%）
+                    const minProgress = Math.min(5, Math.floor(pollCount / 10)); // 每10次轮询+1%，最多5%
+                    pct = minProgress;
+                }
                 if (fillEl) fillEl.style.width = pct + '%';
                 if (pctEl) pctEl.textContent = pct + '%';
-                if (stageEl) stageEl.textContent = '步骤 ' + step + ' / ~' + totalSteps + (evo.current_best != null ? ' · 当前最优 acc: ' + Number(evo.current_best).toFixed(4) : '');
+                const stepText = step > 0 ? ('步骤 ' + step + ' / ~' + totalSteps) : (s.status === 'running' ? '运行中...' : '等待中...');
+                if (stageEl) stageEl.textContent = stepText + (evo.current_best != null ? ' · 当前最优 acc: ' + Number(evo.current_best).toFixed(4) : '');
                 pollCount++;
                 if (pollCount < 3600) setTimeout(poll, 1000);
             };
@@ -1319,6 +1330,8 @@ function setupRecipeApply() {
                     if (pctEl) pctEl.textContent = '100%';
                     if (stageEl) stageEl.textContent = '';
                     loadHistoryList();
+                    // 显示完成弹窗
+                    showTaskCompletionModal(data.task_id, s, {});
                     return;
                 }
                 if (s.status === 'error') {
@@ -1867,4 +1880,84 @@ function initPageDropdowns() {
             }
         });
     });
+}
+
+// ===================== 任务完成弹窗 =====================
+async function showTaskCompletionModal(taskId, statusData, evoProgress) {
+    const overlay = document.getElementById('task-completion-modal-overlay');
+    const taskIdEl = document.getElementById('completion-task-id');
+    const recipeStatusEl = document.getElementById('completion-recipe-status');
+    const modelPathEl = document.getElementById('completion-model-path');
+    const metricsEl = document.getElementById('completion-metrics');
+    const closeBtn = document.getElementById('completion-close');
+    if (!overlay || !taskIdEl) return;
+
+    taskIdEl.textContent = taskId || '未知';
+
+    // 检查配方是否保存
+    try {
+        const recipeRes = await fetch(`/api/recipes/${taskId}`);
+        const recipeData = await recipeRes.json();
+        if (recipeData.status === 'success' && recipeData.recipe) {
+            recipeStatusEl.textContent = '✓ 已保存到 recipes/' + taskId + '.json';
+            recipeStatusEl.style.color = 'var(--success)';
+        } else {
+            recipeStatusEl.textContent = '✗ 未找到配方文件';
+            recipeStatusEl.style.color = 'var(--apple-gray)';
+        }
+    } catch (e) {
+        recipeStatusEl.textContent = '? 无法检查配方状态';
+        recipeStatusEl.style.color = 'var(--apple-gray)';
+    }
+
+    // 获取模型路径
+    try {
+        const detailRes = await fetch(`/api/history/${taskId}`);
+        const detailData = await detailRes.json();
+        if (detailData.status === 'success' && detailData.data) {
+            const outputPath = detailData.data.metrics?.output_path || detailData.data.output_path;
+            if (outputPath) {
+                modelPathEl.textContent = outputPath;
+            } else {
+                modelPathEl.textContent = 'merges/' + taskId + '/output';
+            }
+        } else {
+            modelPathEl.textContent = 'merges/' + taskId + '/output';
+        }
+    } catch (e) {
+        modelPathEl.textContent = 'merges/' + taskId + '/output';
+    }
+
+    // 显示性能指标（如果是完全融合）
+    if (evoProgress && (evoProgress.current_best != null || evoProgress.global_best != null)) {
+        let metricsHtml = '<div style="font-weight: 500; margin-bottom: 8px;">性能指标:</div>';
+        if (evoProgress.current_best != null) {
+            metricsHtml += '<div style="margin-bottom: 6px;">当前最优准确率: <strong>' + Number(evoProgress.current_best).toFixed(4) + '</strong></div>';
+        }
+        if (evoProgress.global_best != null) {
+            metricsHtml += '<div style="margin-bottom: 6px;">全局最优准确率: <strong>' + Number(evoProgress.global_best).toFixed(4) + '</strong></div>';
+        }
+        metricsEl.innerHTML = metricsHtml;
+        metricsEl.style.display = 'block';
+    } else {
+        metricsEl.style.display = 'none';
+    }
+
+    // 显示弹窗
+    overlay.style.display = 'flex';
+    overlay.classList.add('show');
+
+    // 关闭按钮
+    if (closeBtn) {
+        closeBtn.onclick = () => {
+            overlay.style.display = 'none';
+            overlay.classList.remove('show');
+        };
+    }
+    overlay.onclick = (e) => {
+        if (e.target === overlay) {
+            overlay.style.display = 'none';
+            overlay.classList.remove('show');
+        }
+    };
 }

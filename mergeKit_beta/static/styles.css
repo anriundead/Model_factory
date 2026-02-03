@@ -117,9 +117,9 @@ body {
    2. Main Application Structure
    ========================================= */
 .container {
-    max-width: 1200px;
+    max-width: 1440px;
     margin: 0 auto;
-    padding: 0 20px 60px;
+    padding: 0 24px 60px;
     min-height: 100vh;
     transform-origin: center top;
 }
@@ -566,25 +566,57 @@ h3 {
     }
 }
 
-/* 完全融合：工作台与参数并列 */
+/* 完全融合：工作台与参数并列，右侧参数区固定宽度避免被遮挡 */
 .evolutionary-main-layout {
     display: flex;
-    gap: 24px;
+    gap: 36px;
     align-items: flex-start;
     flex-wrap: wrap;
 }
 .evolutionary-left {
-    flex: 1 1 50%;
+    flex: 1 1 0%;
     min-width: 320px;
+    max-width: 680px;
+}
+.evolutionary-left .two-column-layout {
+    gap: 28px;
+}
+.evolutionary-left .section.apple-card {
+    padding: 24px 28px;
+}
+.evolutionary-left .section-header {
+    margin-bottom: 18px;
+}
+/* 融合工作台：更大拖放区与已选列表间距 */
+.evolutionary-left .dropzone {
+    min-height: 260px;
+    padding: 24px;
+}
+.evolutionary-left .dropzone-content {
+    padding: 24px 16px;
+}
+#evolutionary-selected-list.selected-models {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    margin-top: 16px;
+    padding: 0;
+}
+.evolutionary-left .selected-model-item {
+    margin: 0;
+    padding: 14px 18px;
+    border-radius: 14px;
+    font-size: 0.95rem;
 }
 .evolutionary-right {
-    flex: 0 1 380px;
-    min-width: 280px;
+    flex: 0 0 440px;
+    min-width: 440px;
+    overflow: visible;
 }
 .params-form-evolutionary {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 12px 20px;
+    gap: 18px 24px;
     margin-top: 0;
 }
 .params-form-evolutionary .form-group {
@@ -595,21 +627,21 @@ h3 {
 }
 .params-form-evolutionary .btn {
     grid-column: 1 / -1;
-    margin-top: 8px;
+    margin-top: 12px;
 }
 /* 完全融合：字体与间距微调，减轻拥挤 */
 .evolutionary-main-layout .form-group label,
 .evolutionary-right .form-group label {
     font-size: 0.95rem;
-    margin-bottom: 6px;
+    margin-bottom: 8px;
 }
 .evolutionary-right .ios-select-trigger,
 .evolutionary-right .ios-input {
     font-size: 0.95rem;
-    padding: 10px 12px;
+    padding: 12px 14px;
 }
 .params-form-evolutionary {
-    gap: 14px 20px;
+    gap: 18px 24px;
 }
 .dataset-search-row {
     display: flex;
@@ -624,12 +656,71 @@ h3 {
     padding: 8px 14px;
     font-size: 0.9rem;
 }
-@media (max-width: 900px) {
+/* 完全融合：种群/迭代/样本量改为手动输入 + 推荐范围提示 */
+.evolutionary-number-input {
+    position: relative;
+}
+.evolutionary-number-input .param-hint {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--apple-gray);
+    margin-top: 6px;
+    margin-bottom: 0;
+}
+.evolutionary-number-input .ios-input {
+    margin-bottom: 0;
+}
+/* 按配方融合：独立区块，留白充足 */
+.recipe-apply-block {
+    margin-top: 28px;
+    padding-top: 24px;
+    border-top: 1px solid var(--apple-border);
+    grid-column: 1 / -1;
+}
+.recipe-apply-label {
+    display: block;
+    font-size: 0.95rem;
+    font-weight: 500;
+    color: var(--apple-dark);
+    margin-bottom: 8px;
+}
+.recipe-apply-desc {
+    font-size: 0.88rem;
+    color: var(--apple-gray);
+    margin-bottom: 20px;
+    line-height: 1.5;
+}
+.recipe-apply-row {
+    margin-bottom: 16px;
+}
+.recipe-apply-row:last-child {
+    margin-bottom: 0;
+}
+.recipe-apply-select {
+    width: 100%;
+    margin: 0;
+}
+.recipe-apply-name {
+    width: 100%;
+}
+.recipe-apply-actions {
+    margin-top: 20px;
+    padding-top: 8px;
+}
+.recipe-apply-actions .btn {
+    min-width: 140px;
+}
+@media (max-width: 1024px) {
     .evolutionary-main-layout {
         flex-direction: column;
     }
+    .evolutionary-left {
+        max-width: none;
+    }
     .evolutionary-right {
         flex: 1 1 100%;
+        min-width: 0;
+        width: 100%;
     }
 }
 
@@ -666,6 +757,33 @@ h3 {
 
 .models-grid::-webkit-scrollbar-thumb:hover {
     background-color: #86868b; /* 悬停变深 */
+}
+
+/* 完全融合·模型池：更高、更疏，名称完整显示 */
+.evolutionary-models-pool.models-grid,
+#evolutionary-models-container.models-grid {
+    max-height: 320px;
+    gap: 20px;
+    padding: 18px 14px 18px 18px;
+}
+.evolutionary-left .model-card {
+    padding: 20px 22px;
+    min-height: 76px;
+    text-align: left;
+}
+.evolutionary-left .model-card h4 {
+    font-size: 1rem;
+    line-height: 1.4;
+    white-space: normal;
+    word-break: break-word;
+    margin-bottom: 8px;
+}
+.evolutionary-left .model-card p {
+    font-size: 0.82rem;
+}
+.evolutionary-left .limit-desc {
+    margin-top: 14px;
+    margin-bottom: 0;
 }
 
 .model-card {

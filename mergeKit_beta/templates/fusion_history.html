@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>融合历史 - Mergenetic Pro</title>
+    <link rel="stylesheet" href="https://font.sec.miui.com/font/css?family=MiSans:200,300,400,500,600,700&display=swap">
+    <link rel="stylesheet" href="static/styles.css">
+    <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/misans-webfont/misans-style.css" />
+    <link rel="icon" type="image/x-icon" href="static/favicon.ico">
+</head>
+<body>
+    <header class="sticky-header">
+        <div class="header-content">
+            <div class="header-left-group">
+                <button id="menu-btn" class="icon-btn">
+                    <i class="ri-menu-line"></i>
+                </button>
+                <div class="logo">Mergenetic <span class="badge">Pro</span></div>
+            </div>
+            <nav>
+                <span class="status-dot"></span> <span class="status-word">System Ready</span>
+            </nav>
+        </div>
+    </header>
+
+    <aside id="history-sidebar" class="sidebar">
+        <div class="sidebar-header">
+            <h3>工程菜单</h3> <button id="close-sidebar"><i class="ri-close-line"></i></button>
+        </div>
+        <nav class="sidebar-nav">
+            <a href="/" class="nav-item">
+                <i class="ri-git-merge-line"></i>
+                <span>模型融合</span>
+            </a>
+            <a href="/fusion_history" class="nav-item active">
+                <i class="ri-history-line"></i>
+                <span>融合历史</span>
+            </a>
+            <a href="/model_repo" class="nav-item">
+                <i class="ri-archive-line"></i>
+                <span>模型仓库</span>
+            </a>
+        </nav>
+    </aside>
+    <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+    <div class="container" style="padding-top: 40px;">
+        <div class="page-header">
+            <h2>融合历史</h2>
+            <p class="page-subtitle">查看所有完全融合任务的性能指标和配方</p>
+        </div>
+
+        <div class="section apple-card" style="margin-bottom: 24px;">
+            <div class="section-header">
+                <h3>搜索</h3>
+                <span class="helper-text">Search</span>
+            </div>
+            <div style="display: flex; gap: 12px; align-items: center;">
+                <input type="text" id="search-input" class="ios-input" placeholder="搜索任务ID、配方、模型名称..." style="flex: 1;">
+                <button id="search-btn" class="btn btn-primary">
+                    <i class="ri-search-line"></i> 搜索
+                </button>
+            </div>
+            <div id="search-results" style="margin-top: 16px; display: none;"></div>
+        </div>
+
+        <div class="section apple-card">
+            <div class="section-header">
+                <h3>历史记录</h3>
+                <span class="helper-text">Fusion History</span>
+            </div>
+            <div id="history-container">
+                <div class="loading-state">
+                    <div class="spinner"></div>
+                    <p>正在加载历史记录...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            loadFusionHistory();
+            setupSearch();
+            setupSidebar();
+        });
+
+        async function loadFusionHistory() {
+            const container = document.getElementById('history-container');
+            try {
+                const res = await fetch('/api/fusion_history');
+                const data = await res.json();
+                if (data.status !== 'success') {
+                    container.innerHTML = '<p class="limit-desc">加载失败</p>';
+                    return;
+                }
+                const history = data.history || [];
+                if (history.length === 0) {
+                    container.innerHTML = '<p class="limit-desc">暂无融合历史记录</p>';
+                    return;
+                }
+                container.innerHTML = history.map(task => {
+                    const evo = task.evolution_progress || {};
+                    const customName = task.custom_name || '未命名任务';
+                    const taskId = task.task_id || '未知';
+                    const status = task.status || 'unknown';
+                    const createdAt = task.created_at ? new Date(task.created_at * 1000).toLocaleString('zh-CN') : '未知时间';
+                    const currentBest = evo.current_best != null ? Number(evo.current_best).toFixed(4) : '—';
+                    const globalBest = evo.global_best != null ? Number(evo.global_best).toFixed(4) : '—';
+                    const step = evo.step || 0;
+                    const hasRecipe = task.has_recipe ? '✓' : '✗';
+                    return `
+                        <div class="history-item" style="padding: 20px; border-bottom: 1px solid var(--apple-border);">
+                            <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 12px;">
+                                <div>
+                                    <h4 style="margin: 0 0 4px 0; font-size: 1.1rem;">${customName}</h4>
+                                    <p style="margin: 0; color: var(--apple-gray); font-size: 0.85rem;">任务ID: ${taskId} · ${createdAt}</p>
+                                </div>
+                                <span style="padding: 4px 12px; border-radius: 12px; font-size: 0.85rem; background: ${status === 'success' ? 'rgba(52, 199, 89, 0.15)' : status === 'error' ? 'rgba(255, 59, 48, 0.15)' : 'rgba(142, 142, 147, 0.15)'}; color: ${status === 'success' ? 'var(--success)' : status === 'error' ? 'var(--error)' : 'var(--apple-gray)'};">
+                                    ${status === 'success' ? '成功' : status === 'error' ? '失败' : status}
+                                </span>
+                            </div>
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 16px;">
+                                <div>
+                                    <div style="font-size: 0.85rem; color: var(--apple-gray); margin-bottom: 4px;">当前最优准确率</div>
+                                    <div style="font-size: 1.2rem; font-weight: 600;">${currentBest}</div>
+                                </div>
+                                <div>
+                                    <div style="font-size: 0.85rem; color: var(--apple-gray); margin-bottom: 4px;">全局最优准确率</div>
+                                    <div style="font-size: 1.2rem; font-weight: 600;">${globalBest}</div>
+                                </div>
+                                <div>
+                                    <div style="font-size: 0.85rem; color: var(--apple-gray); margin-bottom: 4px;">完成步骤</div>
+                                    <div style="font-size: 1.2rem; font-weight: 600;">${step}</div>
+                                </div>
+                                <div>
+                                    <div style="font-size: 0.85rem; color: var(--apple-gray); margin-bottom: 4px;">配方状态</div>
+                                    <div style="font-size: 1.2rem; font-weight: 600;">${hasRecipe}</div>
+                                </div>
+                            </div>
+                            ${task.model_paths && task.model_paths.length > 0 ? `
+                                <div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--apple-border);">
+                                    <div style="font-size: 0.85rem; color: var(--apple-gray); margin-bottom: 4px;">父模型</div>
+                                    <div style="font-size: 0.9rem;">${task.model_paths.map(p => p.split(/[/\\]/).pop()).join(' + ')}</div>
+                                </div>
+                            ` : ''}
+                        </div>
+                    `;
+                }).join('');
+            } catch (e) {
+                container.innerHTML = '<p class="limit-desc">加载失败: ' + e.message + '</p>';
+            }
+        }
+
+        function setupSearch() {
+            const input = document.getElementById('search-input');
+            const btn = document.getElementById('search-btn');
+            const results = document.getElementById('search-results');
+            const doSearch = async () => {
+                const q = (input.value || '').trim();
+                if (!q) {
+                    results.style.display = 'none';
+                    return;
+                }
+                try {
+                    const res = await fetch('/api/search?q=' + encodeURIComponent(q));
+                    const data = await res.json();
+                    if (data.status !== 'success') {
+                        results.innerHTML = '<p>搜索失败</p>';
+                        results.style.display = 'block';
+                        return;
+                    }
+                    const r = data.results || {};
+                    let html = '<div style="font-weight: 500; margin-bottom: 12px;">搜索结果:</div>';
+                    if (r.recipes && r.recipes.length > 0) {
+                        html += '<div style="margin-bottom: 16px;"><strong>配方 (' + r.recipes.length + ')</strong></div>';
+                        r.recipes.forEach(recipe => {
+                            html += '<div style="padding: 8px 0; border-bottom: 1px solid var(--apple-border);">' + (recipe.custom_name || recipe.recipe_id) + '</div>';
+                        });
+                    }
+                    if (r.tasks && r.tasks.length > 0) {
+                        html += '<div style="margin-bottom: 16px; margin-top: 16px;"><strong>任务 (' + r.tasks.length + ')</strong></div>';
+                        r.tasks.forEach(task => {
+                            html += '<div style="padding: 8px 0; border-bottom: 1px solid var(--apple-border);">' + (task.custom_name || task.task_id) + '</div>';
+                        });
+                    }
+                    if (r.models && r.models.length > 0) {
+                        html += '<div style="margin-bottom: 16px; margin-top: 16px;"><strong>模型 (' + r.models.length + ')</strong></div>';
+                        r.models.forEach(model => {
+                            html += '<div style="padding: 8px 0; border-bottom: 1px solid var(--apple-border);">' + (model.name || '未知') + '</div>';
+                        });
+                    }
+                    if (!r.recipes?.length && !r.tasks?.length && !r.models?.length) {
+                        html = '<p>未找到相关结果</p>';
+                    }
+                    results.innerHTML = html;
+                    results.style.display = 'block';
+                } catch (e) {
+                    results.innerHTML = '<p>搜索失败: ' + e.message + '</p>';
+                    results.style.display = 'block';
+                }
+            };
+            if (btn) btn.addEventListener('click', doSearch);
+            if (input) input.addEventListener('keypress', (e) => { if (e.key === 'Enter') doSearch(); });
+        }
+
+        function setupSidebar() {
+            const sidebar = document.getElementById('history-sidebar');
+            const overlay = document.getElementById('sidebar-overlay');
+            const menuBtn = document.getElementById('menu-btn');
+            const closeBtn = document.getElementById('close-sidebar');
+            const openSidebar = () => {
+                if (sidebar) sidebar.classList.add('open');
+                if (overlay) overlay.classList.add('show');
+            };
+            const closeSidebar = () => {
+                if (sidebar) sidebar.classList.remove('open');
+                if (overlay) overlay.classList.remove('show');
+            };
+            if (menuBtn) menuBtn.addEventListener('click', openSidebar);
+            if (closeBtn) closeBtn.addEventListener('click', closeSidebar);
+            if (overlay) overlay.addEventListener('click', closeSidebar);
+        }
+    </script>
+</body>
+</html>
