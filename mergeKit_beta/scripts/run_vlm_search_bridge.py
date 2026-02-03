@@ -98,6 +98,46 @@ def main():
     logger.info("桥接日志: %s", bridge_log_path)
     logger.info("-" * 80)
 
+    # 数据集验证：在启动 run_vlm_search.py 前验证数据集是否可以成功加载
+    logger.info("验证数据集加载...")
+    try:
+        # 导入数据集加载函数（与 run_vlm_search.py 使用相同的逻辑）
+        sys.path.insert(0, VLM_SEARCH_DIR)
+        from run_vlm_search import _load_mmlu_samples_one_split
+        cache_dir = os.environ.get("HF_DATASETS_CACHE") or (getattr(Config, "HF_DATASETS_CACHE", None) or None)
+        hf_subset_group = meta.get("hf_subset_group", "").strip()
+        test_samples = _load_mmlu_samples_one_split(
+            hf_dataset,
+            hf_subsets,
+            hf_split,
+            max_samples=min(4, max_samples) if max_samples else 4,  # 只加载少量样本用于验证
+            seed=42,
+            cache_dir=cache_dir,
+            hf_subset_group=hf_subset_group,
+        )
+        if not test_samples or len(test_samples) == 0:
+            logger.error("数据集验证失败: 无法加载任何样本 (数据集=%s, 子集=%s, 分割=%s)", hf_dataset, hf_subsets, hf_split)
+            with open(progress_path, "w", encoding="utf-8") as f:
+                json.dump({"status": "error", "message": f"数据集验证失败: 无法加载样本 (数据集={hf_dataset}, 子集={hf_subsets}, 分割={hf_split})"}, f, ensure_ascii=False)
+            sys.exit(1)
+        logger.info("数据集验证成功: 成功加载 %d 个样本 (验证用样本数)", len(test_samples))
+        # 验证样本结构
+        sample_keys = set(test_samples[0].keys()) if test_samples else set()
+        required_keys = {"question", "choices", "answer"}
+        missing_keys = required_keys - sample_keys
+        if missing_keys:
+            logger.warning("数据集样本缺少部分字段: %s (现有字段: %s)", missing_keys, sample_keys)
+        else:
+            logger.info("数据集样本结构验证通过 (包含必要字段: question, choices, answer)")
+    except ImportError as e:
+        logger.warning("无法导入数据集加载函数进行验证: %s (将跳过验证)", e)
+    except Exception as e:
+        logger.error("数据集验证过程出错: %s", e)
+        logger.exception("数据集验证异常详情:")
+        with open(progress_path, "w", encoding="utf-8") as f:
+            json.dump({"status": "error", "message": f"数据集验证失败: {str(e)}"}, f, ensure_ascii=False)
+        sys.exit(1)
+
     if not os.path.isfile(RUN_VLM_SEARCH_PY):
         logger.error("run_vlm_search.py 不存在: %s (可设置 VLM_SEARCH_DIR)", RUN_VLM_SEARCH_PY)
         sys.exit(1)
@@ -157,6 +197,13 @@ def main():
         )
         logger.info("子进程已启动，PID: %s", proc.pid)
         out_lines = []
+        # 用于解析进度信息和计算 ETA
+        import re
+        import time as time_module
+        eval_times = []  # 记录每次评估的耗时
+        last_step = 0
+        start_time = time_module.time()
+        
         while True:
             line = proc.stdout.readline() if proc.stdout else ""
             if not line and proc.poll() is not None:
@@ -165,6 +212,58 @@ def main():
                 out_lines.append(line)
                 sys.stdout.write(line)
                 sys.stdout.flush()
+                
+                # 解析评估日志：提取 step 和耗时信息
+                # 格式示例: "[eval] step=1 acc=0.1250 best_acc=0.1250 genotype=[...]"
+                # 或: "[eval-print] step=1 pid=12345 cuda_visible=0,1 genotype=[...]"
+                eval_match = re.search(r'\[eval\]\s+step=(\d+).*?acc=([\d.]+)', line)
+                if eval_match:
+                    current_step = int(eval_match.group(1))
+                    if current_step > last_step:
+                        # 计算本次评估的耗时（基于时间差）
+                        current_time = time_module.time()
+                        if last_step > 0:
+                            elapsed = current_time - start_time
+                            avg_time_per_step = elapsed / current_step if current_step > 0 else 0
+                            eval_times.append(avg_time_per_step)
+                        last_step = current_step
+                
+                # 尝试解析 ETA 信息（如果 run_vlm_search.py 输出）
+                eta_match = re.search(r'eta[=:]?\s*([\d.]+)\s*(s|sec|second)', line, re.IGNORECASE)
+                if eta_match:
+                    eta_seconds = float(eta_match.group(1))
+                    # 更新 progress.json 中的 ETA
+                    try:
+                        with open(progress_path, "r", encoding="utf-8") as pf:
+                            prog = json.load(pf)
+                        prog["eta_seconds"] = eta_seconds
+                        prog["estimated_completion"] = time_module.time() + eta_seconds
+                        with open(progress_path, "w", encoding="utf-8") as pf:
+                            json.dump(prog, pf, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+                
+                # 基于评估次数和平均耗时计算 ETA（如果没有直接输出）
+                if last_step > 0 and len(eval_times) > 0:
+                    avg_eval_time = sum(eval_times[-min(5, len(eval_times)):]) / min(5, len(eval_times))  # 使用最近5次的平均
+                    total_expected_steps = pop_size * n_iter  # 估算总步数
+                    remaining_steps = max(0, total_expected_steps - last_step)
+                    estimated_eta = avg_eval_time * remaining_steps
+                    
+                    # 每10步更新一次 progress.json 中的 ETA
+                    if last_step % 10 == 0 or last_step == 1:
+                        try:
+                            with open(progress_path, "r", encoding="utf-8") as pf:
+                                prog = json.load(pf)
+                            prog["eta_seconds"] = estimated_eta
+                            prog["estimated_completion"] = time_module.time() + estimated_eta
+                            prog["current_step"] = last_step
+                            prog["total_expected_steps"] = total_expected_steps
+                            with open(progress_path, "w", encoding="utf-8") as pf:
+                                json.dump(prog, pf, ensure_ascii=False, indent=2)
+                        except Exception:
+                            pass
+        
         proc.wait()
         if proc.returncode != 0:
             tail = "".join(out_lines[-50:]) if len(out_lines) > 50 else "".join(out_lines)
@@ -284,6 +383,46 @@ def main():
             except OSError:
                 shutil.copytree(named_dir, output_dir)
                 logger.info("已复制命名目录到 output（无符号链接时回退）")
+
+            # 清理中间模型目录：final_vlm 已复制到命名目录，可以删除
+            if os.path.isdir(final_vlm_output):
+                try:
+                    shutil.rmtree(final_vlm_output, ignore_errors=True)
+                    logger.info("已清理中间模型目录: %s", final_vlm_output)
+                except Exception as e:
+                    logger.warning("清理中间模型目录失败（可忽略）: %s", e)
+        else:
+            # 如果 final_vlm_output 不存在或为空，记录日志
+            if not os.path.isdir(final_vlm_output):
+                logger.warning("final_vlm_output 目录不存在: %s", final_vlm_output)
+            elif not os.listdir(final_vlm_output):
+                logger.warning("final_vlm_output 目录为空: %s", final_vlm_output)
+                # 即使为空也尝试清理
+                try:
+                    shutil.rmtree(final_vlm_output, ignore_errors=True)
+                    logger.info("已清理空的中间模型目录: %s", final_vlm_output)
+                except Exception as e:
+                    logger.warning("清理空目录失败（可忽略）: %s", e)
+
+        # 无论是否进入上面的 if 块，都尝试清理 final_vlm（如果存在且有命名目录）
+        if os.path.isdir(final_vlm_output):
+            # 检查是否有命名目录（表示任务已完成）
+            has_named_dir = False
+            for item in os.listdir(merge_dir):
+                if item.startswith("_") or item in ["final_vlm", "output", "metadata.json", "progress.json", "bridge.log"]:
+                    continue
+                item_path = os.path.join(merge_dir, item)
+                if os.path.isdir(item_path) and not os.path.islink(item_path):
+                    # 检查是否是命名目录（包含时间戳格式或长度较长）
+                    if "_202" in item or len(item) > 50:
+                        has_named_dir = True
+                        break
+            if has_named_dir:
+                try:
+                    shutil.rmtree(final_vlm_output, ignore_errors=True)
+                    logger.info("已清理中间模型目录（后置检查）: %s", final_vlm_output)
+                except Exception as e:
+                    logger.warning("后置清理中间模型目录失败（可忽略）: %s", e)
 
         try:
             with open(meta_path, "r", encoding="utf-8") as f:

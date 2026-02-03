@@ -110,6 +110,32 @@
                     const currentBest = evo.current_best != null ? Number(evo.current_best).toFixed(4) : '—';
                     const globalBest = evo.global_best != null ? Number(evo.global_best).toFixed(4) : '—';
                     const step = evo.step || 0;
+                    const currentStep = evo.current_step || step;
+                    const totalExpectedSteps = evo.total_expected_steps;
+                    // 计算迭代次数：step / pop_size（向上取整）
+                    const popSize = task.pop_size || 20;
+                    const nIter = task.n_iter || 15;
+                    const completedIterations = popSize > 0 ? Math.ceil(currentStep / popSize) : 0;
+                    const expectedIterations = nIter;
+                    // 显示格式：如果知道总步数，显示 "评估次数/总评估次数 (迭代次数/总迭代次数)"
+                    let stepDisplay = '';
+                    if (currentStep > 0) {
+                        if (totalExpectedSteps && totalExpectedSteps > 0) {
+                            stepDisplay = `${currentStep}/${totalExpectedSteps} 次评估`;
+                            if (completedIterations > 0 && expectedIterations > 0) {
+                                stepDisplay += ` (${completedIterations}/${expectedIterations} 迭代)`;
+                            }
+                        } else {
+                            stepDisplay = `${currentStep} 次评估`;
+                            if (completedIterations > 0 && expectedIterations > 0) {
+                                stepDisplay += ` (${completedIterations}/${expectedIterations} 迭代)`;
+                            } else if (completedIterations > 0) {
+                                stepDisplay += ` (${completedIterations} 迭代)`;
+                            }
+                        }
+                    } else {
+                        stepDisplay = '—';
+                    }
                     const hasRecipe = task.has_recipe ? '✓' : '✗';
                     return `
                         <div class="history-item" style="padding: 20px; border-bottom: 1px solid var(--apple-border);">
@@ -133,7 +159,7 @@
                                 </div>
                                 <div>
                                     <div style="font-size: 0.85rem; color: var(--apple-gray); margin-bottom: 4px;">完成步骤</div>
-                                    <div style="font-size: 1.2rem; font-weight: 600;">${step}</div>
+                                    <div style="font-size: 1rem; font-weight: 600; line-height: 1.4;">${stepDisplay}</div>
                                 </div>
                                 <div>
                                     <div style="font-size: 0.85rem; color: var(--apple-gray); margin-bottom: 4px;">配方状态</div>

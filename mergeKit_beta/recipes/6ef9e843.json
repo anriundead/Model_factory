@@ -1,0 +1,47 @@
+{
+  "task_id": "6ef9e843",
+  "output_dir_name": "Qwen2.5-7B-Instruct_Meditron3-Qwen2.5-7B_20260203-163724",
+  "custom_name": "Fusion-0.73",
+  "model_paths": [
+    "/home/a/ServiceEndFiles/Models/Qwen2.5-7B-Instruct",
+    "/home/a/ServiceEndFiles/Models/Meditron3-Qwen2.5-7B"
+  ],
+  "parent_names": [
+    "Qwen2.5-7B-Instruct",
+    "Meditron3-Qwen2.5-7B"
+  ],
+  "best_genotype": [
+    0.4433714080391258,
+    0.4416132998798763
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "college_chemistry",
+    "college_physics",
+    "abstract_algebra",
+    "astronomy",
+    "computer_security",
+    "conceptual_physics",
+    "electrical_engineering",
+    "elementary_mathematics",
+    "high_school_chemistry",
+    "high_school_physics",
+    "high_school_mathematics",
+    "high_school_computer_science",
+    "machine_learning"
+  ],
+  "hf_subset_group": "stem",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 4,
+  "n_iter": 5,
+  "max_samples": 8,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 2,
+  "eval_mode": "text",
+  "completed_at": "2026-02-03T16:37:31.698012",
+  "current_best_acc": 0.125,
+  "final_test_acc": null
+}

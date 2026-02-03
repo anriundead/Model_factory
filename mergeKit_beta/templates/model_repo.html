@@ -48,6 +48,11 @@
                 <p class="limit-desc" style="margin-bottom: 12px;">点击卡片在弹窗中查看父代、融合参数与使用数据集。</p>
                 <div id="model-repo-merged" class="models-grid"><div class="loading-state"><div class="spinner"></div><p>加载中...</p></div></div>
             </section>
+            <section class="section apple-card">
+                <div class="section-header"><h3>融合配方</h3> <span class="helper-text">Recipes</span></div>
+                <p class="limit-desc" style="margin-bottom: 12px;">已保存的完全融合配方，点击查看详情或使用配方直接融合。</p>
+                <div id="model-repo-recipes" class="models-grid"><div class="loading-state"><div class="spinner"></div><p>加载中...</p></div></div>
+            </section>
         </main>
         <footer><p>Copyright © 2025 Nine Heavens. 保留所有权利。</p></footer>
     </div>
@@ -61,6 +66,19 @@
             </div>
             <div class="modal-actions">
                 <button id="model-detail-close" class="ios-btn ios-btn-confirm">关闭</button>
+            </div>
+        </div>
+    </div>
+    <div id="recipe-detail-overlay" class="modal-overlay" style="display:none; opacity:0;">
+        <div class="ios-modal model-detail-modal" style="max-width: 600px; max-height: 80vh; overflow-y: auto;" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3 id="recipe-detail-title">配方详情</h3>
+                <p id="recipe-detail-id" class="limit-desc" style="margin-top: 8px;"></p>
+            </div>
+            <div id="recipe-detail-body" style="text-align: left; padding: 0 20px 16px; font-size: 0.9rem; line-height: 1.5;">
+            </div>
+            <div class="modal-actions">
+                <button id="recipe-detail-close" class="ios-btn ios-btn-confirm">关闭</button>
             </div>
         </div>
     </div>
@@ -121,9 +139,74 @@
             if (e.target === this) hideModelDetail();
         };
 
+        var recipesData = [];
+        function showRecipeDetail(recipeId) {
+            fetch('/api/recipes/' + recipeId).then(r=>r.json()).then(d=>{
+                if (d.status !== 'success' || !d.recipe) {
+                    alert('加载配方失败');
+                    return;
+                }
+                var r = d.recipe;
+                document.getElementById('recipe-detail-title').textContent = r.custom_name || r.recipe_id || '配方详情';
+                document.getElementById('recipe-detail-id').textContent = '配方ID: ' + (r.recipe_id || r.task_id || '未知');
+                var html = '';
+                if (r.parent_names && r.parent_names.length > 0) {
+                    html += '<p style="margin: 0 0 4px; color: #86868b; font-weight: 500;">父模型</p>';
+                    html += '<p style="margin: 0 0 16px;">' + r.parent_names.join(' + ') + '</p>';
+                }
+                if (r.best_genotype && r.best_genotype.length > 0) {
+                    html += '<p style="margin: 0 0 4px; color: #86868b; font-weight: 500;">最佳 Genotype (权重)</p>';
+                    html += '<p style="margin: 0 0 16px; font-family: monospace;">[' + r.best_genotype.map(function(x) { return Number(x).toFixed(6); }).join(', ') + ']</p>';
+                }
+                if (r.current_best_acc != null || r.final_test_acc != null) {
+                    html += '<p style="margin: 0 0 4px; color: #86868b; font-weight: 500;">准确率</p>';
+                    var acc = r.final_test_acc != null ? r.final_test_acc : r.current_best_acc;
+                    html += '<p style="margin: 0 0 16px; font-size: 1.1rem; font-weight: 600;">' + Number(acc).toFixed(4) + '</p>';
+                }
+                if (r.hf_dataset) {
+                    html += '<p style="margin: 0 0 4px; color: #86868b; font-weight: 500;">数据集</p>';
+                    var dsParts = [r.hf_dataset];
+                    if (r.hf_subsets && r.hf_subsets.length) dsParts.push('子集: ' + r.hf_subsets.join(', '));
+                    if (r.hf_split) dsParts.push('split: ' + r.hf_split);
+                    html += '<p style="margin: 0 0 16px;">' + dsParts.join('；') + '</p>';
+                }
+                if (r.pop_size || r.n_iter || r.max_samples) {
+                    html += '<p style="margin: 0 0 4px; color: #86868b; font-weight: 500;">融合参数</p>';
+                    var params = [];
+                    if (r.pop_size) params.push('种群: ' + r.pop_size);
+                    if (r.n_iter) params.push('迭代: ' + r.n_iter);
+                    if (r.max_samples) params.push('样本: ' + r.max_samples);
+                    if (r.dtype) params.push('精度: ' + r.dtype);
+                    html += '<p style="margin: 0 0 16px;">' + params.join(' · ') + '</p>';
+                }
+                if (r.completed_at) {
+                    html += '<p style="margin: 0 0 4px; color: #86868b; font-weight: 500;">完成时间</p>';
+                    html += '<p style="margin: 0;">' + (typeof r.completed_at === 'string' ? r.completed_at : new Date(r.completed_at * 1000).toLocaleString('zh-CN')) + '</p>';
+                }
+                document.getElementById('recipe-detail-body').innerHTML = html || '<p>暂无详细信息</p>';
+                var overlay = document.getElementById('recipe-detail-overlay');
+                overlay.style.display = 'flex';
+                overlay.style.opacity = '1';
+                overlay.classList.add('show');
+            }).catch(function(e) {
+                alert('加载配方失败: ' + e.message);
+            });
+        }
+        function hideRecipeDetail() {
+            var overlay = document.getElementById('recipe-detail-overlay');
+            overlay.classList.remove('show');
+            overlay.style.opacity = '0';
+            overlay.style.display = 'none';
+        }
+        document.getElementById('recipe-detail-close').onclick = hideRecipeDetail;
+        document.getElementById('recipe-detail-overlay').onclick = function(e) {
+            if (e.target === this) hideRecipeDetail();
+        };
+
         fetch('/api/model_repo/list').then(r=>r.json()).then(d=>{
             var baseEl = document.getElementById('model-repo-base');
             var mergedEl = document.getElementById('model-repo-merged');
+            var recipesEl = document.getElementById('model-repo-recipes');
             function pathTail(p) { return (p || '').split('/').filter(Boolean).pop() || p || ''; }
             if (!d.base_models || d.base_models.length === 0) baseEl.innerHTML = '<p class="limit-desc">暂无基座模型</p>';
             else baseEl.innerHTML = d.base_models.map(function(m) {
@@ -144,9 +227,32 @@
                     card.onclick = function() { showModelDetail(parseInt(card.getAttribute('data-merged-index'), 10)); };
                 });
             }
+            // 加载配方列表
+            fetch('/api/recipes').then(r=>r.json()).then(d=>{
+                if (d.status !== 'success' || !d.recipes || d.recipes.length === 0) {
+                    recipesEl.innerHTML = '<p class="limit-desc">暂无配方</p>';
+                    return;
+                }
+                recipesData = d.recipes;
+                recipesEl.innerHTML = d.recipes.map(function(r, i) {
+                    var name = (r.custom_name || r.recipe_id || '未命名').toString().slice(0, 30);
+                    var parents = (r.parent_names || []).map(function(p) { return typeof p === 'string' ? p.split(/[/\\]/).pop() : ''; }).join(' + ');
+                    var hint = parents ? parents.slice(0, 40) : '点击查看详情';
+                    return '<div class="model-card model-card-clickable" data-recipe-id="' + (r.recipe_id || r.task_id || '') + '" style="cursor:pointer;">' +
+                        '<div class="model-name">' + name + '</div>' +
+                        '<div class="limit-desc" style="font-size:0.8rem; margin-top:4px;">' + hint + '</div>' +
+                        '</div>';
+                }).join('');
+                recipesEl.querySelectorAll('.model-card-clickable').forEach(function(card) {
+                    card.onclick = function() { showRecipeDetail(card.getAttribute('data-recipe-id')); };
+                });
+            }).catch(function() {
+                recipesEl.innerHTML = '<p class="limit-desc">加载配方失败</p>';
+            });
         }).catch(function() {
             document.getElementById('model-repo-base').innerHTML = '<p class="limit-desc">加载失败</p>';
             document.getElementById('model-repo-merged').innerHTML = '<p class="limit-desc">加载失败</p>';
+            document.getElementById('model-repo-recipes').innerHTML = '<p class="limit-desc">加载失败</p>';
         });
     </script>
 </body>

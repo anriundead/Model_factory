@@ -699,6 +699,11 @@ h3 {
 .recipe-apply-select {
     width: 100%;
     margin: 0;
+    position: relative;
+    z-index: 100;
+}
+.recipe-apply-select .ios-select-options {
+    z-index: 10001;
 }
 .recipe-apply-name {
     width: 100%;

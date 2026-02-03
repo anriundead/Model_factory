@@ -633,12 +633,20 @@ def _read_evolution_progress(task_id):
             data = json.load(f)
         if data.get("status") == "error":
             return {"error": data.get("message", ""), "step": 0}
-        return {
+        result = {
             "step": data.get("step", 0),
             "current_best": data.get("current_best"),
             "global_best": data.get("global_best"),
             "best_genotype": data.get("best_genotype"),
         }
+        # 添加 ETA 和进度信息
+        if "eta_seconds" in data:
+            result["eta_seconds"] = data.get("eta_seconds")
+            result["estimated_completion"] = data.get("estimated_completion")
+        if "current_step" in data:
+            result["current_step"] = data.get("current_step")
+            result["total_expected_steps"] = data.get("total_expected_steps")
+        return result
     except Exception:
         return None
 
@@ -1304,21 +1312,60 @@ def api_fusion_history():
             meta["task_id"] = tid
             # 读取进度信息（包含 current_best, global_best）
             progress_path = os.path.join(MERGE_DIR, tid, "progress.json")
+            evo_progress = {}
             if os.path.isfile(progress_path):
                 try:
                     with open(progress_path, "r", encoding="utf-8") as pf:
                         prog = json.load(pf)
-                    meta["evolution_progress"] = {
+                    evo_progress = {
                         "step": prog.get("step", 0),
                         "current_best": prog.get("current_best"),
                         "global_best": prog.get("global_best"),
                         "best_genotype": prog.get("best_genotype"),
                     }
+                    # 添加 ETA 和进度信息
+                    if "eta_seconds" in prog:
+                        evo_progress["eta_seconds"] = prog.get("eta_seconds")
+                        evo_progress["estimated_completion"] = prog.get("estimated_completion")
+                    if "current_step" in prog:
+                        evo_progress["current_step"] = prog.get("current_step")
+                        evo_progress["total_expected_steps"] = prog.get("total_expected_steps")
                 except Exception:
                     pass
-            # 检查是否有配方
+            # 优先从 fusion_info.json 或 recipe 读取准确率（如果 progress.json 中为0）
             recipe_path = os.path.join(RECIPES_DIR, "%s.json" % tid)
+            if os.path.isfile(recipe_path):
+                try:
+                    with open(recipe_path, "r", encoding="utf-8") as rf:
+                        recipe = json.load(rf)
+                    # 如果 progress 中的准确率为0，尝试从 recipe 读取
+                    if evo_progress.get("current_best") == 0.0 and recipe.get("final_test_acc") is not None:
+                        evo_progress["current_best"] = recipe.get("final_test_acc")
+                    if evo_progress.get("global_best") == 0.0 and recipe.get("final_test_acc") is not None:
+                        evo_progress["global_best"] = recipe.get("final_test_acc")
+                    if evo_progress.get("current_best") == 0.0 and recipe.get("current_best_acc") is not None:
+                        evo_progress["current_best"] = recipe.get("current_best_acc")
+                except Exception:
+                    pass
+            # 也检查 fusion_info.json（在命名目录中）
+            for item in os.listdir(os.path.join(MERGE_DIR, tid)):
+                fusion_info_path = os.path.join(MERGE_DIR, tid, item, "fusion_info.json")
+                if os.path.isfile(fusion_info_path):
+                    try:
+                        with open(fusion_info_path, "r", encoding="utf-8") as ff:
+                            fusion_info = json.load(ff)
+                        if evo_progress.get("current_best") == 0.0 and fusion_info.get("final_test_acc") is not None:
+                            evo_progress["current_best"] = fusion_info.get("final_test_acc")
+                        if evo_progress.get("global_best") == 0.0 and fusion_info.get("final_test_acc") is not None:
+                            evo_progress["global_best"] = fusion_info.get("final_test_acc")
+                        break
+                    except Exception:
+                        pass
+            meta["evolution_progress"] = evo_progress
             meta["has_recipe"] = os.path.isfile(recipe_path)
+            # 添加 pop_size 和 n_iter 信息供前端计算迭代次数
+            meta["pop_size"] = meta.get("pop_size")
+            meta["n_iter"] = meta.get("n_iter")
             history.append(meta)
         except Exception:
             continue

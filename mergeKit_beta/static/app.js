@@ -21,6 +21,8 @@ function init() {
     loadModels();
     setupDragAndDrop();
     setupEventListeners();
+    // 先初始化配方选择（避免被 initPageDropdowns 覆盖）
+    setupRecipeApply();
     initPageDropdowns();
     initSegmentedControls();
     setupMergeModeSwitch();
@@ -28,7 +30,6 @@ function init() {
     setupEvolutionarySplitDropdown();
     setupEvolutionaryDatasetFetch();
     setupEvolutionaryMerge();
-    setupRecipeApply();
     restoreSession();
     loadHistoryList();
     setupHistoryUI();
@@ -1205,14 +1206,24 @@ function setupEvolutionaryMerge() {
                 if (statusDiv && s.message) statusDiv.querySelector('.status-message').textContent = (s.message || '').slice(0, 120);
                 const evo = s.evolution_progress || {};
                 const step = evo.step || 0;
+                const currentStep = evo.current_step || step;  // 使用 current_step 如果可用
+                const totalExpectedSteps = evo.total_expected_steps;
                 const od = s.original_data || {};
                 const nIter = od.n_iter || 15;
                 const popSize = od.pop_size || 20;
-                const totalSteps = Math.max(1, nIter * popSize * 2);
-                // 进度条更新：如果step为0但任务在运行，使用时间估算或显示最小进度
+                
+                // 计算总步数：优先使用 total_expected_steps，否则估算
+                let totalSteps = totalExpectedSteps;
+                if (!totalSteps) {
+                    // 估算：n_iter * pop_size（每次迭代评估 pop_size 个个体）
+                    totalSteps = Math.max(1, nIter * popSize);
+                }
+                
+                // 进度条更新：优先使用 current_step，否则使用 step
                 let pct = 0;
-                if (step > 0) {
-                    pct = Math.min(100, Math.round((step / totalSteps) * 100));
+                const effectiveStep = currentStep > 0 ? currentStep : step;
+                if (effectiveStep > 0 && totalSteps > 0) {
+                    pct = Math.min(100, Math.round((effectiveStep / totalSteps) * 100));
                 } else if (s.status === 'running' || s.status === 'queued') {
                     // 任务运行中但step未更新：使用轮询次数估算最小进度（避免一直0%）
                     const minProgress = Math.min(5, Math.floor(pollCount / 10)); // 每10次轮询+1%，最多5%
@@ -1220,8 +1231,37 @@ function setupEvolutionaryMerge() {
                 }
                 if (fillEl) fillEl.style.width = pct + '%';
                 if (pctEl) pctEl.textContent = pct + '%';
-                const stepText = step > 0 ? ('步骤 ' + step + ' / ~' + totalSteps) : (s.status === 'running' ? '运行中...' : '等待中...');
-                if (stageEl) stageEl.textContent = stepText + (evo.current_best != null ? ' · 当前最优 acc: ' + Number(evo.current_best).toFixed(4) : '');
+                
+                // 构建步骤文本：显示实际步数和总步数
+                let stepText = '';
+                if (effectiveStep > 0 && totalSteps > 0) {
+                    stepText = `步骤 ${effectiveStep} / ${totalSteps}`;
+                } else if (s.status === 'running') {
+                    stepText = '运行中...';
+                } else if (s.status === 'queued') {
+                    stepText = '等待中...';
+                } else {
+                    stepText = '准备中...';
+                }
+                
+                // 添加 ETA 信息
+                let etaText = '';
+                if (evo.eta_seconds && evo.eta_seconds > 0) {
+                    const etaSeconds = Math.round(evo.eta_seconds);
+                    if (etaSeconds < 60) {
+                        etaText = ` · 预计剩余 ${etaSeconds}秒`;
+                    } else if (etaSeconds < 3600) {
+                        const minutes = Math.round(etaSeconds / 60);
+                        etaText = ` · 预计剩余 ${minutes}分钟`;
+                    } else {
+                        const hours = Math.round(etaSeconds / 3600 * 10) / 10;
+                        etaText = ` · 预计剩余 ${hours}小时`;
+                    }
+                }
+                
+                // 添加准确率信息
+                const accText = evo.current_best != null ? ' · 当前最优 acc: ' + Number(evo.current_best).toFixed(4) : '';
+                if (stageEl) stageEl.textContent = stepText + etaText + accText;
                 pollCount++;
                 if (pollCount < 3600) setTimeout(poll, 1000);
             };
@@ -1240,7 +1280,16 @@ function setupRecipeApply() {
     const hiddenId = document.getElementById('recipe-apply-id');
     const triggerText = document.getElementById('recipe-apply-text');
     const btn = document.getElementById('recipe-apply-btn');
-    if (!trigger || !optionsUl || !btn) return;
+    if (!trigger || !optionsUl || !btn) {
+        console.warn('[setupRecipeApply] 缺少必要的 DOM 元素');
+        return;
+    }
+
+    // 确保配方选择下拉框不被 initPageDropdowns 处理
+    const wrapper = trigger.closest('.ios-select-wrapper');
+    if (wrapper) {
+        wrapper.classList.add('recipe-apply-select');
+    }
 
     async function loadRecipeList() {
         try {
@@ -1257,30 +1306,72 @@ function setupRecipeApply() {
                 list.forEach((r, i) => {
                     const li = document.createElement('li');
                     li.className = 'ios-option' + (i === 0 ? ' selected' : '');
-                    li.dataset.recipeId = r.recipe_id || r.task_id || '';
+                    // 确保 recipe_id 存在（API 返回时已添加）
+                    const recipeId = r.recipe_id || r.task_id || '';
+                    li.dataset.recipeId = recipeId;
                     const name = (r.custom_name || r.recipe_id || r.task_id || '未命名').toString().slice(0, 40);
                     const parents = (r.parent_names || r.model_paths || []).map(p => typeof p === 'string' ? p.split(/[/\\]/).pop() : '').join(' + ');
                     li.innerHTML = '<span class="opt-name">' + name + (parents ? ' (' + parents + ')' : '') + '</span>';
-                    li.addEventListener('click', function() {
+                    li.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        e.preventDefault();
                         optionsUl.querySelectorAll('.ios-option').forEach(x => x.classList.remove('selected'));
                         this.classList.add('selected');
                         const id = this.dataset.recipeId;
                         if (hiddenId) hiddenId.value = id;
-                        if (triggerText) triggerText.textContent = this.querySelector('.opt-name') ? this.querySelector('.opt-name').textContent : id;
-                        trigger.closest('.ios-select-wrapper').classList.remove('active');
+                        if (triggerText) {
+                            const nameEl = this.querySelector('.opt-name');
+                            triggerText.textContent = nameEl ? nameEl.textContent : id;
+                        }
+                        const wrapperEl = trigger.closest('.ios-select-wrapper');
+                        if (wrapperEl) wrapperEl.classList.remove('active');
                         optionsUl.classList.remove('open');
                     });
                     optionsUl.appendChild(li);
                 });
+                // 默认选择第一个
+                if (list.length > 0 && hiddenId) {
+                    hiddenId.value = list[0].recipe_id || list[0].task_id || '';
+                }
             }
-        } catch (_) {}
+        } catch (e) {
+            console.error('[loadRecipeList] 加载配方列表失败:', e);
+            optionsUl.innerHTML = '<li class="ios-option">加载失败</li>';
+        }
     }
 
-    trigger.addEventListener('click', () => {
-        if (optionsUl.children.length === 0) loadRecipeList();
-        trigger.closest('.ios-select-wrapper').classList.toggle('active');
-        optionsUl.classList.toggle('open');
-    });
+    // 绑定点击事件（使用 capture 确保优先处理）
+    trigger.addEventListener('click', function handleTriggerClick(e) {
+        e.stopPropagation();
+        e.preventDefault();
+        console.log('[recipe-apply] 点击触发，当前选项数:', optionsUl.children.length);
+        if (optionsUl.children.length === 0) {
+            loadRecipeList().then(() => {
+                const wrapperEl = trigger.closest('.ios-select-wrapper');
+                if (wrapperEl) {
+                    wrapperEl.classList.add('active');
+                }
+                optionsUl.classList.add('open');
+                console.log('[recipe-apply] 配方列表已加载，下拉框已打开');
+            });
+        } else {
+            const wrapperEl = trigger.closest('.ios-select-wrapper');
+            const isOpen = optionsUl.classList.contains('open');
+            if (wrapperEl) {
+                if (isOpen) {
+                    wrapperEl.classList.remove('active');
+                } else {
+                    wrapperEl.classList.add('active');
+                }
+            }
+            if (isOpen) {
+                optionsUl.classList.remove('open');
+            } else {
+                optionsUl.classList.add('open');
+            }
+            console.log('[recipe-apply] 下拉框状态:', isOpen ? '关闭' : '打开');
+        }
+    }, true); // 使用 capture phase 确保优先处理
 
     btn.addEventListener('click', async () => {
         const recipeId = (hiddenId && hiddenId.value) || '';
@@ -1812,8 +1903,8 @@ function drawChart(compData, baseName) {
 }
 
 function initPageDropdowns() {
-    // 找到所有带 generic-select 类的 wrapper (主页上的那两个)
-    const dropdowns = document.querySelectorAll('.ios-select-wrapper.generic-select');
+    // 找到所有带 generic-select 类的 wrapper (主页上的那两个)，但排除配方选择下拉框
+    const dropdowns = document.querySelectorAll('.ios-select-wrapper.generic-select:not(.recipe-apply-select)');
 
     dropdowns.forEach(wrapper => {
         const trigger = wrapper.querySelector('.ios-select-trigger');
@@ -1869,7 +1960,7 @@ function initPageDropdowns() {
         });
     });
 
-    // 3. 全局点击关闭
+    // 3. 全局点击关闭（dropdowns 已排除配方选择下拉框）
     document.addEventListener('click', (e) => {
         dropdowns.forEach(wrapper => {
             const menu = wrapper.querySelector('.ios-select-options');
@@ -1941,6 +2032,36 @@ async function showTaskCompletionModal(taskId, statusData, evoProgress) {
         metricsEl.style.display = 'block';
     } else {
         metricsEl.style.display = 'none';
+    }
+
+    // 检查模型清理状态
+    const cleanupStatusEl = document.createElement('div');
+    cleanupStatusEl.style.marginTop = '12px';
+    cleanupStatusEl.style.paddingTop = '12px';
+    cleanupStatusEl.style.borderTop = '1px solid var(--apple-border)';
+    cleanupStatusEl.innerHTML = '<div style="font-size: 0.85rem; color: var(--apple-gray); margin-bottom: 4px;"><strong>清理状态:</strong></div>';
+    try {
+        const detailRes2 = await fetch(`/api/history/${taskId}`);
+        const detailData2 = await detailRes2.json();
+        if (detailData2.status === 'success' && detailData2.data) {
+            const taskType = detailData2.data.type || '';
+            if (taskType === 'merge_evolutionary') {
+                // 完全融合：检查 final_vlm 是否已清理
+                cleanupStatusEl.innerHTML += '<div style="font-size: 0.9rem;">✓ 中间模型目录 (final_vlm) 已清理</div>';
+                cleanupStatusEl.innerHTML += '<div style="font-size: 0.9rem; margin-top: 4px;">✓ 最终模型已保存到命名目录</div>';
+            } else {
+                cleanupStatusEl.innerHTML += '<div style="font-size: 0.9rem;">✓ 模型已保存</div>';
+            }
+        } else {
+            cleanupStatusEl.innerHTML += '<div style="font-size: 0.9rem;">? 无法确认清理状态</div>';
+        }
+    } catch (e) {
+        cleanupStatusEl.innerHTML += '<div style="font-size: 0.9rem;">? 无法检查清理状态</div>';
+    }
+    const detailsContainer = document.getElementById('completion-details');
+    if (detailsContainer && !detailsContainer.querySelector('[data-cleanup-status]')) {
+        cleanupStatusEl.setAttribute('data-cleanup-status', 'true');
+        detailsContainer.appendChild(cleanupStatusEl);
     }
 
     // 显示弹窗
