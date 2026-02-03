@@ -12,6 +12,7 @@ fi
 if [ -n "$CONDA_BASE" ] && [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
     source "${CONDA_BASE}/etc/profile.d/conda.sh"
     conda activate mergenetic
+    export MERGENETIC_PYTHON="$(which python 2>/dev/null || true)"
     echo "--- 已激活 conda 环境: mergenetic ---"
 fi
 

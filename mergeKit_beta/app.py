@@ -464,13 +464,17 @@ def start_merge_evolutionary():
     if len(model_paths) < 2:
         return jsonify({"status": "error", "message": "至少需要 2 个模型"}), 400
     resolved = []
+    local_models_path = getattr(Config, "LOCAL_MODELS_PATH", None) or MODEL_POOL_PATH
     for p in model_paths:
         if isinstance(p, str) and os.path.isabs(p) and os.path.isdir(p):
             resolved.append(p)
         else:
-            path = os.path.join(MODEL_POOL_PATH, p) if isinstance(p, str) else os.path.join(MODEL_POOL_PATH, str(p))
+            name = p if isinstance(p, str) else str(p)
+            path = os.path.join(MODEL_POOL_PATH, name)
             if not os.path.isdir(path):
-                return jsonify({"status": "error", "message": "模型路径不存在: %s" % p}), 400
+                path = os.path.join(local_models_path, name)
+            if not os.path.isdir(path):
+                return jsonify({"status": "error", "message": "模型路径不存在: %s（已尝试 MODEL_POOL 与 LOCAL_MODELS_PATH）" % p}), 400
             resolved.append(os.path.abspath(path))
     dataset_type = "cmmmu" if "CMMMU" in (data.get("hf_dataset") or "") else "mmlu"
     hf_subset_raw = data.get("hf_subset") or data.get("hf_subset_group") or ("health_and_medicine" if dataset_type == "cmmmu" else "college_medicine")
@@ -491,6 +495,7 @@ def start_merge_evolutionary():
         "hf_dataset": data.get("hf_dataset", "cais/mmlu"),
         "hf_subset": hf_subsets[0] if hf_subsets else "college_medicine",
         "hf_subsets": hf_subsets,
+        "hf_subset_group": hf_subset_raw if hf_subset_raw in [g["id"] for g in (MMLU_SUBSET_GROUPS + CMMMU_SUBSET_GROUPS)] else "",  # 领域 id（如 stem），供本地按领域目录加载
         "hf_split": data.get("hf_split", "test"),
         "pop_size": int(data.get("pop_size", 20)),
         "n_iter": int(data.get("n_iter", 15)),
@@ -575,6 +580,26 @@ def get_history_detail(task_id):
     return jsonify({"status": "error", "message": "Not found"}), 404
 
 
+def _read_evolution_progress(task_id):
+    """完全融合任务：读取 merges/<task_id>/progress.json 中的迭代/种群/当前最优等，供前端展示。"""
+    progress_path = os.path.join(MERGE_DIR, task_id, "progress.json")
+    if not os.path.isfile(progress_path):
+        return None
+    try:
+        with open(progress_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("status") == "error":
+            return {"error": data.get("message", ""), "step": 0}
+        return {
+            "step": data.get("step", 0),
+            "current_best": data.get("current_best"),
+            "global_best": data.get("global_best"),
+            "best_genotype": data.get("best_genotype"),
+        }
+    except Exception:
+        return None
+
+
 @app.route("/api/status/<task_id>")
 def get_status(task_id):
     task = tasks.get(task_id)
@@ -590,6 +615,11 @@ def get_status(task_id):
                     if op < my_priority or (op == my_priority and t.get("created_at", 0) < task.get("created_at", 0)):
                         pos += 1
             resp["queue_position"] = pos + running
+        # 完全融合运行中或刚完成：附带 progress.json 的详细进度（迭代/种群/当前最优）
+        if task.get("original_data", {}).get("type") == "merge_evolutionary" or task.get("type") == "merge_evolutionary":
+            evo = _read_evolution_progress(task_id)
+            if evo is not None:
+                resp["evolution_progress"] = evo
         return jsonify(resp)
     # 回退：从磁盘 metadata 读取
     disk = _status_from_disk(task_id)

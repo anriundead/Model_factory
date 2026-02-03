@@ -8,6 +8,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -96,8 +97,9 @@ def main():
         logger.error("run_vlm_search.py 不存在: %s (可设置 VLM_SEARCH_DIR)", RUN_VLM_SEARCH_PY)
         sys.exit(1)
 
+    python_cmd = (getattr(Config, "MERGENETIC_PYTHON", None) or "").strip() or "python"
     cmd = [
-        Config.MERGENETIC_PYTHON,
+        python_cmd,
         RUN_VLM_SEARCH_PY,
         "--ray-num-gpus", str(ray_num_gpus),
         "--model-paths", *model_paths,
@@ -107,6 +109,9 @@ def main():
     ]
     for sub in hf_subsets:
         cmd.extend(["--hf-subset", sub])
+    hf_subset_group = meta.get("hf_subset_group", "").strip()
+    if hf_subset_group:
+        cmd.extend(["--hf-subset-group", hf_subset_group])
     cmd.extend([
         "--prompt-yaml", PROMPT_MMLU,
         "--pop-size", str(pop_size),
@@ -124,6 +129,12 @@ def main():
     logger.debug("命令: %s", " ".join(cmd))
     logger.info("工作目录: %s", VLM_SEARCH_DIR)
 
+    # 子进程继承当前环境（含 HF_ENDPOINT 镜像、HF_DATASETS_CACHE），便于使用已下载数据集
+    env = os.environ.copy()
+    if getattr(Config, "HF_ENDPOINT", None):
+        env["HF_ENDPOINT"] = Config.HF_ENDPOINT
+    if getattr(Config, "HF_DATASETS_CACHE", None):
+        env["HF_DATASETS_CACHE"] = Config.HF_DATASETS_CACHE
     try:
         proc = subprocess.Popen(
             cmd,
@@ -132,6 +143,7 @@ def main():
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=env,
         )
         logger.info("子进程已启动，PID: %s", proc.pid)
         out_lines = []
@@ -154,6 +166,26 @@ def main():
                 pass
             logger.error("run_vlm_search 执行失败（返回码: %s）", proc.returncode)
             sys.exit(1)
+
+        # 完全融合成功：将 final_vlm 同步到 merges/<task_id>/output，并更新 metadata.json
+        output_dir = os.path.join(merge_dir, "output")
+        if os.path.isdir(final_vlm_output) and os.listdir(final_vlm_output):
+            if os.path.exists(output_dir):
+                shutil.rmtree(output_dir, ignore_errors=True)
+            shutil.copytree(final_vlm_output, output_dir)
+            logger.info("已复制最终模型到 %s", output_dir)
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            meta["status"] = "success"
+            meta.pop("error", None)
+            meta["message"] = "任务完成"
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            logger.info("已更新 metadata.json status=success")
+        except Exception as e:
+            logger.warning("更新 metadata.json 失败: %s", e)
+
         logger.info("=" * 80)
         logger.info("桥接脚本结束（成功）")
         logger.info("=" * 80)

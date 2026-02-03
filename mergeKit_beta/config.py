@@ -41,6 +41,8 @@ class Config:
     # ==================== 环境变量配置 ====================
     NUMEXPR_MAX_THREADS = 64
     HF_ENDPOINT = "https://hf-mirror.com"
+    # HuggingFace 数据集缓存目录（已下载的数据集优先从此读取，不设则使用 datasets 默认缓存）
+    HF_DATASETS_CACHE = os.environ.get("HF_DATASETS_CACHE", "").strip() or None
 
     # ==================== 融合库配置 ====================
     MERGE_LIBRARY = "mergenetic"
