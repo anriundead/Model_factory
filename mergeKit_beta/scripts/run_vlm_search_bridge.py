@@ -107,8 +107,9 @@ def main():
         "--hf-dataset", hf_dataset,
         "--hf-split", hf_split,
     ]
-    for sub in hf_subsets:
-        cmd.extend(["--hf-subset", sub])
+    # 多个子集用单次 --hf-subset A B 传递，避免 argparse nargs="+" 被多次覆盖
+    if hf_subsets:
+        cmd.extend(["--hf-subset", *hf_subsets])
     hf_subset_group = meta.get("hf_subset_group", "").strip()
     if hf_subset_group:
         cmd.extend(["--hf-subset-group", hf_subset_group])
