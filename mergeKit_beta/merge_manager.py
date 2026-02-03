@@ -15,6 +15,7 @@ from core.process_manager import ProcessManager
 MODEL_POOL_PATH = Config.MODEL_POOL_PATH
 MERGE_DIR = Config.MERGE_DIR
 LOGS_DIR = Config.LOGS_DIR
+RECIPES_DIR = getattr(Config, "RECIPES_DIR", None) or os.path.join(Config.PROJECT_ROOT, "recipes")
 MERGENETIC_PYTHON = Config.MERGENETIC_PYTHON
 
 os.makedirs(MERGE_DIR, exist_ok=True)
@@ -383,6 +384,168 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
         _write_error_status(str(e))
         if task_control.get("aborted"):
             return {"status": "stopped", "message": "用户已停止"}
+        return {"status": "error", "error": str(e)}
+
+
+def run_recipe_apply_task(task_id, params, update_progress_callback, task_control=None):
+    """
+    按配方执行一次合并（固定 genotype，不进化）。用于「根据配方直接融合出最终模型」。
+    params: recipe_id, custom_name（可选）
+    """
+    if task_control is None:
+        task_control = {}
+
+    recipe_id = params.get("recipe_id")
+    if not recipe_id:
+        return {"status": "error", "error": "缺少 recipe_id"}
+
+    recipe_path = os.path.join(RECIPES_DIR, "%s.json" % recipe_id)
+    if not os.path.isfile(recipe_path):
+        return {"status": "error", "error": "配方不存在: %s" % recipe_id}
+
+    with open(recipe_path, "r", encoding="utf-8") as f:
+        recipe = json.load(f)
+
+    model_paths = recipe.get("model_paths") or []
+    if len(model_paths) < 2:
+        return {"status": "error", "error": "配方中模型数量不足"}
+
+    model_paths = [os.path.abspath(p) for p in model_paths]
+    for p in model_paths:
+        if not os.path.isdir(p):
+            return {"status": "error", "error": "模型路径不存在: %s" % p}
+
+    weights = recipe.get("best_genotype")
+    if not weights or len(weights) < 2:
+        return {"status": "error", "error": "配方缺少 best_genotype"}
+    weights = [float(weights[i]) for i in range(min(len(weights), len(model_paths)))]
+    if len(weights) < len(model_paths):
+        weights.extend([1.0] * (len(model_paths) - len(weights)))
+
+    dtype = recipe.get("dtype", "bfloat16")
+    custom_name = params.get("custom_name", "").strip() or recipe.get("custom_name", "") or ("配方-%s" % recipe_id)
+    density = 0.5
+
+    task_dir = os.path.join(MERGE_DIR, task_id)
+    output_dir = os.path.join(task_dir, "output")
+    yaml_config_dir = os.path.join(task_dir, "yaml_configs")
+    config_yaml_path = os.path.join(yaml_config_dir, "config.yaml")
+    os.makedirs(task_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(yaml_config_dir, exist_ok=True)
+
+    meta_path = os.path.join(task_dir, "metadata.json")
+    metadata = {
+        "id": task_id,
+        "type": "recipe_apply",
+        "recipe_id": recipe_id,
+        "custom_name": custom_name,
+        "model_paths": model_paths,
+        "weights": weights,
+        "dtype": dtype,
+        "status": "pending",
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    def _write_error_status(err_msg):
+        metadata["status"] = "error"
+        metadata["error"] = err_msg
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    try:
+        import subprocess
+        r = subprocess.run(
+            [MERGENETIC_PYTHON, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode != 0:
+            raise RuntimeError("Python 环境验证失败: %s" % (r.stderr or r.stdout or "unknown"))
+
+        update_progress_callback(10, "按配方执行 Mergenetic 融合...")
+        for i, mp in enumerate(model_paths):
+            if not _model_has_mergenetic_expected_keys(mp):
+                raise ValueError("模型键不符合 mergenetic 预期: %s" % mp)
+            normalize_model_weights(mp, force=False)
+
+        update_progress_callback(20, "生成融合配置...")
+        from mergenetic.merging.ties_dare_merger import TiesDareMerger
+
+        base_path = model_paths[0]
+        other_paths = model_paths[1:]
+        densities = [density] * len(model_paths)
+        weights_and_densities = list(weights) + list(densities)
+
+        merger = TiesDareMerger(
+            run_id=task_id,
+            path_to_base_model=base_path,
+            model_paths=other_paths,
+            path_to_store_yaml=yaml_config_dir,
+            path_to_store_merged_model=output_dir,
+            dtype=dtype,
+        )
+        merger.create_individual_configuration(weights_and_densities)
+
+        update_progress_callback(40, "正在执行合并...")
+        out_path = merger.merge_model_from_configuration(Path(config_yaml_path))
+
+        # 若输出在 output/task_id 下，移到 output
+        inner = os.path.join(output_dir, task_id)
+        if os.path.isdir(inner):
+            for name in os.listdir(inner):
+                src = os.path.join(inner, name)
+                dst = os.path.join(output_dir, name)
+                if os.path.isfile(src):
+                    shutil.copy2(src, dst)
+                else:
+                    if os.path.exists(dst):
+                        shutil.rmtree(dst)
+                    shutil.copytree(src, dst)
+            shutil.rmtree(inner)
+        elif str(out_path) != output_dir and os.path.isdir(str(out_path)):
+            for name in os.listdir(str(out_path)):
+                src = os.path.join(str(out_path), name)
+                dst = os.path.join(output_dir, name)
+                if os.path.isfile(src):
+                    shutil.copy2(src, dst)
+                else:
+                    dest = os.path.join(output_dir, name)
+                    if os.path.exists(dest):
+                        shutil.rmtree(dest)
+                    shutil.copytree(src, dest)
+
+        if not os.path.isdir(output_dir) or not any(
+            f.endswith(".safetensors") or f == "config.json"
+            for f in os.listdir(output_dir)
+        ):
+            raise RuntimeError("融合输出目录无效: %s" % output_dir)
+
+        update_progress_callback(90, "注册模型仓库...")
+        try:
+            from model_repo import api as model_repo_api
+        except ImportError:
+            model_repo_api = None
+        if model_repo_api and hasattr(model_repo_api, "register_merged_model"):
+            recipe_meta = {
+                "parent_models": [os.path.basename(p) for p in model_paths],
+                "weights": weights,
+                "method": "ties_dare",
+                "library": "mergenetic",
+                "dtype": dtype,
+            }
+            model_repo_api.register_merged_model(output_dir, custom_name, recipe_meta)
+        metadata["status"] = "success"
+        metadata["metrics"] = {"output_path": output_dir}
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        update_progress_callback(100, "配方融合完成")
+        return {"status": "success", "output_path": output_dir}
+    except Exception as e:
+        _logger.exception("[run_recipe_apply_task] 失败: %s", e)
+        _write_error_status(str(e))
         return {"status": "error", "error": str(e)}
 
 

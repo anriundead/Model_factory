@@ -1,0 +1,42 @@
+{
+  "task_id": "a9c7e803",
+  "custom_name": "进化融合-a9c7e803",
+  "model_paths": [
+    "/home/a/ServiceEndFiles/Models/Llama3-merge-biomed-8b",
+    "/home/a/ServiceEndFiles/Models/Bio-Medical-Llama-3-8B"
+  ],
+  "parent_names": [
+    "Llama3-merge-biomed-8b",
+    "Bio-Medical-Llama-3-8B"
+  ],
+  "best_genotype": [
+    0.390743353558069,
+    0.4229049526310821
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "college_chemistry",
+    "college_physics",
+    "abstract_algebra",
+    "astronomy",
+    "computer_security",
+    "conceptual_physics",
+    "electrical_engineering",
+    "elementary_mathematics",
+    "high_school_chemistry",
+    "high_school_physics",
+    "high_school_mathematics",
+    "high_school_computer_science",
+    "machine_learning"
+  ],
+  "hf_subset_group": "",
+  "hf_split": "test",
+  "pop_size": 2,
+  "n_iter": 1,
+  "max_samples": 4,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 1,
+  "eval_mode": "text",
+  "completed_at": "任务完成",
+  "current_best_acc": 0.0
+}

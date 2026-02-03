@@ -246,31 +246,35 @@
                         <span class="helper-text">Mergenetic Evolutionary</span>
                     </div>
                     <p class="limit-desc" style="margin-bottom: 16px;">选择至少 2 个模型，设置种群、迭代、最大样本量及数据集与子集；涉及 VLM 时请选用 CMMMU 等图像数据集。</p>
-                    <div class="two-column-layout">
-                        <section class="section apple-card">
-                            <div class="section-header">
-                                <h3>融合工作台</h3>
-                                <span class="helper-text">Merge Workspace</span>
+                    <div class="evolutionary-main-layout">
+                        <div class="evolutionary-left">
+                            <div class="two-column-layout">
+                                <section class="section apple-card">
+                                    <div class="section-header">
+                                        <h3>融合工作台</h3>
+                                        <span class="helper-text">Merge Workspace</span>
+                                    </div>
+                                    <div id="evolutionary-dropzone" class="dropzone">
+                                        <div class="dropzone-content" id="evolutionary-workspace-placeholder">
+                                            <i class="ri-add-circle-line drop-icon"></i>
+                                            <p class="drop-title">待融合模型</p>
+                                            <p class="hint">点击下方模型卡片加入，至少选 2 个</p>
+                                        </div>
+                                        <div id="evolutionary-selected-list" class="selected-models"></div>
+                                    </div>
+                                </section>
+                                <section class="section apple-card">
+                                    <div class="section-header">
+                                        <h3>参与融合的模型（多选）</h3>
+                                        <span class="helper-text">可选模型 · 已标 VLM/LLM</span>
+                                    </div>
+                                    <div id="evolutionary-models-container" class="models-grid" style="max-height: 220px; overflow-y: auto;"></div>
+                                    <p class="limit-desc">点击卡片选中/取消，至少选 2 个</p>
+                                </section>
                             </div>
-                            <div id="evolutionary-dropzone" class="dropzone">
-                                <div class="dropzone-content" id="evolutionary-workspace-placeholder">
-                                    <i class="ri-add-circle-line drop-icon"></i>
-                                    <p class="drop-title">待融合模型</p>
-                                    <p class="hint">点击下方模型卡片加入，至少选 2 个</p>
-                                </div>
-                                <div id="evolutionary-selected-list" class="selected-models"></div>
-                            </div>
-                        </section>
-                        <section class="section apple-card">
-                            <div class="section-header">
-                                <h3>参与融合的模型（多选）</h3>
-                                <span class="helper-text">可选模型 · 已标 VLM/LLM</span>
-                            </div>
-                            <div id="evolutionary-models-container" class="models-grid" style="max-height: 220px; overflow-y: auto;"></div>
-                            <p class="limit-desc">点击卡片选中/取消，至少选 2 个</p>
-                        </section>
-                    </div>
-                    <div class="params-form" style="margin-top: 20px;">
+                        </div>
+                        <div class="evolutionary-right">
+                    <div class="params-form params-form-evolutionary">
                         <div class="form-group">
                             <label>任务名称</label>
                             <input type="text" id="evolutionary-custom-name" class="ios-input" placeholder="进化融合任务名称" value="">
@@ -324,6 +328,14 @@
                             </div>
                             <input type="hidden" id="evolutionary-max-samples" value="64">
                         </div>
+                        <div class="form-group" style="grid-column: 1 / -1;">
+                            <label>HuggingFace 数据集</label>
+                            <div class="dataset-search-row">
+                                <input type="text" id="evolutionary-hf-dataset-input" class="ios-input" placeholder="输入完整数据集名，如 cais/mmlu 或 m-a-p/CMMMU" value="">
+                                <button type="button" id="evolutionary-hf-dataset-fetch" class="btn btn-secondary btn-sm">拉取并读取</button>
+                            </div>
+                            <p class="limit-desc">拉取后自动列出子集与 split；训练验证建议用 val，最终准确率用 test。</p>
+                        </div>
                         <div class="form-group">
                             <label>数据集类型</label>
                             <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
@@ -345,7 +357,7 @@
                             <input type="hidden" id="evolutionary-dataset-type" value="mmlu">
                         </div>
                         <div class="form-group" id="evolutionary-subset-form-group">
-                            <label id="evolutionary-subset-label">MMLU 子集</label>
+                            <label id="evolutionary-subset-label">MMLU 领域</label>
                             <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
                                 <div class="ios-select-trigger" id="evolutionary-subset-trigger">
                                     <span class="selected-text" id="evolutionary-subset-text">生物/医学</span>
@@ -353,7 +365,22 @@
                                 </div>
                                 <ul class="ios-select-options" id="evolutionary-subset-options"></ul>
                             </div>
-                            <input type="hidden" id="evolutionary-mmlu-subset" value="college_medicine">
+                            <input type="hidden" id="evolutionary-mmlu-subset" value="biology_medicine">
+                        </div>
+                        <div class="form-group" id="evolutionary-split-form-group">
+                            <label>Split（训练用 val，最终 acc 用 test）</label>
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger" id="evolutionary-split-trigger">
+                                    <span class="selected-text" id="evolutionary-split-text">validation</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options" id="evolutionary-split-options">
+                                    <li class="ios-option" data-value="validation"><span class="opt-name">validation（训练/验证）</span></li>
+                                    <li class="ios-option" data-value="test"><span class="opt-name">test（最终准确率）</span></li>
+                                    <li class="ios-option" data-value="train"><span class="opt-name">train</span></li>
+                                </ul>
+                            </div>
+                            <input type="hidden" id="evolutionary-hf-split" value="validation">
                         </div>
                         <div class="form-group">
                             <label>精度</label>
@@ -387,6 +414,22 @@
                             <input type="hidden" id="evolutionary-ray-gpus" value="2">
                         </div>
                         <button type="button" id="start-evolutionary-merge" class="btn btn-primary">开始完全融合</button>
+                        <div class="form-group" style="margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--apple-border);">
+                            <label>按配方直接融合</label>
+                            <p class="limit-desc">使用已保存的完全融合配方，只跑一次合并（固定 genotype），无需进化。</p>
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 8px 0;">
+                                <div class="ios-select-trigger" id="recipe-apply-trigger">
+                                    <span class="selected-text" id="recipe-apply-text">选择配方</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options" id="recipe-apply-options"></ul>
+                            </div>
+                            <input type="hidden" id="recipe-apply-id" value="">
+                            <input type="text" id="recipe-apply-custom-name" class="ios-input" placeholder="可选：输出模型名称" style="margin-top: 6px;">
+                            <button type="button" id="recipe-apply-btn" class="btn btn-secondary" style="margin-top: 10px;">按配方融合</button>
+                        </div>
+                    </div>
+                        </div>
                     </div>
                 </section>
             </div>
@@ -395,12 +438,12 @@
                 <div id="task-status" class="task-status">
                     <div class="status-header">
                         <div class="status-message">准备就绪</div>
-                        <div class="progress-text" style="display: none;">0%</div>
+                        <div class="progress-text" id="task-progress-pct" style="display: none;">0%</div>
                     </div>
-                    
+                    <div class="progress-stage" id="task-progress-stage" style="display: none; font-size: 0.85rem; color: var(--apple-gray); margin-top: 4px;"></div>
                     <div class="progress-container" style="display: none;">
                         <div class="progress-bar">
-                            <div class="progress-fill"></div>
+                            <div class="progress-fill" id="task-progress-fill"></div>
                         </div>
                     </div>
                 </div>

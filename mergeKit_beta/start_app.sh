@@ -25,6 +25,8 @@ else
     PYTHON=python
 fi
 
+# 基座模型目录：未设置时使用默认路径，便于前端选取模型后正确解析路径
+export LOCAL_MODELS_PATH="${LOCAL_MODELS_PATH:-/home/a/ServiceEndFiles/Models}"
 # 默认端口 5001，可通过环境变量覆盖
 export PORT="${PORT:-5001}"
 echo "--- mergeKit_beta 后端启动 (port=$PORT) ---"

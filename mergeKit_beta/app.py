@@ -19,10 +19,45 @@ from config import Config
 
 Config.setup_environment()
 
-from merge_manager import run_merge_task, run_eval_only_task, MODEL_POOL_PATH, MERGE_DIR
+from merge_manager import run_merge_task, run_eval_only_task, run_recipe_apply_task, MODEL_POOL_PATH, MERGE_DIR
 from core.process_manager import ProcessManager
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
+
+
+def _resolve_model_path(name_or_path: str):
+    """
+    将前端传来的模型名或路径解析为绝对路径。优先 LOCAL_MODELS_PATH，再 MODEL_POOL_PATH，
+    支持绝对路径、相对名称、以及遍历两池下目录名匹配（便于名称一致时找到路径）。
+    """
+    if not name_or_path or not isinstance(name_or_path, str):
+        return None
+    s = name_or_path.strip()
+    if not s:
+        return None
+    local_path = getattr(Config, "LOCAL_MODELS_PATH", None) or MODEL_POOL_PATH
+    if os.path.isabs(s) and os.path.isdir(s):
+        return os.path.abspath(s)
+    # 先试直接拼接：LOCAL 优先（用户模型通常在此）
+    for base in (local_path, MODEL_POOL_PATH):
+        if not base:
+            continue
+        candidate = os.path.join(base, s)
+        if os.path.isdir(candidate):
+            return os.path.abspath(candidate)
+    # 再试按目录名匹配：遍历两池的一级子目录
+    name = os.path.basename(s)
+    for base in (local_path, MODEL_POOL_PATH):
+        if not base or not os.path.isdir(base):
+            continue
+        try:
+            for item in os.listdir(base):
+                full = os.path.join(base, item)
+                if os.path.isdir(full) and item == name:
+                    return os.path.abspath(full)
+        except OSError:
+            continue
+    return None
 
 # ---------- 应用日志：记录任务提交、执行与结果，便于定位问题 ----------
 def _app_log_dir():
@@ -207,6 +242,11 @@ def worker():
                     data.get("model_path", ""),
                     data.get("dataset", ""),
                 )
+            elif task_type == "recipe_apply":
+                _app_logger.info(
+                    "[worker] 配方应用 recipe_id=%s",
+                    data.get("recipe_id", ""),
+                )
 
             if task_type == "merge_evolutionary":
                 # VLM 进化搜索：启动 run_vlm_search_bridge 子进程（若存在）
@@ -262,6 +302,12 @@ def worker():
                         result = {"status": "error", "error": str(e)}
             elif task_type == "eval_only":
                 result = run_eval_only_task(task_id, data, update_progress, task_control)
+            elif task_type == "recipe_apply":
+                result = run_recipe_apply_task(task_id, data, update_progress, task_control)
+                if result.get("status") == "success":
+                    _app_logger.info("[worker] 配方融合完成 task_id=%s output=%s", task_id, result.get("output_path", ""))
+                else:
+                    _app_logger.warning("[worker] 配方融合失败 task_id=%s error=%s", task_id, result.get("error", ""))
             else:
                 result = run_merge_task(task_id, data, update_progress, task_control)
                 if result.get("status") == "success":
@@ -464,18 +510,14 @@ def start_merge_evolutionary():
     if len(model_paths) < 2:
         return jsonify({"status": "error", "message": "至少需要 2 个模型"}), 400
     resolved = []
-    local_models_path = getattr(Config, "LOCAL_MODELS_PATH", None) or MODEL_POOL_PATH
     for p in model_paths:
-        if isinstance(p, str) and os.path.isabs(p) and os.path.isdir(p):
-            resolved.append(p)
-        else:
-            name = p if isinstance(p, str) else str(p)
-            path = os.path.join(MODEL_POOL_PATH, name)
-            if not os.path.isdir(path):
-                path = os.path.join(local_models_path, name)
-            if not os.path.isdir(path):
-                return jsonify({"status": "error", "message": "模型路径不存在: %s（已尝试 MODEL_POOL 与 LOCAL_MODELS_PATH）" % p}), 400
-            resolved.append(os.path.abspath(path))
+        path = _resolve_model_path(p)
+        if not path:
+            return jsonify({
+                "status": "error",
+                "message": "模型路径不存在: %s（已尝试 LOCAL_MODELS_PATH 与 MODEL_POOL_PATH 及目录名匹配）" % (p,),
+            }), 400
+        resolved.append(path)
     dataset_type = "cmmmu" if "CMMMU" in (data.get("hf_dataset") or "") else "mmlu"
     hf_subset_raw = data.get("hf_subset") or data.get("hf_subset_group") or ("health_and_medicine" if dataset_type == "cmmmu" else "college_medicine")
     hf_subsets = data.get("hf_subsets")
@@ -497,6 +539,7 @@ def start_merge_evolutionary():
         "hf_subsets": hf_subsets,
         "hf_subset_group": hf_subset_raw if hf_subset_raw in [g["id"] for g in (MMLU_SUBSET_GROUPS + CMMMU_SUBSET_GROUPS)] else "",  # 领域 id（如 stem），供本地按领域目录加载
         "hf_split": data.get("hf_split", "test"),
+        "hf_split_final": (data.get("hf_split_final") or "").strip() or None,  # 最终评测用 split，如 test
         "pop_size": int(data.get("pop_size", 20)),
         "n_iter": int(data.get("n_iter", 15)),
         "max_samples": int(data.get("max_samples", 64)),
@@ -615,11 +658,13 @@ def get_status(task_id):
                     if op < my_priority or (op == my_priority and t.get("created_at", 0) < task.get("created_at", 0)):
                         pos += 1
             resp["queue_position"] = pos + running
-        # 完全融合运行中或刚完成：附带 progress.json 的详细进度（迭代/种群/当前最优）
+        # 完全融合运行中或刚完成：附带 progress.json 的详细进度（迭代/种群/当前最优）及 n_iter/pop_size 供前端进度条
         if task.get("original_data", {}).get("type") == "merge_evolutionary" or task.get("type") == "merge_evolutionary":
             evo = _read_evolution_progress(task_id)
             if evo is not None:
                 resp["evolution_progress"] = evo
+            od = task.get("original_data") or {}
+            resp["original_data"] = {"n_iter": od.get("n_iter"), "pop_size": od.get("pop_size")}
         return jsonify(resp)
     # 回退：从磁盘 metadata 读取
     disk = _status_from_disk(task_id)
@@ -772,6 +817,16 @@ def api_model_repo_path(model_id):
     if path and os.path.isdir(path):
         return jsonify({"status": "success", "path": path})
     return jsonify({"status": "error", "message": "Not found"}), 404
+
+
+@app.route("/api/resolve_model_path")
+def api_resolve_model_path():
+    """根据模型名或路径解析为绝对路径，供前端校验或展示。"""
+    name_or_path = request.args.get("name") or request.args.get("path") or ""
+    path = _resolve_model_path(name_or_path)
+    if path:
+        return jsonify({"status": "success", "path": path})
+    return jsonify({"status": "error", "message": "未找到对应模型目录"}), 404
 
 
 def _testset_list():
@@ -964,6 +1019,199 @@ def api_model_is_vlm():
     if not path or not os.path.isdir(path):
         return jsonify({"status": "error", "message": "path 无效"}), 400
     return jsonify({"status": "success", "is_vlm": _model_is_vlm(path)})
+
+
+def _get_model_type(model_path: str) -> str | None:
+    """从 config.json 读取 model_type。"""
+    if not model_path or not os.path.isdir(model_path):
+        return None
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return (cfg.get("model_type") or "").strip().lower()
+    except Exception:
+        return None
+
+
+def _get_model_arch(model_path: str) -> tuple[int | None, int | None]:
+    """
+    从 config.json 读取 hidden_size 与 num_hidden_layers，用于判断是否同一架构可配对融合。
+    返回 (hidden_size, num_hidden_layers)，若缺失则对应为 None。
+    """
+    if not model_path or not os.path.isdir(model_path):
+        return None, None
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        return None, None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        hs = cfg.get("hidden_size")
+        nhl = cfg.get("num_hidden_layers")
+        if hs is not None:
+            try:
+                hs = int(hs)
+            except (TypeError, ValueError):
+                hs = None
+        if nhl is not None:
+            try:
+                nhl = int(nhl)
+            except (TypeError, ValueError):
+                nhl = None
+        return hs, nhl
+    except Exception:
+        return None, None
+
+
+def _check_merge_compatible(model_paths: list) -> tuple[bool, str, list]:
+    """
+    判断多模型是否可融合：要求同一架构，即 config 的 hidden_size 与 num_hidden_layers 均一致。
+    返回 (compatible, reason, model_types)。model_types 仍返回各 model_type 供前端展示。
+    """
+    if not model_paths or len(model_paths) < 2:
+        return True, "", []
+    archs = []
+    types = []
+    for p in model_paths:
+        hs, nhl = _get_model_arch(p)
+        t = _get_model_type(p)
+        types.append(t or "")
+        if hs is None or nhl is None:
+            return False, "无法读取模型 config 的 hidden_size/num_hidden_layers：%s" % (os.path.basename(p) if p else p), types
+        archs.append((hs, nhl))
+    if len(set(archs)) != 1:
+        return False, "模型架构不一致（hidden_size 或 num_hidden_layers 不同），无法融合。请参见 docs/模型融合配对说明.md。", types
+    return True, "", types
+
+
+@app.route("/api/dataset/hf_info", methods=["POST"])
+def api_dataset_hf_info():
+    """
+    根据 HuggingFace 数据集名称拉取信息并返回子集(config)与 split 列表，供完全融合界面选择。
+    请求体: { "hf_dataset": "cais/mmlu" }。会触发缓存/下载到 HF_DATASETS_CACHE 或默认缓存。
+    """
+    data = request.json or {}
+    hf_dataset = (data.get("hf_dataset") or "").strip()
+    if not hf_dataset:
+        return jsonify({"status": "error", "message": "hf_dataset 必填"}), 400
+    try:
+        from datasets import get_dataset_config_names, load_dataset_builder
+        configs = get_dataset_config_names(hf_dataset, trust_remote_code=True)
+        if not configs:
+            return jsonify({"status": "success", "hf_dataset": hf_dataset, "configs": [], "splits": []})
+        # 取第一个 config 探测 splits（多数数据集各 config 的 split 一致）
+        try:
+            builder = load_dataset_builder(hf_dataset, configs[0], trust_remote_code=True)
+            splits = list(builder.info.splits.keys()) if builder.info.splits else ["train", "validation", "test"]
+        except Exception:
+            splits = ["train", "validation", "test"]
+        return jsonify({
+            "status": "success",
+            "hf_dataset": hf_dataset,
+            "configs": configs,
+            "splits": splits,
+        })
+    except Exception as e:
+        _app_logger.exception("api_dataset_hf_info: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/merge_evolutionary_check", methods=["POST"])
+def api_merge_evolutionary_check():
+    """检查所选模型是否可融合，用于前端在选择时弹窗提示。"""
+    data = request.json or {}
+    paths = data.get("model_paths") or []
+    if len(paths) < 2:
+        return jsonify({"status": "success", "compatible": True, "reason": ""})
+    resolved = []
+    for p in paths:
+        ab = _resolve_model_path(p)
+        if not ab:
+            return jsonify({"status": "error", "message": "模型路径无效: %s" % (p,)}), 400
+        resolved.append(ab)
+    compatible, reason, model_types = _check_merge_compatible(resolved)
+    return jsonify({
+        "status": "success",
+        "compatible": compatible,
+        "reason": reason,
+        "model_types": model_types,
+    })
+
+
+RECIPES_DIR = getattr(Config, "RECIPES_DIR", None) or os.path.join(Config.PROJECT_ROOT, "recipes")
+
+
+@app.route("/api/recipes")
+def api_recipes_list():
+    """列出所有已保存的完全融合配方，供前端查询。"""
+    if not os.path.isdir(RECIPES_DIR):
+        return jsonify({"status": "success", "recipes": []})
+    recipes = []
+    for f in os.listdir(RECIPES_DIR):
+        if not f.endswith(".json"):
+            continue
+        path = os.path.join(RECIPES_DIR, f)
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                r = json.load(fp)
+            r["recipe_id"] = os.path.splitext(f)[0]
+            recipes.append(r)
+        except Exception:
+            continue
+    recipes.sort(key=lambda x: (x.get("completed_at") or ""), reverse=True)
+    return jsonify({"status": "success", "recipes": recipes})
+
+
+@app.route("/api/recipes/<recipe_id>")
+def api_recipe_get(recipe_id):
+    """获取单个配方详情（含完整参数与 best_genotype）。"""
+    path = os.path.join(RECIPES_DIR, "%s.json" % recipe_id)
+    if not os.path.isfile(path):
+        return jsonify({"status": "error", "message": "配方不存在"}), 404
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            recipe = json.load(f)
+        recipe["recipe_id"] = recipe_id
+        return jsonify({"status": "success", "recipe": recipe})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/recipes/apply", methods=["POST"])
+def api_recipes_apply():
+    """根据配方直接融合出最终模型（固定 genotype，只跑一次合并）。"""
+    data = request.json or {}
+    recipe_id = (data.get("recipe_id") or "").strip()
+    if not recipe_id:
+        return jsonify({"status": "error", "message": "缺少 recipe_id"}), 400
+    path = os.path.join(RECIPES_DIR, "%s.json" % recipe_id)
+    if not os.path.isfile(path):
+        return jsonify({"status": "error", "message": "配方不存在"}), 404
+
+    task_id = str(uuid.uuid4())[:8]
+    created_at = time.time()
+    task_data = {
+        "type": "recipe_apply",
+        "task_id": task_id,
+        "recipe_id": recipe_id,
+        "custom_name": (data.get("custom_name") or "").strip() or None,
+        "created_at": created_at,
+    }
+    with scheduler_lock:
+        tasks[task_id] = {
+            "progress": 0,
+            "message": "正在排队...",
+            "status": "queued",
+            "created_at": created_at,
+            "original_data": task_data,
+            "priority": data.get("priority", "common"),
+        }
+        task_queue.put((PRIORITY_MAP.get(data.get("priority", "common"), 10), created_at, task_id, task_data))
+    _app_logger.info("[API] 提交配方应用 task_id=%s recipe_id=%s", task_id, recipe_id)
+    return jsonify({"status": "success", "task_id": task_id})
 
 
 if __name__ == "__main__":

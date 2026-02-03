@@ -25,7 +25,10 @@ function init() {
     initSegmentedControls();
     setupMergeModeSwitch();
     setupEvolutionaryDatasetTypeSwitch();
+    setupEvolutionarySplitDropdown();
+    setupEvolutionaryDatasetFetch();
     setupEvolutionaryMerge();
+    setupRecipeApply();
     restoreSession();
     loadHistoryList();
     setupHistoryUI();
@@ -884,7 +887,7 @@ function loadEvolutionaryModels() {
             card.dataset.name = name;
             card.dataset.isVlm = isVlm ? '1' : '0';
             card.innerHTML = '<div class="model-name">' + name + '</div><div class="limit-desc"><span class="evol-tag ' + tagClass + '">' + tag + '</span></div>';
-            card.addEventListener('click', () => {
+            card.addEventListener('click', async () => {
                 const idx = evolutionarySelectedPaths.indexOf(path);
                 if (idx >= 0) {
                     evolutionarySelectedList.splice(idx, 1);
@@ -894,6 +897,22 @@ function loadEvolutionaryModels() {
                     evolutionarySelectedList.push({ name, path, is_vlm: isVlm });
                     evolutionarySelectedPaths.push(path);
                     card.classList.add('selected');
+                    if (evolutionarySelectedPaths.length >= 2) {
+                        try {
+                            const checkRes = await fetch('/api/merge_evolutionary_check', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ model_paths: evolutionarySelectedPaths })
+                            });
+                            const checkData = await checkRes.json();
+                            if (checkData.status === 'success' && checkData.compatible === false) {
+                                alert('所选模型无法融合：' + (checkData.reason || '架构不一致'));
+                                evolutionarySelectedList.pop();
+                                evolutionarySelectedPaths.pop();
+                                card.classList.remove('selected');
+                            }
+                        } catch (e) { /* ignore */ }
+                    }
                 }
                 renderEvolutionaryWorkspace();
                 checkVlmAndSwitchDataset();
@@ -934,7 +953,107 @@ async function checkVlmAndSwitchDataset() {
     } catch (_) {}
 }
 
+let evolutionaryCustomDataset = null;
+
+function setupEvolutionarySplitDropdown() {
+    const trigger = document.getElementById('evolutionary-split-trigger');
+    const optionsUl = document.getElementById('evolutionary-split-options');
+    const hidden = document.getElementById('evolutionary-hf-split');
+    const triggerText = document.getElementById('evolutionary-split-text');
+    if (!trigger || !optionsUl || !hidden) return;
+    const wrapper = trigger.closest('.ios-select-wrapper');
+    trigger.addEventListener('click', () => {
+        wrapper.classList.toggle('active');
+        optionsUl.classList.toggle('open');
+    });
+    optionsUl.querySelectorAll('.ios-option').forEach(opt => {
+        opt.addEventListener('click', () => {
+            const val = opt.dataset.value;
+            optionsUl.querySelectorAll('.ios-option').forEach(x => x.classList.remove('selected'));
+            opt.classList.add('selected');
+            if (hidden) hidden.value = val;
+            if (triggerText) triggerText.textContent = opt.querySelector('.opt-name') ? opt.querySelector('.opt-name').textContent : val;
+            wrapper.classList.remove('active');
+            optionsUl.classList.remove('open');
+        });
+    });
+}
+
+function setupEvolutionaryDatasetFetch() {
+    const btn = document.getElementById('evolutionary-hf-dataset-fetch');
+    const input = document.getElementById('evolutionary-hf-dataset-input');
+    if (!btn || !input) return;
+    btn.addEventListener('click', async () => {
+        const name = (input.value || '').trim();
+        if (!name) {
+            alert('请输入 HuggingFace 数据集名称，如 cais/mmlu');
+            return;
+        }
+        btn.disabled = true;
+        btn.textContent = '拉取中...';
+        try {
+            const res = await fetch('/api/dataset/hf_info', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ hf_dataset: name })
+            });
+            const data = await res.json();
+            if (data.status !== 'success') {
+                alert(data.message || '拉取失败');
+                return;
+            }
+            evolutionaryCustomDataset = { hf_dataset: name, configs: data.configs || [], splits: data.splits || [] };
+            const optionsUl = document.getElementById('evolutionary-subset-options');
+            const hiddenInput = document.getElementById('evolutionary-mmlu-subset');
+            const triggerText = document.getElementById('evolutionary-subset-text');
+            const labelEl = document.getElementById('evolutionary-subset-label');
+            if (labelEl) labelEl.textContent = '子集 (config)';
+            if (optionsUl) {
+                optionsUl.innerHTML = '';
+                (data.configs || []).forEach((c, i) => {
+                    const li = document.createElement('li');
+                    li.className = 'ios-option' + (i === 0 ? ' selected' : '');
+                    li.dataset.value = c;
+                    li.innerHTML = '<span class="opt-name">' + c + '</span>';
+                    li.addEventListener('click', function() {
+                        optionsUl.querySelectorAll('.ios-option').forEach(x => x.classList.remove('selected'));
+                        this.classList.add('selected');
+                        if (hiddenInput) hiddenInput.value = this.dataset.value;
+                        if (triggerText) triggerText.textContent = this.dataset.value;
+                    });
+                    optionsUl.appendChild(li);
+                });
+            }
+            if (hiddenInput && data.configs && data.configs[0]) hiddenInput.value = data.configs[0];
+            if (triggerText && data.configs && data.configs[0]) triggerText.textContent = data.configs[0];
+            const splitOpts = document.getElementById('evolutionary-split-options');
+            if (splitOpts && data.splits && data.splits.length) {
+                splitOpts.innerHTML = '';
+                data.splits.forEach((s, i) => {
+                    const li = document.createElement('li');
+                    li.className = 'ios-option' + (s === 'validation' || s === 'val' ? ' selected' : '');
+                    li.dataset.value = s === 'val' ? 'validation' : s;
+                    li.innerHTML = '<span class="opt-name">' + s + (s === 'validation' ? '（训练/验证）' : s === 'test' ? '（最终准确率）' : '') + '</span>';
+                    li.addEventListener('click', function() {
+                        splitOpts.querySelectorAll('.ios-option').forEach(x => x.classList.remove('selected'));
+                        this.classList.add('selected');
+                        const h = document.getElementById('evolutionary-hf-split');
+                        const t = document.getElementById('evolutionary-split-text');
+                        if (h) h.value = this.dataset.value;
+                        if (t) t.textContent = this.querySelector('.opt-name').textContent;
+                    });
+                    splitOpts.appendChild(li);
+                });
+            }
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '拉取并读取';
+        }
+    });
+}
+
 function loadEvolutionarySubsets(datasetType) {
+    if (evolutionaryCustomDataset) return;
     const labelEl = document.getElementById('evolutionary-subset-label');
     const triggerText = document.getElementById('evolutionary-subset-text');
     const hiddenInput = document.getElementById('evolutionary-mmlu-subset');
@@ -968,6 +1087,7 @@ function setupEvolutionaryDatasetTypeSwitch() {
         opt.addEventListener('click', () => {
             const val = opt.dataset.value;
             typeHidden.value = val;
+            evolutionaryCustomDataset = null;
             loadEvolutionarySubsets(val);
         });
     });
@@ -1006,28 +1126,38 @@ function setupEvolutionaryMerge() {
         const maxSamples = parseInt(document.getElementById('evolutionary-max-samples')?.value || 64, 10);
         const datasetType = document.getElementById('evolutionary-dataset-type')?.value || 'mmlu';
         const hfSubsetGroup = document.getElementById('evolutionary-mmlu-subset')?.value || (datasetType === 'cmmmu' ? 'health_medicine' : 'biology_medicine');
-        const hfDataset = datasetType === 'cmmmu' ? 'm-a-p/CMMMU' : 'cais/mmlu';
-        const hfSplit = datasetType === 'cmmmu' ? 'val' : 'test';
+        const customHfInput = document.getElementById('evolutionary-hf-dataset-input');
+        const useCustomDataset = customHfInput && customHfInput.value.trim();
+        const hfDataset = useCustomDataset ? customHfInput.value.trim() : (datasetType === 'cmmmu' ? 'm-a-p/CMMMU' : 'cais/mmlu');
+        const hfSplit = (document.getElementById('evolutionary-hf-split') && document.getElementById('evolutionary-hf-split').value) || (datasetType === 'cmmmu' ? 'val' : 'validation');
         const dtype = document.getElementById('evolutionary-dtype')?.value || 'bfloat16';
         const rayGpus = parseInt(document.getElementById('evolutionary-ray-gpus')?.value || 2, 10);
+        const body = {
+            model_paths: evolutionarySelectedPaths,
+            custom_name: customName,
+            pop_size: popSize,
+            n_iter: nIter,
+            max_samples: maxSamples,
+            hf_dataset: hfDataset,
+            hf_split: hfSplit,
+            dtype,
+            ray_num_gpus: rayGpus,
+        };
+        if (hfSplit === 'validation' || hfSplit === 'val') body.hf_split_final = 'test';
+        if (useCustomDataset) {
+            const subsetEl = document.getElementById('evolutionary-mmlu-subset');
+            body.hf_subsets = subsetEl && subsetEl.value ? [subsetEl.value] : [];
+            body.hf_subset_group = '';
+        } else {
+            body.hf_subset_group = hfSubsetGroup;
+        }
         btn.disabled = true;
         btn.textContent = '提交中...';
         try {
             const res = await fetch('/api/merge_evolutionary', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    model_paths: evolutionarySelectedPaths,
-                    custom_name: customName,
-                    pop_size: popSize,
-                    n_iter: nIter,
-                    max_samples: maxSamples,
-                    hf_dataset: hfDataset,
-                    hf_subset_group: hfSubsetGroup,
-                    hf_split: hfSplit,
-                    dtype,
-                    ray_num_gpus: rayGpus,
-                }),
+                body: JSON.stringify(body),
             });
             const data = await res.json();
             if (!data.task_id) {
@@ -1040,15 +1170,27 @@ function setupEvolutionaryMerge() {
             const statusDiv = document.getElementById('task-status');
             if (statusDiv) {
                 statusDiv.querySelector('.status-message').textContent = '完全融合任务已排队: ' + data.task_id;
-                statusDiv.querySelector('.progress-container').style.display = 'block';
+                const progContainer = statusDiv.querySelector('.progress-container');
+                const progPct = document.getElementById('task-progress-pct');
+                const progStage = document.getElementById('task-progress-stage');
+                if (progContainer) progContainer.style.display = 'block';
+                if (progPct) progPct.style.display = 'block';
+                if (progStage) progStage.style.display = 'block';
             }
             let pollCount = 0;
             const poll = async () => {
                 const s = await fetch('/api/status/' + data.task_id).then(r => r.json()).catch(() => ({}));
+                const statusDiv = document.getElementById('task-status');
+                const fillEl = document.getElementById('task-progress-fill');
+                const pctEl = document.getElementById('task-progress-pct');
+                const stageEl = document.getElementById('task-progress-stage');
                 if (s.status === 'completed' || s.status === 'success') {
                     btn.disabled = false;
                     btn.textContent = '开始完全融合';
                     if (statusDiv) statusDiv.querySelector('.status-message').textContent = '完全融合完成';
+                    if (fillEl) fillEl.style.width = '100%';
+                    if (pctEl) pctEl.textContent = '100%';
+                    if (stageEl) stageEl.textContent = '';
                     loadHistoryList();
                     return;
                 }
@@ -1058,14 +1200,145 @@ function setupEvolutionaryMerge() {
                     if (statusDiv) statusDiv.querySelector('.status-message').textContent = '失败: ' + (s.message || s.error);
                     return;
                 }
-                if (statusDiv && s.message) statusDiv.querySelector('.status-message').textContent = s.message;
+                if (statusDiv && s.message) statusDiv.querySelector('.status-message').textContent = (s.message || '').slice(0, 120);
+                const evo = s.evolution_progress || {};
+                const step = evo.step || 0;
+                const od = s.original_data || {};
+                const nIter = od.n_iter || 15;
+                const popSize = od.pop_size || 20;
+                const totalSteps = Math.max(1, nIter * popSize * 2);
+                const pct = Math.min(100, Math.round((step / totalSteps) * 100));
+                if (fillEl) fillEl.style.width = pct + '%';
+                if (pctEl) pctEl.textContent = pct + '%';
+                if (stageEl) stageEl.textContent = '步骤 ' + step + ' / ~' + totalSteps + (evo.current_best != null ? ' · 当前最优 acc: ' + Number(evo.current_best).toFixed(4) : '');
                 pollCount++;
-                if (pollCount < 3600) setTimeout(poll, 2000);
+                if (pollCount < 3600) setTimeout(poll, 1000);
             };
             setTimeout(poll, 1500);
         } catch (e) {
             btn.disabled = false;
             btn.textContent = '开始完全融合';
+            alert('请求失败: ' + e.message);
+        }
+    });
+}
+
+function setupRecipeApply() {
+    const trigger = document.getElementById('recipe-apply-trigger');
+    const optionsUl = document.getElementById('recipe-apply-options');
+    const hiddenId = document.getElementById('recipe-apply-id');
+    const triggerText = document.getElementById('recipe-apply-text');
+    const btn = document.getElementById('recipe-apply-btn');
+    if (!trigger || !optionsUl || !btn) return;
+
+    async function loadRecipeList() {
+        try {
+            const res = await fetch('/api/recipes');
+            const data = await res.json();
+            const list = (data.recipes || []).slice(0, 50);
+            optionsUl.innerHTML = '';
+            if (list.length === 0) {
+                const li = document.createElement('li');
+                li.className = 'ios-option';
+                li.textContent = '暂无配方';
+                optionsUl.appendChild(li);
+            } else {
+                list.forEach((r, i) => {
+                    const li = document.createElement('li');
+                    li.className = 'ios-option' + (i === 0 ? ' selected' : '');
+                    li.dataset.recipeId = r.recipe_id || r.task_id || '';
+                    const name = (r.custom_name || r.recipe_id || r.task_id || '未命名').toString().slice(0, 40);
+                    const parents = (r.parent_names || r.model_paths || []).map(p => typeof p === 'string' ? p.split(/[/\\]/).pop() : '').join(' + ');
+                    li.innerHTML = '<span class="opt-name">' + name + (parents ? ' (' + parents + ')' : '') + '</span>';
+                    li.addEventListener('click', function() {
+                        optionsUl.querySelectorAll('.ios-option').forEach(x => x.classList.remove('selected'));
+                        this.classList.add('selected');
+                        const id = this.dataset.recipeId;
+                        if (hiddenId) hiddenId.value = id;
+                        if (triggerText) triggerText.textContent = this.querySelector('.opt-name') ? this.querySelector('.opt-name').textContent : id;
+                        trigger.closest('.ios-select-wrapper').classList.remove('active');
+                        optionsUl.classList.remove('open');
+                    });
+                    optionsUl.appendChild(li);
+                });
+            }
+        } catch (_) {}
+    }
+
+    trigger.addEventListener('click', () => {
+        if (optionsUl.children.length === 0) loadRecipeList();
+        trigger.closest('.ios-select-wrapper').classList.toggle('active');
+        optionsUl.classList.toggle('open');
+    });
+
+    btn.addEventListener('click', async () => {
+        const recipeId = (hiddenId && hiddenId.value) || '';
+        if (!recipeId) {
+            alert('请先选择配方');
+            return;
+        }
+        const customName = (document.getElementById('recipe-apply-custom-name') && document.getElementById('recipe-apply-custom-name').value.trim()) || '';
+        btn.disabled = true;
+        btn.textContent = '提交中...';
+        try {
+            const res = await fetch('/api/recipes/apply', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ recipe_id: recipeId, custom_name: customName || undefined })
+            });
+            const data = await res.json();
+            if (!data.task_id) {
+                alert(data.message || '提交失败');
+                btn.disabled = false;
+                btn.textContent = '按配方融合';
+                return;
+            }
+            btn.textContent = '已提交: ' + data.task_id;
+            const statusDiv = document.getElementById('task-status');
+            if (statusDiv) {
+                statusDiv.querySelector('.status-message').textContent = '配方融合任务已排队: ' + data.task_id;
+                const progContainer = statusDiv.querySelector('.progress-container');
+                const progPct = document.getElementById('task-progress-pct');
+                const progStage = document.getElementById('task-progress-stage');
+                if (progContainer) progContainer.style.display = 'block';
+                if (progPct) progPct.style.display = 'block';
+                if (progStage) progStage.style.display = 'block';
+            }
+            let pollCount = 0;
+            const poll = async () => {
+                const s = await fetch('/api/status/' + data.task_id).then(r => r.json()).catch(() => ({}));
+                const statusDiv = document.getElementById('task-status');
+                const fillEl = document.getElementById('task-progress-fill');
+                const pctEl = document.getElementById('task-progress-pct');
+                const stageEl = document.getElementById('task-progress-stage');
+                if (s.status === 'completed' || s.status === 'success') {
+                    btn.disabled = false;
+                    btn.textContent = '按配方融合';
+                    if (statusDiv) statusDiv.querySelector('.status-message').textContent = '配方融合完成';
+                    if (fillEl) fillEl.style.width = '100%';
+                    if (pctEl) pctEl.textContent = '100%';
+                    if (stageEl) stageEl.textContent = '';
+                    loadHistoryList();
+                    return;
+                }
+                if (s.status === 'error') {
+                    btn.disabled = false;
+                    btn.textContent = '按配方融合';
+                    if (statusDiv) statusDiv.querySelector('.status-message').textContent = '失败: ' + (s.message || s.error);
+                    return;
+                }
+                if (statusDiv && s.message) statusDiv.querySelector('.status-message').textContent = (s.message || '').slice(0, 120);
+                const pct = s.progress || 0;
+                if (fillEl) fillEl.style.width = pct + '%';
+                if (pctEl) pctEl.textContent = pct + '%';
+                if (stageEl) stageEl.textContent = '';
+                pollCount++;
+                if (pollCount < 600) setTimeout(poll, 1000);
+            };
+            setTimeout(poll, 1500);
+        } catch (e) {
+            btn.disabled = false;
+            btn.textContent = '按配方融合';
             alert('请求失败: ' + e.message);
         }
     });

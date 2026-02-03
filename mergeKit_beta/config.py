@@ -25,6 +25,8 @@ class Config:
     LOCAL_MODELS_PATH = os.path.abspath(os.environ.get("LOCAL_MODELS_PATH", "/home/a/ServiceEndFiles/Models"))
     MERGE_DIR = os.path.join(PROJECT_ROOT, "merges")
     LOGS_DIR = os.path.join(PROJECT_ROOT, "logs", "merge")
+    # 完全融合配方目录：保存可复现的配方（genotype + 参数），供直接融合
+    RECIPES_DIR = os.path.join(PROJECT_ROOT, "recipes")
 
     # ==================== 优先级配置 ====================
     PRIORITY_MAP = {
@@ -57,5 +59,6 @@ class Config:
         os.environ["NUMEXPR_MAX_THREADS"] = str(cls.NUMEXPR_MAX_THREADS)
         os.makedirs(cls.MERGE_DIR, exist_ok=True)
         os.makedirs(cls.LOGS_DIR, exist_ok=True)
+        os.makedirs(cls.RECIPES_DIR, exist_ok=True)
         if not os.path.isdir(cls.MODEL_POOL_PATH):
             os.makedirs(cls.MODEL_POOL_PATH, exist_ok=True)

@@ -566,6 +566,73 @@ h3 {
     }
 }
 
+/* 完全融合：工作台与参数并列 */
+.evolutionary-main-layout {
+    display: flex;
+    gap: 24px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+}
+.evolutionary-left {
+    flex: 1 1 50%;
+    min-width: 320px;
+}
+.evolutionary-right {
+    flex: 0 1 380px;
+    min-width: 280px;
+}
+.params-form-evolutionary {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px 20px;
+    margin-top: 0;
+}
+.params-form-evolutionary .form-group {
+    margin-bottom: 0;
+}
+.params-form-evolutionary .form-group:first-child {
+    grid-column: 1 / -1;
+}
+.params-form-evolutionary .btn {
+    grid-column: 1 / -1;
+    margin-top: 8px;
+}
+/* 完全融合：字体与间距微调，减轻拥挤 */
+.evolutionary-main-layout .form-group label,
+.evolutionary-right .form-group label {
+    font-size: 0.95rem;
+    margin-bottom: 6px;
+}
+.evolutionary-right .ios-select-trigger,
+.evolutionary-right .ios-input {
+    font-size: 0.95rem;
+    padding: 10px 12px;
+}
+.params-form-evolutionary {
+    gap: 14px 20px;
+}
+.dataset-search-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+.dataset-search-row .ios-input {
+    flex: 1;
+    min-width: 0;
+}
+.btn-sm {
+    padding: 8px 14px;
+    font-size: 0.9rem;
+}
+@media (max-width: 900px) {
+    .evolutionary-main-layout {
+        flex-direction: column;
+    }
+    .evolutionary-right {
+        flex: 1 1 100%;
+    }
+}
+
 /* =========================================
    4. Models Grid
    ========================================= */
