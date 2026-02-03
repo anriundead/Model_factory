@@ -1,0 +1,58 @@
+{
+  "models": {
+    "0924e7d9-0939-4196-a5af-6eff5e6e9bb9": {
+      "model_id": "0924e7d9-0939-4196-a5af-6eff5e6e9bb9",
+      "name": "KaLM v2.5-0.5B_Qwen2.5-0.5B_20260129120144",
+      "architecture": "Qwen2ForCausalLM",
+      "model_type": "LLM",
+      "is_merged": true,
+      "recipe": {
+        "parent_models": [
+          "KaLM v2.5-0.5B",
+          "Qwen2.5-0.5B"
+        ],
+        "weights": [
+          0.5,
+          0.5
+        ],
+        "method": "linear",
+        "library": "mergenetic",
+        "dtype": "float16",
+        "search_method": null,
+        "search_params": null
+      },
+      "param_count": 272269312,
+      "created_at": 1769688209.9965546,
+      "created_by": "system",
+      "eval_history": [],
+      "tags": []
+    },
+    "b62642a0-9e9e-4cad-a807-104bb2546d19": {
+      "model_id": "b62642a0-9e9e-4cad-a807-104bb2546d19",
+      "name": "KaLM v2.5-0.5B_Qwen2.5-0.5B_639ba201",
+      "architecture": "Qwen2ForCausalLM",
+      "model_type": "LLM",
+      "is_merged": true,
+      "recipe": {
+        "parent_models": [
+          "KaLM v2.5-0.5B",
+          "Qwen2.5-0.5B"
+        ],
+        "weights": [
+          1,
+          1
+        ],
+        "method": "ties_dare",
+        "library": "mergenetic",
+        "dtype": "float16",
+        "search_method": null,
+        "search_params": null
+      },
+      "param_count": 272269312,
+      "created_at": 1769766214.4443493,
+      "created_by": "system",
+      "eval_history": [],
+      "tags": []
+    }
+  }
+}

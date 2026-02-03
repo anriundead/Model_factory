@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mergenetic Pro - 测试集仓库</title>
+    <link rel="stylesheet" href="https://font.sec.miui.com/font/css?family=MiSans:200,300,400,500,600,700&display=swap">
+    <link rel="stylesheet" href="/static/styles.css">
+    <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+</head>
+<body>
+    <header class="sticky-header">
+        <div class="header-content">
+            <div class="header-left-group">
+                <button id="menu-btn" class="icon-btn"><i class="ri-menu-line"></i></button>
+                <div class="logo">Mergenetic <span class="badge">Pro</span></div>
+            </div>
+            <nav><span class="status-dot"></span> <span class="status-word">测试集仓库</span></nav>
+        </div>
+    </header>
+    <aside id="history-sidebar" class="sidebar">
+        <div class="sidebar-header"><h3>工程菜单</h3> <button id="close-sidebar"><i class="ri-close-line"></i></button></div>
+        <nav class="sidebar-nav">
+            <a href="/" class="nav-item"><i class="ri-git-merge-line"></i><span>模型融合</span></a>
+            <a href="/evaluation" class="nav-item"><i class="ri-flask-line"></i><span>模型测试</span></a>
+            <a href="/testsets" class="nav-item active"><i class="ri-database-2-line"></i><span>测试集仓库</span></a>
+            <a href="/test_history" class="nav-item"><i class="ri-history-line"></i><span>测试历史记录</span></a>
+            <a href="/model_repo" class="nav-item"><i class="ri-archive-line"></i><span>模型仓库</span></a>
+        </nav>
+        <div style="padding: 0 25px; margin-top: 10px; font-size: 0.85rem; color: #86868b;">历史记录</div>
+        <div id="history-list" class="history-list"></div>
+    </aside>
+    <div id="sidebar-overlay" class="sidebar-overlay"></div>
+    <div id="main-app" class="container active-view">
+        <main>
+            <div class="page-header">
+                <h2>测试集仓库</h2>
+                <p class="page-subtitle">管理评测用数据集，支持 HuggingFace 数据集创建与列表</p>
+            </div>
+            <section class="section apple-card">
+                <div class="section-header"><h3>测试集列表</h3> <span class="helper-text">Testsets</span></div>
+                <div id="testsets-list" class="models-grid"><div class="loading-state"><div class="spinner"></div><p>加载中...</p></div></div>
+            </section>
+        </main>
+        <footer><p>Copyright © 2025 Nine Heavens. 保留所有权利。</p></footer>
+    </div>
+    <script>
+        document.getElementById('menu-btn').onclick = () => { document.getElementById('history-sidebar').classList.add('open'); document.getElementById('sidebar-overlay').classList.add('show'); };
+        document.getElementById('close-sidebar').onclick = () => { document.getElementById('history-sidebar').classList.remove('open'); document.getElementById('sidebar-overlay').classList.remove('show'); };
+        document.getElementById('sidebar-overlay').onclick = () => { document.getElementById('history-sidebar').classList.remove('open'); document.getElementById('sidebar-overlay').classList.remove('show'); };
+        fetch('/api/testset/list').then(r=>r.json()).then(d=>{
+            const el = document.getElementById('testsets-list');
+            if (!d.testsets || d.testsets.length === 0) { el.innerHTML = '<p class="limit-desc">暂无测试集</p>'; return; }
+            el.innerHTML = d.testsets.map(t => '<div class="model-card"><div class="model-name">' + (t.name||t.hf_dataset||t.testset_id) + '</div><div class="limit-desc">' + (t.hf_dataset||'') + ' · ' + (t.sample_count||0) + ' 条</div></div>').join('');
+        }).catch(() => { document.getElementById('testsets-list').innerHTML = '<p class="limit-desc">加载失败</p>'; });
+    </script>
+</body>
+</html>

@@ -1,0 +1,39 @@
+# ========== Workspaces 根目录：忽略过大的模型/第三方项目 ==========
+# 不忽略 mergeKit_beta 目录本身，仅忽略其下大文件（见下方）
+
+eval_outputs/
+fusion/
+GCCL-Medical-LLM2-FlowerTune-main/
+locks/
+@LongLink
+Mene/
+MergeAgent-ModelsMergePool-/
+mergeKit_alpha/
+MindEvo/
+MLLM_Merge/
+ModelEvaluator/
+modelmerge_visual/
+ModelMerging/
+ModelsMerging/
+yaml_system/
+yaml_user/
+ZjyCode/
+
+# ========== mergeKit_beta 内：仅忽略过大的输出与缓存 ==========
+# 保留代码、配置、前端等，只忽略融合产物与日志等
+
+mergeKit_beta/merges/
+mergeKit_beta/logs/
+mergeKit_beta/app.log
+mergeKit_beta/__pycache__/
+mergeKit_beta/eval/
+mergeKit_beta/eval_workflow/
+mergeKit_beta/models_pool/
+mergeKit_beta/testset_download/
+mergeKit_beta/testset_repo/
+mergeKit_beta/yaml_template/
+
+# Python 与通用缓存（整仓库）
+**/__pycache__/
+*.pyc
+*.pyo

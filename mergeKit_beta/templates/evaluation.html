@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mergenetic Pro - 模型测试</title>
+    <link rel="stylesheet" href="https://font.sec.miui.com/font/css?family=MiSans:200,300,400,500,600,700&display=swap">
+    <link rel="stylesheet" href="/static/styles.css"> 
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/misans-webfont/misans-style.css" />
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+</head>
+<body>
+
+    <header class="sticky-header">
+        <div class="header-content">
+            <div class="header-left-group">
+                <button id="menu-btn" class="icon-btn">
+                    <i class="ri-menu-line"></i>
+                </button>
+                <div class="logo">Mergenetic <span class="badge">Pro</span></div>
+            </div>
+            <nav>
+                <span class="status-dot"></span> <span class="status-word">Evaluation Mode</span>
+            </nav>
+        </div>
+    </header>
+
+    <aside id="history-sidebar" class="sidebar">
+        <div class="sidebar-header">
+            <h3>工程菜单</h3>
+            <button id="close-sidebar"><i class="ri-close-line"></i></button>
+        </div>
+        
+        <nav class="sidebar-nav">
+            <a href="/" class="nav-item">
+                <i class="ri-git-merge-line"></i>
+                <span>模型融合</span>
+            </a>
+            <a href="/evaluation" class="nav-item active">
+                <i class="ri-flask-line"></i>
+                <span>模型测试</span>
+            </a>
+            <a href="/testsets" class="nav-item">
+                <i class="ri-database-2-line"></i>
+                <span>测试集仓库</span>
+            </a>
+            <a href="/test_history" class="nav-item">
+                <i class="ri-history-line"></i>
+                <span>测试历史记录</span>
+            </a>
+            <a href="/model_repo" class="nav-item">
+                <i class="ri-archive-line"></i>
+                <span>模型仓库</span>
+            </a>
+        </nav>
+
+        <div style="padding: 0 25px; margin-top: 10px; font-size: 0.85rem; color: #86868b; font-family:'Misans Medium'">历史记录</div>
+        <div id="history-list" class="history-list"></div>
+    </aside>
+    <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+    <div id="main-app" class="container active-view">
+        <main>
+            <div class="page-header">
+                <h2>性能评估</h2>
+                <p class="page-subtitle">选择待测模型与数据集，基于 lm_eval 进行标准化能力测试</p>
+            </div>
+
+            <div class="two-column-layout">
+                <div class="left-col" style="display: flex; flex-direction: column; gap: 30px;">
+                    <section class="section apple-card" style="margin-bottom: 0;">
+                        <div class="section-header">
+                            <h3>本地基座模型</h3>
+                            <span class="helper-text">Local Base Models</span>
+                        </div>
+                        <div id="local-models-container" class="models-grid">
+                            <div class="loading-state"><div class="spinner"></div></div>
+                        </div>
+                    </section>
+
+                    <section class="section apple-card">
+                        <div class="section-header">
+                            <h3>已融合模型</h3>
+                            <span class="helper-text">Merged Models</span>
+                        </div>
+                        <div id="merged-models-container" class="models-grid">
+                            <div class="loading-state"><div class="spinner"></div></div>
+                        </div>
+                    </section>
+                </div>
+
+                <div class="right-col">
+                    <section class="section apple-card">
+                        <div class="section-header">
+                            <h3>测试配置</h3>
+                            <span class="helper-text">Configuration</span>
+                        </div>
+                        
+                        <div id="eval-dropzone" class="dropzone">
+                            <div class="dropzone-content">
+                                <i class="ri-flask-line drop-icon"></i>
+                                <p class="drop-title">点击左侧模型添加</p>
+                                <p class="hint">单次仅支持评估一个模型</p>
+                            </div>
+                            <div id="selected-eval-model" class="selected-models"></div>
+                        </div>
+
+                        <div class="params-form" style="margin-top: 30px;">
+                            <div class="form-group">
+                                <label>评估数据集</label>
+                                <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                    <div class="ios-select-trigger">
+                                        <span class="selected-text">全部评测 (Standard Benchmark)</span>
+                                        <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                    </div>
+                                    <ul class="ios-select-options">
+                                        <li class="ios-option selected" data-value="all">
+                                            <div class="opt-left">
+                                                <i class="ri-dashboard-line" style="color:var(--apple-blue);"></i>
+                                                <span class="opt-name">全部评测 (Standard Benchmark)</span>
+                                            </div>
+                                            <span class="opt-desc">综合 HellaSwag, ARC, BoolQ, Winogrande</span>
+                                        </li>
+                                        <li class="ios-option" data-value="hellaswag">
+                                            <div class="opt-left">
+                                                <i class="ri-brain-line" style="color:#ff9f0a;"></i>
+                                                <span class="opt-name">HellaSwag</span>
+                                            </div>
+                                            <span class="opt-desc">常识推理 (Common Sense)</span>
+                                        </li>
+                                        <li class="ios-option" data-value="arc_easy">
+                                            <div class="opt-left">
+                                                <i class="ri-flask-line" style="color:#30b0c7;"></i>
+                                                <span class="opt-name">ARC-Easy</span>
+                                            </div>
+                                            <span class="opt-desc">科学问答 (Science QA)</span>
+                                        </li>
+                                        <li class="ios-option" data-value="boolq">
+                                            <div class="opt-left">
+                                                <i class="ri-question-answer-line" style="color:#ff375f;"></i>
+                                                <span class="opt-name">BoolQ</span>
+                                            </div>
+                                            <span class="opt-desc">阅读理解 (Yes/No)</span>
+                                        </li>
+                                        <li class="ios-option" data-value="winogrande">
+                                            <div class="opt-left">
+                                                <i class="ri-text-spacing" style="color:#bf5af2;"></i>
+                                                <span class="opt-name">Winogrande</span>
+                                            </div>
+                                            <span class="opt-desc">代词消歧 (Reasoning)</span>
+                                        </li>
+                                        <li class="ios-option" data-value="piqa">
+                                            <div class="opt-left">
+                                                <i class="ri-lightbulb-line" style="color:#32d74b;"></i>
+                                                <span class="opt-name">PIQA</span>
+                                            </div>
+                                            <span class="opt-desc">物理常识 (Physical Interaction)</span>
+                                        </li>
+                                    </ul>
+                                    <input type="hidden" id="eval-dataset" value="all">
+                                </div>
+                                
+                                <div class="segmented-control-wrapper">
+                                    <label class="segmented-label">测试深度 (Limit)</label>
+                                    <div class="segmented-control" id="eval-limit-control">
+                                        <div class="segmented-option" data-value="0.1">10% (快速)</div>
+                                        <div class="segmented-option selected active" data-value="0.5">50% (均衡)</div>
+                                        <div class="segmented-option" data-value="1.0">100% (完整)</div>
+                                    </div>
+                                    <div class="limit-desc">注：测试用例跑得越多，结果越准，耗时越久</div>
+                                    <input type="hidden" id="eval-limit" value="0.5">
+                                </div>
+
+                            </div> </div> </section>
+                </div>
+            </div>
+
+            <section class="action-bar">
+                <div id="task-status" class="task-status">
+                    <div class="status-header">
+                        <div class="status-message">准备就绪</div>
+                    </div>
+                    <div class="progress-container" style="display: none;">
+                        <div class="progress-bar"><div class="progress-fill"></div></div>
+                    </div>
+                </div>
+                
+                <div class="buttons">
+                    <button id="clear-eval" class="btn btn-secondary" disabled>重置</button>
+                    <button id="start-eval" class="btn btn-primary" disabled>开始测试</button>
+                </div>
+            </section>
+
+            <section class="section apple-card result-section" id="results-section" style="display: none;">
+                <div class="section-header">
+                    <h3>评估结果报告</h3>
+                </div>
+                <div class="results-grid">
+                    <div class="result-card">
+                        <span class="label">准确率 (Accuracy)</span>
+                        <div class="value" id="accuracy">--</div>
+                    </div>
+                    <div class="result-card">
+                        <span class="label">F1 Score</span>
+                        <div class="value" id="f1-score">--</div>
+                    </div>
+                    <div class="result-card">
+                        <span class="label">测试用例</span>
+                        <div class="value" id="test-cases">--</div>
+                    </div>
+                    <div class="result-card">
+                        <span class="label">上下文长度</span>
+                        <div class="value" id="context-len">--</div>
+                    </div>
+                </div>
+                <div class="chart-container">
+                    <canvas id="evaluation-chart"></canvas>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <p>Copyright © 2025 Nine Heavens. 保留所有权利。</p>
+        </footer>
+    </div>
+
+    <div id="delete-modal-overlay" class="modal-overlay" style="display: none;">
+        <div class="ios-modal">
+            <div class="modal-header">
+                <h3>删除记录</h3>
+                <p>确定要永久删除该测试记录吗？<br>此操作不可恢复。</p>
+            </div>
+            <div class="modal-actions">
+                <button id="cancel-delete" class="ios-btn ios-btn-cancel">取消</button>
+                <button id="confirm-delete" class="ios-btn ios-btn-confirm" style="background-color: var(--error); color: white;">删除</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/evaluation.js"></script>
+</body>
+</html>

@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mergenetic Pro - 模型融合平台</title>
+    <link rel="stylesheet" href="https://font.sec.miui.com/font/css?family=MiSans:200,300,400,500,600,700&display=swap">
+    <link rel="stylesheet" href="static/styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/misans-webfont/misans-style.css" />
+    <link rel="icon" type="image/x-icon" href="static/favicon.ico">
+</head>
+<body>
+
+    <div id="welcome-screen">
+        <div class="welcome-content">
+            <h1 class="hero-title">Mergenetic.</h1>
+            <p class="hero-subtitle">新一代 LLM 模型融合与进化平台<br>精准、高效、无限可能</p>
+            
+            <button id="enter-btn" class="circle-arrow-btn">
+                <i class="ri-arrow-down-line"></i>
+            </button>
+            <p class="enter-text">点击开始</p>
+        </div>
+    </div>
+
+    <header class="sticky-header">
+        <div class="header-content">
+            <div class="header-left-group">
+                <button id="menu-btn" class="icon-btn">
+                    <i class="ri-menu-line"></i>
+                </button>
+                <div class="logo">Mergenetic <span class="badge">Pro</span></div>
+            </div>
+            
+            <nav>
+                <span class="status-dot"></span> <span class="status-word">System Ready</span>
+            </nav>
+        </div>
+    </header>
+
+    <aside id="history-sidebar" class="sidebar">
+        <div class="sidebar-header">
+            <h3>工程菜单</h3> <button id="close-sidebar"><i class="ri-close-line"></i></button>
+        </div>
+        
+        <nav class="sidebar-nav">
+            <a href="/" class="nav-item active">
+                <i class="ri-git-merge-line"></i>
+                <span>模型融合</span>
+            </a>
+            <a href="/evaluation" class="nav-item">
+                <i class="ri-flask-line"></i>
+                <span>模型测试</span>
+            </a>
+            <a href="/testsets" class="nav-item">
+                <i class="ri-database-2-line"></i>
+                <span>测试集仓库</span>
+            </a>
+            <a href="/test_history" class="nav-item">
+                <i class="ri-history-line"></i>
+                <span>测试历史记录</span>
+            </a>
+            <a href="/model_repo" class="nav-item">
+                <i class="ri-archive-line"></i>
+                <span>模型仓库</span>
+            </a>
+        </nav>
+
+        <div style="padding: 0 25px; margin-top: 10px; font-size: 0.85rem; color: #86868b; font-family:'Misans Medium'">历史记录</div>
+        <div id="history-list" class="history-list">
+            </div>
+    </aside>
+    <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+    <div id="delete-modal-overlay" class="modal-overlay" style="display: none;">
+        <div class="ios-modal">
+            <div class="modal-header">
+                <h3>删除记录</h3>
+                <p>确定要永久删除该融合工程吗？<br>此操作不可恢复。</p>
+            </div>
+            <div class="modal-actions">
+                <button id="cancel-delete" class="ios-btn ios-btn-cancel">取消</button>
+                <button id="confirm-delete" class="ios-btn ios-btn-confirm" style="background-color: var(--error);">删除</button>
+            </div>
+        </div>
+    </div>
+
+    
+    <div id="main-app" class="container blurred-hidden">
+
+        <main>
+            <div class="bigLogo">
+                <img src="static/bigLogo.svg" alt="Mergenetic Logo" style="margin: auto; text-align: center; display: block; width: 150px; height: auto; margin-bottom: 50px; padding-top: 50px;">
+            </div>
+            <div class="page-header">
+                <h2>模型工坊</h2>
+                <p class="page-subtitle">选择基座模型，配置融合参数，构建您的专属智能体</p>
+            </div>
+
+            <div class="segmented-control-wrapper" style="margin-bottom: 24px;">
+                <div class="segmented-control" id="merge-mode-control">
+                    <div class="segmented-option selected active" data-value="standard">标准融合</div>
+                    <div class="segmented-option" data-value="evolutionary">完全融合</div>
+                </div>
+                <p class="limit-desc" style="margin-top: 8px;">标准融合：手动设置权重；完全融合：使用 mergenetic 进化迭代，可设置种群、迭代与 MMLU 子集。</p>
+            </div>
+
+            <div id="panel-standard-merge">
+            <section class="section apple-card">
+                <div class="section-header">
+                    <h3>本地可用模型</h3>
+                    <span class="helper-text">Local Models</span>
+                </div>
+                <div id="models-container" class="models-grid">
+                    <div class="loading-state">
+                        <div class="spinner"></div>
+                        <p>正在扫描本地模型库...</p>
+                    </div>
+                </div>
+            </section>
+
+            <div class="two-column-layout">
+                <section class="section apple-card">
+                    <div class="section-header">
+                        <h3>融合工作台</h3>
+                        <span class="helper-text">Merge Workspace</span>
+                    </div>
+                    <div id="dropzone" class="dropzone">
+                        <div class="dropzone-content">
+                            <i class="ri-add-circle-line drop-icon"></i>
+                            <p class="drop-title">拖入模型</p>
+                            <p class="hint">或点击上方模型卡片添加</p>
+                        </div>
+                        <div id="selected-models" class="selected-models">
+                            </div>
+                    </div>
+                </section>
+
+                <section class="section apple-card">
+                    <div class="section-header">
+                        <h3>参数配置</h3>
+                        <span class="helper-text">Parameters</span>
+                    </div>
+                    <div class="params-form">
+                        
+                        <div class="form-group">
+                            <label>融合算法</label>
+                            <input type="hidden" id="merge-method" value="linear">
+                            
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger">
+                                    <span class="selected-text">Linear</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options">
+                                    <li class="ios-option selected" data-value="linear">
+                                        <div class="opt-left">
+                                            <i class="ri-git-merge-line" style="color: #5e5ce6;"></i>
+                                            <span class="opt-name">Linear</span>
+                                        </div>
+                                        <span class="opt-desc">线性加权平均</span>
+                                    </li>
+                                    <li class="ios-option" data-value="slerp">
+                                        <div class="opt-left">
+                                            <i class="ri-earth-line" style="color: #30b0c7;"></i>
+                                            <span class="opt-name">SLERP</span>
+                                        </div>
+                                        <span class="opt-desc">球面线性插值</span>
+                                    </li>
+                                    <li class="ios-option" data-value="task_arithmetic">
+                                        <div class="opt-left">
+                                            <i class="ri-calculator-line" style="color: #ff9f0a;"></i>
+                                            <span class="opt-name">Task Arithmetic</span>
+                                        </div>
+                                        <span class="opt-desc">任务向量运算</span>
+                                    </li>
+                                    <li class="ios-option" data-value="ties_dare">
+                                        <div class="opt-left">
+                                            <i class="ri-scissors-cut-line" style="color: #ff375f;"></i>
+                                            <span class="opt-name">TIES-DARE</span>
+                                        </div>
+                                        <span class="opt-desc">稀疏化与合并</span>
+                                    </li>
+                                </ul>
+                            </div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>精度类型</label>
+                            <input type="hidden" id="dtype" value="float16">
+                            
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger">
+                                    <span class="selected-text">Float16</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options">
+                                    <li class="ios-option selected" data-value="float16">
+                                        <div class="opt-left">
+                                            <i class="ri-file-shred-line" style="color: var(--apple-blue);"></i>
+                                            <span class="opt-name">Float16</span>
+                                        </div>
+                                        <span class="opt-desc">标准半精度</span>
+                                    </li>
+                                    <li class="ios-option" data-value="float32">
+                                        <div class="opt-left">
+                                            <i class="ri-database-2-line" style="color: var(--apple-gray);"></i>
+                                            <span class="opt-name">Float32</span>
+                                        </div>
+                                        <span class="opt-desc">高精度 (显存占用大)</span>
+                                    </li>
+                                    <li class="ios-option" data-value="bfloat16">
+                                        <div class="opt-left">
+                                            <i class="ri-cpu-line" style="color: #af52de;"></i>
+                                            <span class="opt-name">BFloat16</span>
+                                        </div>
+                                        <span class="opt-desc">BF16 (需硬件支持)</span>
+                                    </li>
+                                </ul>
+                            </div>
+                        </div>
+
+                        <div id="weights-container" class="weights-container">
+                        </div>
+                        <div class="segmented-control-wrapper">
+                            <label class="segmented-label">测试深度 (Limit)</label>
+                            <div class="segmented-control" id="merge-limit-control">
+                                <div class="segmented-option" data-value="0.1">10% (快速)</div>
+                                <div class="segmented-option selected active" data-value="0.5">50% (均衡)</div>
+                                <div class="segmented-option" data-value="1.0">100% (完整)</div>
+                            </div>
+                            <div class="limit-desc">注：测试用例跑得越多，结果越准，耗时越久</div>
+                            <input type="hidden" id="merge-limit" value="0.5">
+                        </div>
+                </div>
+            </section>
+            </div>
+            </div>
+
+            <div id="panel-evolutionary-merge" style="display: none;">
+                <section class="section apple-card">
+                    <div class="section-header">
+                        <h3>完全融合（进化迭代）</h3>
+                        <span class="helper-text">Mergenetic Evolutionary</span>
+                    </div>
+                    <p class="limit-desc" style="margin-bottom: 16px;">选择至少 2 个模型，设置种群、迭代、最大样本量及数据集与子集；涉及 VLM 时请选用 CMMMU 等图像数据集。</p>
+                    <div class="two-column-layout">
+                        <section class="section apple-card">
+                            <div class="section-header">
+                                <h3>融合工作台</h3>
+                                <span class="helper-text">Merge Workspace</span>
+                            </div>
+                            <div id="evolutionary-dropzone" class="dropzone">
+                                <div class="dropzone-content" id="evolutionary-workspace-placeholder">
+                                    <i class="ri-add-circle-line drop-icon"></i>
+                                    <p class="drop-title">待融合模型</p>
+                                    <p class="hint">点击下方模型卡片加入，至少选 2 个</p>
+                                </div>
+                                <div id="evolutionary-selected-list" class="selected-models"></div>
+                            </div>
+                        </section>
+                        <section class="section apple-card">
+                            <div class="section-header">
+                                <h3>参与融合的模型（多选）</h3>
+                                <span class="helper-text">可选模型 · 已标 VLM/LLM</span>
+                            </div>
+                            <div id="evolutionary-models-container" class="models-grid" style="max-height: 220px; overflow-y: auto;"></div>
+                            <p class="limit-desc">点击卡片选中/取消，至少选 2 个</p>
+                        </section>
+                    </div>
+                    <div class="params-form" style="margin-top: 20px;">
+                        <div class="form-group">
+                            <label>任务名称</label>
+                            <input type="text" id="evolutionary-custom-name" class="ios-input" placeholder="进化融合任务名称" value="">
+                        </div>
+                        <div class="form-group">
+                            <label>种群大小</label>
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger" id="evolutionary-pop-trigger">
+                                    <span class="selected-text">20</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options" id="evolutionary-pop-options">
+                                    <li class="ios-option" data-value="8"><span class="opt-name">8</span></li>
+                                    <li class="ios-option selected" data-value="20"><span class="opt-name">20</span></li>
+                                    <li class="ios-option" data-value="32"><span class="opt-name">32</span></li>
+                                    <li class="ios-option" data-value="64"><span class="opt-name">64</span></li>
+                                </ul>
+                            </div>
+                            <input type="hidden" id="evolutionary-pop-size" value="20">
+                        </div>
+                        <div class="form-group">
+                            <label>迭代次数</label>
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger" id="evolutionary-iter-trigger">
+                                    <span class="selected-text">15</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options" id="evolutionary-iter-options">
+                                    <li class="ios-option" data-value="5"><span class="opt-name">5</span></li>
+                                    <li class="ios-option" data-value="10"><span class="opt-name">10</span></li>
+                                    <li class="ios-option selected" data-value="15"><span class="opt-name">15</span></li>
+                                    <li class="ios-option" data-value="20"><span class="opt-name">20</span></li>
+                                    <li class="ios-option" data-value="30"><span class="opt-name">30</span></li>
+                                </ul>
+                            </div>
+                            <input type="hidden" id="evolutionary-n-iter" value="15">
+                        </div>
+                        <div class="form-group">
+                            <label>最大样本量</label>
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger" id="evolutionary-samples-trigger">
+                                    <span class="selected-text">64</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options" id="evolutionary-samples-options">
+                                    <li class="ios-option" data-value="32"><span class="opt-name">32</span></li>
+                                    <li class="ios-option selected" data-value="64"><span class="opt-name">64</span></li>
+                                    <li class="ios-option" data-value="100"><span class="opt-name">100</span></li>
+                                    <li class="ios-option" data-value="200"><span class="opt-name">200</span></li>
+                                </ul>
+                            </div>
+                            <input type="hidden" id="evolutionary-max-samples" value="64">
+                        </div>
+                        <div class="form-group">
+                            <label>数据集类型</label>
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger" id="evolutionary-dataset-type-trigger">
+                                    <span class="selected-text">MMLU（纯文本）</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options" id="evolutionary-dataset-type-options">
+                                    <li class="ios-option selected" data-value="mmlu">
+                                        <div class="opt-left"><span class="opt-name">MMLU（纯文本）</span></div>
+                                        <span class="opt-desc">cais/mmlu，适合 LLM</span>
+                                    </li>
+                                    <li class="ios-option" data-value="cmmmu">
+                                        <div class="opt-left"><span class="opt-name">CMMMU（多模态）</span></div>
+                                        <span class="opt-desc">m-a-p/CMMMU，含图像，适合 VLM</span>
+                                    </li>
+                                </ul>
+                            </div>
+                            <input type="hidden" id="evolutionary-dataset-type" value="mmlu">
+                        </div>
+                        <div class="form-group" id="evolutionary-subset-form-group">
+                            <label id="evolutionary-subset-label">MMLU 子集</label>
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger" id="evolutionary-subset-trigger">
+                                    <span class="selected-text" id="evolutionary-subset-text">生物/医学</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options" id="evolutionary-subset-options"></ul>
+                            </div>
+                            <input type="hidden" id="evolutionary-mmlu-subset" value="college_medicine">
+                        </div>
+                        <div class="form-group">
+                            <label>精度</label>
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger" id="evolutionary-dtype-trigger">
+                                    <span class="selected-text">BFloat16</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options" id="evolutionary-dtype-options">
+                                    <li class="ios-option selected" data-value="bfloat16"><span class="opt-name">BFloat16</span></li>
+                                    <li class="ios-option" data-value="float16"><span class="opt-name">Float16</span></li>
+                                    <li class="ios-option" data-value="float32"><span class="opt-name">Float32</span></li>
+                                </ul>
+                            </div>
+                            <input type="hidden" id="evolutionary-dtype" value="bfloat16">
+                        </div>
+                        <div class="form-group">
+                            <label>Ray GPU 数</label>
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger" id="evolutionary-ray-trigger">
+                                    <span class="selected-text">2</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options" id="evolutionary-ray-options">
+                                    <li class="ios-option" data-value="1"><span class="opt-name">1</span></li>
+                                    <li class="ios-option selected" data-value="2"><span class="opt-name">2</span></li>
+                                    <li class="ios-option" data-value="4"><span class="opt-name">4</span></li>
+                                    <li class="ios-option" data-value="8"><span class="opt-name">8</span></li>
+                                </ul>
+                            </div>
+                            <input type="hidden" id="evolutionary-ray-gpus" value="2">
+                        </div>
+                        <button type="button" id="start-evolutionary-merge" class="btn btn-primary">开始完全融合</button>
+                    </div>
+                </section>
+            </div>
+
+            <section class="action-bar">
+                <div id="task-status" class="task-status">
+                    <div class="status-header">
+                        <div class="status-message">准备就绪</div>
+                        <div class="progress-text" style="display: none;">0%</div>
+                    </div>
+                    
+                    <div class="progress-container" style="display: none;">
+                        <div class="progress-bar">
+                            <div class="progress-fill"></div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="buttons">
+                    <div id="edit-buttons" style="display: flex;">
+                        <button id="clear-selection" class="btn btn-secondary" disabled>重置</button>
+                        <button id="start-merge" class="btn btn-primary" disabled>开始融合</button>
+                    </div>
+                    
+                    <div id="history-buttons" style="display: none;">
+                        <button id="btn-new-project" class="btn btn-secondary">新工程</button>
+                        <button id="btn-download" class="btn btn-primary"><i class="ri-download-line"></i> 下载模型</button>
+                    </div>
+                </div>
+
+            </section>
+
+            <section class="section apple-card result-section" id="results-section" style="display: none;">
+                <div class="section-header">
+                    <h3>性能评估报告</h3>
+                </div>
+                <div class="results-grid">
+                    <div class="result-card">
+                    <span class="label">准确率</span>
+                    <div class="value" id="accuracy">--</div>
+                </div>
+                <div class="result-card">
+                    <span class="label">F1 Score</span>
+                    <div class="value" id="f1-score">--</div>
+                </div>
+                <div class="result-card">
+                    <span class="label">测试用例</span>
+                    <div class="value" id="test-cases">--</div>
+                </div>
+                <div class="result-card">
+                    <span class="label">通过数量</span>
+                    <div class="value" id="passed">--</div>
+                </div>
+                </div>
+                <div class="chart-container">
+                    <canvas id="evaluation-chart"></canvas>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <p>Copyright © 2025 Nine Heavens. 保留所有权利。</p>
+        </footer>
+    </div>
+
+    <div id="delete-modal-overlay" class="modal-overlay" style="display: none;">
+        <div class="ios-modal">
+            <div class="modal-header">
+                <h3>删除记录</h3>
+                <p>确定要永久删除该融合工程吗？<br>此操作不可恢复。</p>
+            </div>
+            <div class="modal-actions">
+                <button id="cancel-delete" class="ios-btn ios-btn-cancel">取消</button>
+                <button id="confirm-delete" class="ios-btn ios-btn-confirm" style="background-color: var(--error); color: white;">删除</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const enterBtn = document.getElementById('enter-btn');
+            const welcomeScreen = document.getElementById('welcome-screen');
+            const mainApp = document.getElementById('main-app');
+            const body = document.body;
+            const STORAGE_KEY = 'mergenetic_last_visit_time';
+
+            function shouldShowWelcome() {
+                const lastVisitTimestamp = localStorage.getItem(STORAGE_KEY);
+                if (!lastVisitTimestamp) return true;
+                const lastVisit = new Date(parseInt(lastVisitTimestamp));
+                const now = new Date();
+                const threshold = getMostRecentMonday8AM(now);
+                return lastVisit < threshold;
+            }
+
+            function getMostRecentMonday8AM(date) {
+                const d = new Date(date);
+                const day = d.getDay(); 
+                const currentHour = d.getHours();
+                let diffToMonday = d.getDate() - day + (day === 0 ? -6 : 1);
+                if (day === 1 && currentHour < 8) {
+                    diffToMonday -= 7;
+                }
+                const monday = new Date(d.setDate(diffToMonday));
+                monday.setHours(8, 0, 0, 0); 
+                return monday;
+            }
+            
+            if (shouldShowWelcome()) {
+                console.log("New week cycle detected or first visit. Showing intro.");
+                enterBtn.addEventListener('click', () => {
+                    localStorage.setItem(STORAGE_KEY, new Date().getTime());
+                    welcomeScreen.style.transform = 'translateY(-100vh)';
+                    welcomeScreen.style.opacity = '0';
+                    mainApp.classList.remove('blurred-hidden');
+                    mainApp.classList.add('active-view');
+                    body.style.overflowY = 'auto';
+                    setTimeout(() => { welcomeScreen.style.display = 'none'; }, 800);
+                });
+            } else {
+                console.log("Welcome screen already seen this cycle. Skipping.");
+                welcomeScreen.style.display = 'none';
+                mainApp.classList.remove('blurred-hidden');
+                mainApp.style.opacity = '1';
+                mainApp.style.transform = 'translateY(0) scale(1)';
+                mainApp.style.filter = 'blur(0)';
+                body.style.overflowY = 'auto';
+            }
+        });
+    </script>
+
+    <div id="priority-modal-overlay" class="modal-overlay" style="display: none;">
+        <div class="ios-modal">
+            <div class="modal-header">
+                <h3>任务优先级</h3>
+                <p>请选择该融合任务的执行策略</p>
+            </div>
+
+            <div class="ios-select-wrapper" id="priority-wrapper">
+                <div class="input-group" style="margin-bottom: 25px;">
+                    <input type="text" id="model-name-input" class="ios-input" placeholder="输入融合模型名称 (必填)" autocomplete="off">
+                </div>
+                <div id="priority-trigger" class="ios-select-trigger">
+                    <span class="selected-text">Common</span>
+                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                </div>
+                
+                <ul id="priority-options" class="ios-select-options">
+                    <li class="ios-option" data-value="vip">
+                        <div class="opt-left">
+                            <i class="ri-vip-crown-fill icon-vip"></i>
+                            <span class="opt-name">VIP</span>
+                        </div>
+                        <span class="opt-desc">加入即执行，打断所有</span>
+                    </li>
+                    <li class="ios-option selected" data-value="common">
+                        <div class="opt-left">
+                            <i class="ri-stack-line icon-common"></i>
+                            <span class="opt-name">Common</span>
+                        </div>
+                        <span class="opt-desc">正常排队，可打断 Cutin</span>
+                    </li>
+                    <li class="ios-option" data-value="cutin">
+                        <div class="opt-left">
+                            <i class="ri-pause-circle-line icon-cutin"></i>
+                            <span class="opt-name">Cutin</span>
+                        </div>
+                        <span class="opt-desc">最低，会被打断，需手动恢复</span>
+                    </li>
+                </ul>
+            </div>
+
+            <div class="modal-actions">
+                <button id="cancel-priority" class="ios-btn ios-btn-cancel">取消</button>
+                <button id="confirm-priority" class="ios-btn ios-btn-confirm">确认融合</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mergenetic Pro - 测试历史记录</title>
+    <link rel="stylesheet" href="https://font.sec.miui.com/font/css?family=MiSans:200,300,400,500,600,700&display=swap">
+    <link rel="stylesheet" href="/static/styles.css">
+    <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+</head>
+<body>
+    <header class="sticky-header">
+        <div class="header-content">
+            <div class="header-left-group">
+                <button id="menu-btn" class="icon-btn"><i class="ri-menu-line"></i></button>
+                <div class="logo">Mergenetic <span class="badge">Pro</span></div>
+            </div>
+            <nav><span class="status-dot"></span> <span class="status-word">测试历史</span></nav>
+        </div>
+    </header>
+    <aside id="history-sidebar" class="sidebar">
+        <div class="sidebar-header"><h3>工程菜单</h3> <button id="close-sidebar"><i class="ri-close-line"></i></button></div>
+        <nav class="sidebar-nav">
+            <a href="/" class="nav-item"><i class="ri-git-merge-line"></i><span>模型融合</span></a>
+            <a href="/evaluation" class="nav-item"><i class="ri-flask-line"></i><span>模型测试</span></a>
+            <a href="/testsets" class="nav-item"><i class="ri-database-2-line"></i><span>测试集仓库</span></a>
+            <a href="/test_history" class="nav-item active"><i class="ri-history-line"></i><span>测试历史记录</span></a>
+            <a href="/model_repo" class="nav-item"><i class="ri-archive-line"></i><span>模型仓库</span></a>
+        </nav>
+        <div style="padding: 0 25px; margin-top: 10px; font-size: 0.85rem; color: #86868b;">历史记录</div>
+        <div id="history-list" class="history-list"></div>
+    </aside>
+    <div id="sidebar-overlay" class="sidebar-overlay"></div>
+    <div id="main-app" class="container active-view">
+        <main>
+            <div class="page-header">
+                <h2>测试历史记录</h2>
+                <p class="page-subtitle">查看过往评测任务与结果</p>
+            </div>
+            <section class="section apple-card">
+                <div class="section-header"><h3>历史记录</h3> <span class="helper-text">Test History</span></div>
+                <div id="test-history-list"><div class="loading-state"><div class="spinner"></div><p>加载中...</p></div></div>
+            </section>
+        </main>
+        <footer><p>Copyright © 2025 Nine Heavens. 保留所有权利。</p></footer>
+    </div>
+    <script>
+        document.getElementById('menu-btn').onclick = () => { document.getElementById('history-sidebar').classList.add('open'); document.getElementById('sidebar-overlay').classList.add('show'); };
+        document.getElementById('close-sidebar').onclick = () => { document.getElementById('history-sidebar').classList.remove('open'); document.getElementById('sidebar-overlay').classList.remove('show'); };
+        document.getElementById('sidebar-overlay').onclick = () => { document.getElementById('history-sidebar').classList.remove('open'); document.getElementById('sidebar-overlay').classList.remove('show'); };
+        fetch('/api/test_history').then(r=>r.json()).then(d=>{
+            const el = document.getElementById('test-history-list');
+            if (!d.history || d.history.length === 0) { el.innerHTML = '<p class="limit-desc">暂无测试历史</p>'; return; }
+            el.innerHTML = d.history.map(h => '<div class="history-item"><div class="h-title">' + (h.model_name||h.task_id||'') + '</div><div class="h-meta">' + (h.created_at ? new Date(h.created_at*1000).toLocaleString() : '') + '</div></div>').join('');
+        }).catch(() => { document.getElementById('test-history-list').innerHTML = '<p class="limit-desc">加载失败</p>'; });
+    </script>
+</body>
+</html>
