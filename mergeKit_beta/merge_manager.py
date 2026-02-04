@@ -5,11 +5,16 @@ import json
 import logging
 import os
 import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 from config import Config
 from core.process_manager import ProcessManager
+
+# 评估用（与 mergeKit_alpha 一致）
+STANDARD_BENCHMARKS = getattr(Config, "STANDARD_BENCHMARKS", ["hellaswag", "arc_easy", "boolq", "winogrande"])
 
 # 路径与配置
 MODEL_POOL_PATH = Config.MODEL_POOL_PATH
@@ -549,22 +554,344 @@ def run_recipe_apply_task(task_id, params, update_progress_callback, task_contro
         return {"status": "error", "error": str(e)}
 
 
+def _eval_get_context_length(model_path):
+    """读取模型上下文长度（与 mergeKit_alpha 一致）。"""
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        for attr in ("max_position_embeddings", "seq_length", "n_positions", "model_max_length"):
+            if hasattr(config, attr):
+                return getattr(config, attr)
+        return 2048
+    except Exception:
+        return 0
+
+
+def _pick_latest_json(path):
+    """在路径或目录下取最新修改的 json 文件（与 mergeKit_alpha 一致）。"""
+    if not path:
+        return None
+    candidates = []
+    if os.path.isfile(path) and path.lower().endswith(".json"):
+        candidates.append(path)
+    if os.path.isdir(path):
+        for root, _, files in os.walk(path):
+            for fn in files:
+                if fn.lower().endswith(".json"):
+                    candidates.append(os.path.join(root, fn))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: os.path.getmtime(p))
+
+
+# 测试集仓库：HF 数据集 -> lm_eval 任务名前缀。子集通过按科目任务名指定（如 mmlu_college_medicine）。
+# 结果写入 output_path（merges/<task_id>/），_pick_latest_json 会递归查找目录内最新 results*.json，其他测试集路径与输出逻辑一致。
+# 未在此映射的仓库数据集会以 hf_dataset 名作为 --tasks 传入，需为 lm_eval 支持的任务名才能正常运行。
+HF_DATASET_TO_LM_EVAL_TASK = {
+    "cais/mmlu": "mmlu",
+    "mmlu": "mmlu",
+}
+
+
+def _load_eval_task_mapping():
+    """加载可选的部署用映射文件，格式 JSON：{"hf_dataset": "前缀", "hf_dataset|subset": "lm_eval_task"}，与内置映射合并。"""
+    path = os.path.join(Config.PROJECT_ROOT, "config", "eval_task_mapping.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        _logger.warning("[eval] 读取映射文件失败 %s: %s", path, e)
+        return {}
+
+
+def run_lm_eval_stream(
+    model_path,
+    output_path,
+    task_name,
+    callback,
+    start_prog,
+    end_prog,
+    task_control=None,
+    limit="0.5",
+    hf_dataset=None,
+    hf_subset=None,
+    hf_split=None,
+    lm_eval_task=None,
+):
+    """
+    与 mergeKit_alpha 一致的评估流程：Popen 流式执行 lm_eval，结果写入 output_path。
+    若提供 lm_eval_task（测试集创建/选择时自动写入），优先使用；否则用 hf_dataset/hf_subset 推断或内置/配置文件映射。
+    返回 { acc, f1, samples, time, context, per_task_acc }。
+    """
+    if task_control is None:
+        task_control = {}
+    os.makedirs(output_path, exist_ok=True)
+
+    if (lm_eval_task or "").strip():
+        task_name = (lm_eval_task or "").strip()
+    elif (hf_dataset or "").strip():
+        # 测试集仓库分支：先查部署用映射文件，再内置映射，最后按 MMLU 规则推断
+        hf_key = (hf_dataset or "").strip()
+        subset = (hf_subset or "").strip()
+        extra = _load_eval_task_mapping()
+        exact_key = "%s|%s" % (hf_key, subset) if subset else hf_key
+        if exact_key in extra:
+            task_name = extra[exact_key]
+        elif hf_key in extra:
+            task_name = extra[hf_key] if not subset else (extra[hf_key] + "_" + subset.replace("-", "_"))
+        else:
+            mapped = HF_DATASET_TO_LM_EVAL_TASK.get(hf_key.lower(), hf_key)
+            if subset and mapped == "mmlu":
+                task_name = "mmlu_" + subset.replace("-", "_")
+            else:
+                task_name = mapped if mapped else task_name
+
+    if task_name == "all":
+        target_tasks_list = list(STANDARD_BENCHMARKS)
+        cmd_task_str = ",".join(target_tasks_list)
+    else:
+        target_tasks_list = [task_name]
+        cmd_task_str = task_name
+
+    try:
+        device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+    except Exception:
+        device = "cpu"
+
+    cmd = [
+        "lm_eval", "--model", "hf",
+        "--model_args", "pretrained=%s,trust_remote_code=True" % model_path,
+        "--tasks", cmd_task_str,
+        "--device", device,
+        "--batch_size", "auto",
+        "--output_path", output_path,
+        "--log_samples",
+    ]
+    if str(limit) != "1.0":
+        cmd.extend(["--limit", str(limit)])
+
+    eval_cache = getattr(Config, "EVAL_HF_DATASETS_CACHE", None) or os.path.join(Config.PROJECT_ROOT, "cache", "eval_datasets")
+    os.makedirs(eval_cache, exist_ok=True)
+    eval_env = os.environ.copy()
+    eval_env["HF_DATASETS_CACHE"] = eval_cache
+
+    _logger.info("[eval] 执行: %s (HF_DATASETS_CACHE=%s)", " ".join(cmd), eval_cache)
+    start_time = time.time()
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=eval_env,
+        **_popen_group_kwargs(),
+    )
+    task_control["process"] = process
+
+    last_update_time = 0.0
+    last_lines = []
+    max_tail = 40
+    while True:
+        if task_control.get("aborted"):
+            ProcessManager.kill_process_tree(process)
+            raise RuntimeError("任务已被用户手动终止")
+        line = process.stdout.readline() if process.stdout else ""
+        if not line and process.poll() is not None:
+            break
+        if line:
+            _logger.info("[eval] %s", line.rstrip())
+            last_lines.append(line.rstrip())
+            if len(last_lines) > max_tail:
+                last_lines.pop(0)
+            now = time.time()
+            if now - last_update_time > 0.5:
+                clean = line.strip()[:80]
+                if clean:
+                    callback(start_prog, "[%s] %s" % (cmd_task_str, clean))
+                last_update_time = now
+    process.wait()
+    duration = time.time() - start_time
+
+    def _fail_msg(tip):
+        tail = "\n".join(last_lines[-30:]) if last_lines else ""
+        return "%s\n--- lm_eval 输出尾行 ---\n%s" % (tip, tail)
+
+    if process.returncode != 0:
+        _logger.warning("[eval] lm_eval 退出码 %s", process.returncode)
+        err_path = os.path.join(output_path, "eval_stderr.txt")
+        try:
+            with open(err_path, "w", encoding="utf-8") as f:
+                f.write(_fail_msg("lm_eval 退出码: %s" % process.returncode))
+        except Exception:
+            pass
+        tail_text = "\n".join(last_lines[-30:]) if last_lines else ""
+        hint = ""
+        if "dataclass" in tail_text or "Features.from_dict" in tail_text:
+            hint = " 若为 datasets 缓存兼容问题，可尝试删除 HF 数据集缓存或 pip install -U datasets。"
+        raise RuntimeError("评测进程退出码 %s，详见任务目录 eval_stderr.txt.%s\n--- 输出尾行 ---\n%s" % (process.returncode, hint, tail_text[-2000:] if len(tail_text) > 2000 else tail_text))
+
+    json_path = _pick_latest_json(output_path)
+    if not json_path:
+        _logger.warning("[eval] 未在 %s 找到 json 结果", output_path)
+        raise RuntimeError(_fail_msg("评测未在 %s 生成结果文件，请检查 lm_eval 与数据集环境" % output_path))
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw_results = data.get("results", data)
+        total_acc = 0.0
+        total_samples = 0
+        valid_tasks_count = 0
+        per_task_acc = {}
+        for t in target_tasks_list:
+            task_res = raw_results.get(t, {})
+            curr_acc = 0.0
+            found = False
+            for key in ("acc_norm,none", "acc_norm", "acc,none", "acc"):
+                if key in task_res:
+                    curr_acc = float(task_res[key])
+                    found = True
+                    break
+            if found:
+                total_acc += curr_acc
+                valid_tasks_count += 1
+            per_task_acc[t] = round(curr_acc * 100, 2)
+            curr_samples = 0
+            if "n-samples" in data and t in data["n-samples"]:
+                s = data["n-samples"][t]
+                curr_samples = s.get("effective", 0) if isinstance(s, dict) else int(s)
+            elif "n_samples" in data and t in data.get("n_samples", {}):
+                s = data["n_samples"][t]
+                curr_samples = s.get("effective", 0) if isinstance(s, dict) else int(s)
+            elif task_res.get("n_samples") is not None:
+                curr_samples = int(task_res["n_samples"])
+            total_samples += curr_samples
+
+        avg_acc = (total_acc / valid_tasks_count) if valid_tasks_count > 0 else 0.0
+        if total_samples == 0:
+            total_samples = int(data.get("config", {}).get("limit", 0)) * len(target_tasks_list)
+        context_len = _eval_get_context_length(model_path)
+        return {
+            "acc": round(avg_acc * 100, 2),
+            "f1": round(avg_acc, 4),
+            "samples": int(total_samples),
+            "time": round(duration, 2),
+            "context": int(context_len or 0),
+            "per_task_acc": per_task_acc,
+        }
+    except Exception as e:
+        _logger.exception("[eval] 解析结果失败: %s", e)
+        raise RuntimeError("解析评测结果失败: %s" % e) from e
+
+
 def run_eval_only_task(task_id, params, update_progress_callback, task_control=None):
-    """仅评估任务（与 alpha 兼容）：可调用 lm_eval 或占位返回。"""
+    """仅评估任务：与 mergeKit_alpha 一致，调用 run_lm_eval_stream 后按 alpha 格式写 metadata 并返回。
+    当选择「测试集仓库」时，使用 params 中的 hf_dataset / hf_subset / hf_split，不再使用内置 benchmark。"""
     if task_control is None:
         task_control = {}
     task_dir = os.path.join(MERGE_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
+    model_path = (params.get("model_path") or "").strip()
+    # 优先使用测试集仓库参数：有 hf_dataset 或 testset_id 时走测试集分支，否则用 dataset（内置 all/hellaswag 等）
+    hf_dataset = (params.get("hf_dataset") or "").strip() or None
+    hf_subset = (params.get("hf_subset") or "").strip() or None
+    hf_split = (params.get("hf_split") or "").strip() or None
+    if not hf_dataset and params.get("testset_id"):
+        # 从测试集仓库列表解析出 hf_dataset（与 app 端一致：api 已写入 dataset/hf_*，此处仅作兜底）
+        for key in ("dataset", "hf_dataset"):
+            v = (params.get(key) or "").strip()
+            if v and "/" in v:
+                hf_dataset = v
+                if hf_subset is None:
+                    hf_subset = (params.get("hf_subset") or "").strip() or None
+                if hf_split is None:
+                    hf_split = (params.get("hf_split") or "validation").strip() or "validation"
+                break
+    dataset_name = params.get("dataset", "all")
+    # 若为测试集仓库选定数据集，展示名与任务名由 run_lm_eval_stream 内根据 hf_* 决定
+    if hf_dataset:
+        dataset_name = hf_dataset + ((" (" + (hf_subset or "") + ")") if hf_subset else "")
+        _logger.info("[eval] 使用测试集仓库: hf_dataset=%s hf_subset=%s hf_split=%s", hf_dataset, hf_subset, hf_split)
+    limit_val = params.get("limit", "0.5")
+    model_name = params.get("model_name", "Eval Task")
+
     metadata = {
         "id": task_id,
         "type": "eval_only",
-        "custom_name": params.get("model_name", "Eval Task"),
+        "custom_name": model_name,
         "created_at": params.get("created_at", time.time()),
-        "dataset": params.get("dataset", "hellaswag"),
-        "status": "error",
-        "error": "mergeKit_beta 未实现 run_eval_only_task，请使用 mergeKit_alpha 或单独评测脚本",
+        "dataset": dataset_name,
+        "status": "running",
     }
-    meta_path = os.path.join(task_dir, "metadata.json")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
-    return {"status": "error", "error": metadata["error"]}
+
+    def _write_meta(status, metrics=None, error=None):
+        metadata["status"] = status
+        if metrics is not None:
+            metadata["metrics"] = metrics
+        if error:
+            metadata["error"] = error
+        with open(os.path.join(task_dir, "metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    try:
+        if not model_path or not os.path.isdir(model_path):
+            msg = "模型路径无效或不是目录: %s" % (model_path or "(空)")
+            _write_meta("error", error=msg)
+            return {"status": "error", "error": msg}
+
+        update_progress_callback(10, "准备评估模型: %s" % model_name)
+        display_task = "Standard Benchmark" if (dataset_name == "all" and not hf_dataset) else dataset_name
+        update_progress_callback(30, "正在启动评估 (%s)..." % display_task)
+
+        metrics = run_lm_eval_stream(
+            model_path,
+            task_dir,
+            dataset_name,
+            update_progress_callback,
+            30,
+            95,
+            task_control,
+            limit=limit_val,
+            hf_dataset=hf_dataset,
+            hf_subset=hf_subset,
+            hf_split=hf_split,
+            lm_eval_task=(params.get("lm_eval_task") or "").strip() or None,
+        )
+
+        per_task = metrics.get("per_task_acc") or {}
+        if per_task:
+            labels = list(per_task.keys())
+            merged_data = [per_task[k] for k in labels]
+            base_data = [0.0] * len(labels)
+        else:
+            labels = ["Accuracy", "Efficiency", "Context"]
+            base_data = [50, 50, 50]
+            merged_data = [
+                metrics["acc"],
+                50,
+                min(100, (metrics.get("context", 0) / 1024) * 10) if metrics.get("context", 0) else 0,
+            ]
+
+        final_result = {
+            "accuracy": metrics["acc"],
+            "f1_score": metrics["f1"],
+            "test_cases": metrics["samples"],
+            "context": str(metrics["context"]) if metrics["context"] else "N/A",
+            "base_name": "Baseline",
+            "comparison": {
+                "labels": labels,
+                "base_data": base_data,
+                "merged_data": merged_data,
+            },
+        }
+        update_progress_callback(100, "测试完成")
+        _write_meta("success", metrics=final_result)
+        return {"status": "success", "metrics": final_result}
+    except Exception as e:
+        _logger.exception("[eval] 异常: %s", e)
+        _write_meta("error", error=str(e))
+        if task_control.get("aborted"):
+            return {"status": "stopped", "message": "用户已停止"}
+        return {"status": "error", "error": str(e)}

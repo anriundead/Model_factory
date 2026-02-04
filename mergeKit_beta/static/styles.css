@@ -1301,6 +1301,15 @@ footer{
     font-family: 'Misans ExtraLight';
 }
 
+.results-placeholder-hint {
+    font-size: 0.85rem;
+    color: var(--apple-gray, #86868b);
+    margin: 12px 0 0;
+    max-width: 600px;
+    margin-left: auto;
+    margin-right: auto;
+}
+
 .chart-container {
     position: relative;
     width: 100%;

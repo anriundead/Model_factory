@@ -15,24 +15,193 @@ let deleteTargetId = null; // 用于删除功能
 function initEval() {
     loadAllModels();
     setupEvalUI();
+    setupDatasetSource();
     setupSidebar(); 
-    setupDeleteModal(); // 初始化删除弹窗监听
+    setupDeleteModal();
     initSegmentedControls();
 }
 
 function initSegmentedControls() {
     document.querySelectorAll('.segmented-control').forEach(control => {
         const options = control.querySelectorAll('.segmented-option');
-        const hiddenInput = control.parentElement.querySelector('input[type="hidden"]');
+        const hiddenInput = control.parentElement.querySelector('input[type="hidden"]') ||
+            document.getElementById(control.id && control.id.replace('-control', '') ? control.id.replace('-control', '') : null);
         
         options.forEach(opt => {
             opt.addEventListener('click', () => {
                 options.forEach(o => o.classList.remove('active', 'selected'));
                 opt.classList.add('active', 'selected');
-                if (hiddenInput) hiddenInput.value = opt.dataset.value;
+                const inp = control.id === 'eval-dataset-source-control' ? document.getElementById('eval-dataset-source') : hiddenInput;
+                if (inp) inp.value = opt.dataset.value;
+                if (control.id === 'eval-dataset-source-control') onDatasetSourceChange(opt.dataset.value);
             });
         });
     });
+}
+
+function onDatasetSourceChange(value) {
+    document.getElementById('eval-source-builtin').style.display = value === 'builtin' ? 'block' : 'none';
+    document.getElementById('eval-source-repo').style.display = value === 'repo' ? 'block' : 'none';
+    document.getElementById('eval-source-custom').style.display = value === 'custom' ? 'block' : 'none';
+    if (value === 'repo') loadTestsetRepoOptions();
+}
+
+let testsetsList = [];
+async function loadTestsetRepoOptions() {
+    try {
+        const res = await fetch('/api/testset/list');
+        const data = await res.json();
+        testsetsList = (data.testsets || []) || [];
+        const ul = document.getElementById('eval-repo-options');
+        ul.innerHTML = '';
+        if (!testsetsList.length) {
+            ul.innerHTML = '<li class="ios-option" style="color:#999;">暂无测试集</li>';
+            return;
+        }
+        testsetsList.forEach((t, i) => {
+            const li = document.createElement('li');
+            li.className = 'ios-option' + (i === 0 ? ' selected' : '');
+            li.dataset.testsetId = t.testset_id || '';
+            li.dataset.hfDataset = t.hf_dataset || '';
+            li.dataset.hfSubset = t.hf_subset || '';
+            li.dataset.hfSplit = t.hf_split || 'train';
+            li.innerHTML = '<span class="opt-name">' + (t.name || t.hf_dataset || t.testset_id) + '</span>';
+            li.addEventListener('click', () => selectRepoTestset(t));
+            ul.appendChild(li);
+        });
+        document.getElementById('eval-repo-trigger').querySelector('.selected-text').textContent = testsetsList[0] ? (testsetsList[0].name || testsetsList[0].hf_dataset) : '请选择测试集';
+        document.getElementById('eval-testset-id').value = testsetsList[0] ? (testsetsList[0].testset_id || '') : '';
+        document.getElementById('eval-hf-dataset').value = testsetsList[0] ? (testsetsList[0].hf_dataset || '') : '';
+        if (testsetsList[0]) fillSubsetSplitFromTestset(testsetsList[0]);
+    } catch (e) {
+        console.error(e);
+        document.getElementById('eval-repo-options').innerHTML = '<li class="ios-option" style="color:#999;">加载失败</li>';
+    }
+}
+
+function selectRepoTestset(t) {
+    document.getElementById('eval-repo-trigger').querySelector('.selected-text').textContent = t.name || t.hf_dataset || t.testset_id;
+    document.getElementById('eval-testset-id').value = t.testset_id || '';
+    document.getElementById('eval-hf-dataset').value = t.hf_dataset || '';
+    fillSubsetSplitFromTestset(t);
+    document.querySelectorAll('#eval-repo-options .ios-option').forEach((o, i) => o.classList.toggle('selected', o.dataset.testsetId === (t.testset_id || '')));
+    document.getElementById('eval-repo-options').classList.remove('open');
+}
+
+function fillSubsetSplitFromTestset(t) {
+    const subsetVal = t.hf_subset || '';
+    const splitVal = t.hf_split || 'train';
+    const subsetUl = document.getElementById('eval-subset-options');
+    const splitUl = document.getElementById('eval-split-options');
+    subsetUl.innerHTML = '<li class="ios-option selected" data-value="">— 无</li>';
+    splitUl.innerHTML = '<li class="ios-option selected" data-value="train">train</li><li class="ios-option" data-value="validation">validation</li><li class="ios-option" data-value="test">test</li>';
+    document.getElementById('eval-subset-trigger').querySelector('.selected-text').textContent = subsetVal || '— 无';
+    document.getElementById('eval-split-trigger').querySelector('.selected-text').textContent = splitVal;
+    document.getElementById('eval-subset').value = subsetVal;
+    document.getElementById('eval-split').value = splitVal;
+    if (t.hf_dataset) {
+        fetch('/api/dataset/hf_info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hf_dataset: t.hf_dataset }) })
+            .then(r => r.json())
+            .then(d => {
+                if (d.status === 'success' && (d.configs && d.configs.length || d.splits && d.splits.length)) {
+                    if (d.configs && d.configs.length) {
+                        subsetUl.innerHTML = '<li class="ios-option" data-value="">— 无</li>' + d.configs.map(c => '<li class="ios-option' + (c === subsetVal ? ' selected' : '') + '" data-value="' + c + '">' + c + '</li>').join('');
+                    }
+                    if (d.splits && d.splits.length) {
+                        splitUl.innerHTML = d.splits.map(s => '<li class="ios-option' + (s === splitVal ? ' selected' : '') + '" data-value="' + s + '">' + s + '</li>').join('');
+                    }
+                }
+            })
+            .catch(() => {});
+    }
+}
+
+function setupDatasetSource() {
+    onDatasetSourceChange(document.getElementById('eval-dataset-source').value);
+    document.getElementById('eval-hf-search-btn').addEventListener('click', doHfSearch);
+    document.getElementById('eval-hf-download-btn').addEventListener('click', doHfDownloadAndAdd);
+}
+
+let customHfDataset = null;
+let customConfigs = [];
+let customSplits = [];
+
+async function doHfSearch() {
+    const q = document.getElementById('eval-hf-search-input').value.trim();
+    if (!q) { alert('请输入数据集名称或关键词'); return; }
+    const btn = document.getElementById('eval-hf-search-btn');
+    btn.disabled = true;
+    btn.textContent = '搜索中...';
+    document.getElementById('eval-hf-results').innerHTML = '<span style="color:#999;">搜索中...</span>';
+    try {
+        const res = await fetch('/api/hf/datasets/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ q, limit: 20 }) });
+        const data = await res.json();
+        if (data.status !== 'success' || !data.results || !data.results.length) {
+            document.getElementById('eval-hf-results').innerHTML = '<span style="color:#999;">未找到结果</span>';
+            return;
+        }
+        document.getElementById('eval-hf-results').innerHTML = data.results.map(r => 
+            '<div class="eval-hf-result-item" data-id="' + (r.id || '') + '" style="padding:6px 8px; border-radius:6px; cursor:pointer; margin-bottom:4px; background:var(--apple-bg-secondary, #f5f5f7);">' + (r.id || '') + '</div>'
+        ).join('');
+        document.querySelectorAll('.eval-hf-result-item').forEach(el => {
+            el.addEventListener('click', () => selectCustomHfDataset(el.dataset.id));
+        });
+    } catch (e) {
+        document.getElementById('eval-hf-results').innerHTML = '<span style="color:#ff3b30;">搜索失败</span>';
+    }
+    btn.disabled = false;
+    btn.textContent = '搜索';
+}
+
+async function selectCustomHfDataset(hfId) {
+    customHfDataset = hfId;
+    document.querySelectorAll('.eval-hf-result-item').forEach(el => el.style.background = el.dataset.id === hfId ? 'var(--apple-blue)' : 'var(--apple-bg-secondary, #f5f5f7)');
+    document.getElementById('eval-custom-subset-split').style.display = 'block';
+    try {
+        const res = await fetch('/api/dataset/hf_info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hf_dataset: hfId }) });
+        const data = await res.json();
+        if (data.status === 'success') {
+            customConfigs = data.configs || [];
+            customSplits = data.splits || ['train', 'validation', 'test'];
+            const subUl = document.getElementById('eval-custom-subset-options');
+            const splitUl = document.getElementById('eval-custom-split-options');
+            subUl.innerHTML = '<li class="ios-option selected" data-value="">— 无</li>' + (customConfigs.map(c => '<li class="ios-option" data-value="' + c + '">' + c + '</li>').join(''));
+            splitUl.innerHTML = customSplits.map(s => '<li class="ios-option' + (s === 'test' ? ' selected' : '') + '" data-value="' + s + '">' + s + '</li>').join('');
+            document.getElementById('eval-custom-subset-trigger').querySelector('.selected-text').textContent = '— 无';
+            document.getElementById('eval-custom-split-trigger').querySelector('.selected-text').textContent = 'test';
+            document.getElementById('eval-custom-subset').value = '';
+            document.getElementById('eval-custom-split').value = 'test';
+        }
+    } catch (e) { console.error(e); }
+}
+
+async function doHfDownloadAndAdd() {
+    if (!customHfDataset) { alert('请先搜索并选择数据集'); return; }
+    const subset = document.getElementById('eval-custom-subset').value.trim();
+    const split = document.getElementById('eval-custom-split').value.trim() || 'train';
+    const btn = document.getElementById('eval-hf-download-btn');
+    btn.disabled = true;
+    btn.textContent = '下载中...';
+    try {
+        const res = await fetch('/api/testset/create', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: customHfDataset, hf_dataset: customHfDataset, hf_subset: subset || undefined, hf_split: split })
+        });
+        const data = await res.json();
+        if (data.status === 'success') {
+            alert('已添加到测试集仓库，可在「测试集仓库」页面查看。');
+            loadTestsetRepoOptions();
+            document.getElementById('eval-dataset-source').value = 'repo';
+            onDatasetSourceChange('repo');
+        } else {
+            alert('添加失败: ' + (data.message || ''));
+        }
+    } catch (e) {
+        alert('请求失败');
+    }
+    btn.disabled = false;
+    btn.textContent = '下载并添加到测试集仓库';
 }
 
 async function loadHistoryList() {
@@ -328,7 +497,6 @@ function setupEvalUI() {
 async function startEvaluation() {
     if (!evalState.selectedModel) return;
     
-    const dataset = document.getElementById('eval-dataset').value;
     const limit = document.getElementById('eval-limit').value;
     const startBtn = document.getElementById('start-eval');
     const clearBtn = document.getElementById('clear-eval');
@@ -343,17 +511,30 @@ async function startEvaluation() {
     
     setStatusUI("正在提交评估任务...", 0, true);
 
+    const source = document.getElementById('eval-dataset-source').value;
+    const payload = {
+        model_path: evalState.selectedModel.path,
+        model_name: evalState.selectedModel.name,
+        task_type: 'eval_only',
+        limit: limit
+    };
+    if (source === 'builtin') {
+        payload.dataset = document.getElementById('eval-dataset').value;
+    } else if (source === 'repo') {
+        payload.testset_id = document.getElementById('eval-testset-id').value;
+        payload.hf_dataset = document.getElementById('eval-hf-dataset').value || null;
+        payload.hf_subset = document.getElementById('eval-subset').value || null;
+        payload.hf_split = document.getElementById('eval-split').value || null;
+    } else {
+        payload.hf_dataset = customHfDataset;
+        payload.hf_subset = document.getElementById('eval-custom-subset').value;
+        payload.hf_split = document.getElementById('eval-custom-split').value;
+    }
     try {
         const response = await fetch('/api/evaluate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                model_path: evalState.selectedModel.path, 
-                model_name: evalState.selectedModel.name,
-                dataset: dataset,
-                task_type: 'eval_only',
-                limit: limit
-            })
+            body: JSON.stringify(payload)
         });
 
         const data = await response.json();
@@ -445,38 +626,89 @@ function renderResults(metrics) {
     document.getElementById('results-section').style.display = 'block';
     document.getElementById('results-section').scrollIntoView({behavior:'smooth'});
     
-    document.getElementById('accuracy').innerText = `${metrics.accuracy}%`;
-    document.getElementById('f1-score').innerText = metrics.f1_score;
-    document.getElementById('test-cases').innerText = metrics.test_cases;
+    document.getElementById('accuracy').innerText = (metrics.accuracy != null ? metrics.accuracy : '--') + (String(metrics.accuracy).indexOf('%') >= 0 ? '' : '%');
+    document.getElementById('f1-score').innerText = metrics.f1_score != null ? metrics.f1_score : '--';
+    document.getElementById('test-cases').innerText = metrics.test_cases != null ? metrics.test_cases : '--';
     document.getElementById('context-len').innerText = metrics.context || "N/A";
 
-    drawChart(metrics.comparison, metrics.base_name || "Baseline");
+    const hintEl = document.getElementById('results-placeholder-hint');
+    if (hintEl) {
+        const isPlaceholder = (String(metrics.test_cases) === '0' && (metrics.accuracy === '0.0' || metrics.accuracy === 0));
+        hintEl.style.display = isPlaceholder ? 'block' : 'none';
+        if (isPlaceholder && metrics.eval_note) {
+            hintEl.textContent = metrics.eval_note;
+        } else if (isPlaceholder) {
+            hintEl.textContent = '当前为占位结果，未运行 lm_eval 或评测未返回数据。图中三角形仅为占位显示。';
+        }
+    }
+
+    if (metrics.comparison && metrics.comparison.labels && (metrics.comparison.merged_data || metrics.comparison.base_data)) {
+        drawChart(metrics.comparison, metrics.base_name || "Baseline");
+    } else {
+        if (window.myChart) { window.myChart.destroy(); window.myChart = null; }
+    }
 }
 
 let myChart = null;
 function drawChart(compData, baseName) {
-    const ctx = document.getElementById('evaluation-chart').getContext('2d');
+    const ctx = document.getElementById('evaluation-chart');
+    if (!ctx) return;
+    const chartCtx = ctx.getContext('2d');
     if (myChart) myChart.destroy();
 
-    myChart = new Chart(ctx, {
+    let rawLabels = Array.isArray(compData.labels) ? compData.labels : ['Task'];
+    let rawBase = (Array.isArray(compData.base_data) ? compData.base_data : []).map(Number);
+    let rawMerged = (Array.isArray(compData.merged_data) ? compData.merged_data : []).map(Number);
+    // 雷达图至少需要 3 个轴；单任务或双任务时用有意义标签与数据补齐，避免出现“—”和 0 的占位轴
+    const minAxes = 3;
+    const n = Math.max(rawLabels.length, minAxes);
+    if (rawLabels.length >= 1 && rawLabels.length < minAxes) {
+        const padLabels = rawLabels.length === 1 ? ['准确率', '得分'] : ['综合'];
+        const padBase = rawLabels.length === 1 ? [rawBase[0] || 0, rawBase[0] || 0] : [(rawBase[0] + rawBase[1]) / 2];
+        const padMerged = rawLabels.length === 1 ? [rawMerged[0] || 0, rawMerged[0] || 0] : [(rawMerged[0] + rawMerged[1]) / 2];
+        rawLabels = [...rawLabels, ...padLabels];
+        rawBase = [...rawBase, ...padBase];
+        rawMerged = [...rawMerged, ...padMerged];
+    }
+    const labels = rawLabels.length >= n ? rawLabels.slice(0, n) : [...rawLabels];
+    while (labels.length < n) labels.push('—');
+    const baseData = rawBase.length >= n ? rawBase.slice(0, n) : [...rawBase];
+    const mergedData = rawMerged.length >= n ? rawMerged.slice(0, n) : [...rawMerged];
+    while (baseData.length < n) baseData.push(0);
+    while (mergedData.length < n) mergedData.push(0);
+
+    const allZero = (arr) => arr.length && arr.every((v) => v === 0);
+    const baseAllZero = allZero(baseData);
+    const mergedAllZero = allZero(mergedData);
+    // 全为 0 时多边形会塌缩到中心不可见，用最小显示值画出小三角形
+    const displayBase = baseAllZero ? baseData.map(() => 2) : baseData;
+    const displayMerged = mergedAllZero ? mergedData.map(() => 2) : mergedData;
+
+    myChart = new Chart(chartCtx, {
         type: 'radar',
         data: {
-            labels: compData.labels,
+            labels: labels,
             datasets: [
                 {
                     label: baseName,
-                    data: compData.base_data,
-                    backgroundColor: 'rgba(108, 117, 125, 0.2)',
+                    data: displayBase,
+                    backgroundColor: 'rgba(108, 117, 125, 0.25)',
                     borderColor: 'rgba(108, 117, 125, 1)',
                     pointBackgroundColor: 'rgba(108, 117, 125, 1)',
+                    pointBorderColor: '#fff',
+                    pointRadius: 5,
+                    pointHoverRadius: 7,
                     borderWidth: 2
                 },
                 {
                     label: 'Target Model',
-                    data: compData.merged_data,
-                    backgroundColor: 'rgba(67, 97, 238, 0.2)',
+                    data: displayMerged,
+                    backgroundColor: 'rgba(67, 97, 238, 0.25)',
                     borderColor: '#4361ee',
                     pointBackgroundColor: '#4361ee',
+                    pointBorderColor: '#fff',
+                    pointRadius: 5,
+                    pointHoverRadius: 7,
                     borderWidth: 2
                 }
             ]
@@ -484,7 +716,31 @@ function drawChart(compData, baseName) {
         options: {
             responsive: true,
             maintainAspectRatio: false,
-            scales: { r: { angleLines: {display:true}, suggestedMin:0, suggestedMax:100 } }
+            animation: { duration: 800 },
+            scales: {
+                r: {
+                    angleLines: { display: true },
+                    suggestedMin: 0,
+                    suggestedMax: 100,
+                    pointLabels: { font: { size: 12 } }
+                }
+            },
+            plugins: {
+                legend: { display: true },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            const idx = context.dataIndex;
+                            if (context.datasetIndex === 0) {
+                                if (baseAllZero) return baseName + ': 0（无数据占位）';
+                                return baseName + ': ' + displayBase[idx];
+                            }
+                            if (mergedAllZero) return 'Target Model: 0（无数据占位）';
+                            return 'Target Model: ' + displayMerged[idx];
+                        }
+                    }
+                }
+            }
         }
     });
 }
@@ -522,19 +778,23 @@ function initDropdowns() {
         });
     });
     
-    document.querySelectorAll('.ios-option').forEach(opt => {
-        opt.addEventListener('click', function(e) {
+    document.querySelectorAll('.ios-select-options').forEach(menu => {
+        menu.addEventListener('click', function(e) {
+            const opt = e.target.closest('.ios-option');
+            if (!opt) return;
             e.stopPropagation();
-            const val = this.dataset.value;
-            const name = this.querySelector('.opt-name').innerText;
-            const wrapper = this.closest('.ios-select-wrapper');
-            
-            wrapper.querySelector('.selected-text').innerText = name;
-            wrapper.querySelector('input').value = val;
-            
+            const val = opt.dataset.value !== undefined ? opt.dataset.value : opt.textContent.trim();
+            const nameEl = opt.querySelector('.opt-name');
+            const name = nameEl ? nameEl.innerText : opt.textContent.trim();
+            const wrapper = opt.closest('.ios-select-wrapper');
+            if (!wrapper) return;
+            const sel = wrapper.querySelector('.selected-text');
+            const input = wrapper.querySelector('input[type="hidden"]');
+            if (sel) sel.innerText = name;
+            if (input) input.value = val;
             wrapper.querySelector('.ios-select-options').classList.remove('open');
             wrapper.querySelectorAll('.ios-option').forEach(o => o.classList.remove('selected'));
-            this.classList.add('selected');
+            opt.classList.add('selected');
         });
     });
 

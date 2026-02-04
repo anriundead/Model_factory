@@ -25,6 +25,9 @@ class Config:
     LOCAL_MODELS_PATH = os.path.abspath(os.environ.get("LOCAL_MODELS_PATH", "/home/a/ServiceEndFiles/Models"))
     MERGE_DIR = os.path.join(PROJECT_ROOT, "merges")
     LOGS_DIR = os.path.join(PROJECT_ROOT, "logs", "merge")
+    # 测试集仓库：用户下载的 HF 数据集在此登记，测试集列表与评估页共用
+    TESTSET_REPO = os.path.join(PROJECT_ROOT, "testset_repo")
+    TESTSET_DATA_PATH = os.path.join(PROJECT_ROOT, "testset_repo", "data", "testsets.json")
     # 完全融合配方目录：保存可复现的配方（genotype + 参数），供直接融合
     RECIPES_DIR = os.path.join(PROJECT_ROOT, "recipes")
 
@@ -39,6 +42,12 @@ class Config:
     STANDARD_BENCHMARKS = ["hellaswag", "arc_easy", "boolq", "winogrande"]
     DEFAULT_DATASET = "hellaswag"
     DEFAULT_LIMIT = "0.5"
+    # 内置基准测试专用：lm_eval 使用的 HF 数据集缓存目录，与系统默认缓存隔离，避免版本兼容问题
+    # 可通过环境变量 MERGEKIT_EVAL_HF_CACHE 覆盖，不设则使用项目下 cache/eval_datasets
+    # 说明：内置基准(hellaswag/arc_easy/boolq/winogrande)由 lm_eval 加载，lm_eval 依赖 HuggingFace 的 datasets 库；
+    # 本项目不直接依赖 datasets，若未装 lm_eval 则不会用到。早期版本若无需 datasets 多为未走 lm_eval 或环境已带旧版依赖。
+    _eval_cache = os.environ.get("MERGEKIT_EVAL_HF_CACHE", "").strip()
+    EVAL_HF_DATASETS_CACHE = os.path.abspath(_eval_cache) if _eval_cache else os.path.join(PROJECT_ROOT, "cache", "eval_datasets")
 
     # ==================== 环境变量配置 ====================
     NUMEXPR_MAX_THREADS = 64
@@ -62,3 +71,4 @@ class Config:
         os.makedirs(cls.RECIPES_DIR, exist_ok=True)
         if not os.path.isdir(cls.MODEL_POOL_PATH):
             os.makedirs(cls.MODEL_POOL_PATH, exist_ok=True)
+        os.makedirs(cls.EVAL_HF_DATASETS_CACHE, exist_ok=True)

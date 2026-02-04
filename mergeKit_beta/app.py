@@ -154,15 +154,17 @@ def get_all_history():
         meta_path = os.path.join(task_path, "metadata.json")
         if not os.path.exists(meta_path):
             continue
-        try:
+        if not os.path.exists(meta_path):
+            continue
+            try:
             with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
+                    meta = json.load(f)
             if meta.get("type") == "eval_only":
-                continue
+                        continue
             if "id" not in meta:
                 meta["id"] = task_id
-            history_list.append(meta)
-        except Exception as e:
+                    history_list.append(meta)
+            except Exception as e:
             print("Error reading metadata for %s: %s" % (task_id, e))
     return sorted(history_list, key=lambda x: x.get("created_at", 0), reverse=True)
 
@@ -175,13 +177,16 @@ def _status_from_disk(task_id):
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
+        raw_status = meta.get("status", "unknown")
+        # 前端轮询期望 status 为 "completed" 才展示结果，与 worker 内存中一致
+        api_status = "completed" if raw_status == "success" else ("error" if raw_status == "error" else raw_status)
         return {
             "id": task_id,
-            "status": meta.get("status", "unknown"),
-            "progress": 100 if meta.get("status") == "success" else (0 if meta.get("status") == "error" else 50),
+            "status": api_status,
+            "progress": 100 if raw_status == "success" else (0 if raw_status == "error" else 50),
             "message": meta.get("error") or meta.get("message", ""),
             "created_at": meta.get("created_at"),
-            "result": {"status": meta.get("status"), "metrics": meta.get("metrics")},
+            "result": {"status": raw_status, "metrics": meta.get("metrics")},
         }
     except Exception:
         return None
@@ -192,7 +197,7 @@ def worker():
     print("--- 任务处理 Worker 已启动 ---")
     while True:
         try:
-            priority_score, created_at, task_id, data = task_queue.get()
+        priority_score, created_at, task_id, data = task_queue.get()
         except Exception:
             continue
         if tasks.get(task_id, {}).get("status") == "stopped":
@@ -206,7 +211,7 @@ def worker():
                 tasks[task_id]["control"] = task_control
                 running_task_info["id"] = task_id
                 running_task_info["priority"] = priority_score
-
+            
             def update_progress(p, msg):
                 if tasks.get(task_id, {}).get("status") in ["interrupted", "stopped"]:
                     return
@@ -255,7 +260,7 @@ def worker():
                     tasks[task_id]["status"] = "error"
                     tasks[task_id]["message"] = "scripts/run_vlm_search_bridge.py 不存在"
                     result = {"status": "error", "error": "run_vlm_search_bridge.py 未找到"}
-                else:
+            else:
                     import subprocess
                     merge_dir = os.path.join(MERGE_DIR, task_id)
                     os.makedirs(merge_dir, exist_ok=True)
@@ -301,7 +306,11 @@ def worker():
                             pass
                         result = {"status": "error", "error": str(e)}
             elif task_type == "eval_only":
-                result = run_eval_only_task(task_id, data, update_progress, task_control)
+                # 每次评估前重新加载 merge_manager，确保使用最新 run_eval_only_task 实现（避免进程未重启时仍跑旧占位逻辑）
+                import importlib
+                import merge_manager as _mm
+                importlib.reload(_mm)
+                result = _mm.run_eval_only_task(task_id, data, update_progress, task_control)
             elif task_type == "recipe_apply":
                 result = run_recipe_apply_task(task_id, data, update_progress, task_control)
                 if result.get("status") == "success":
@@ -398,17 +407,17 @@ def _list_models_from_dir(root_path):
         full_path = os.path.join(root_path, item)
         if not os.path.isdir(full_path) or not os.path.isfile(os.path.join(full_path, "config.json")):
             continue
-        size_bytes = 0
+                size_bytes = 0
         try:
-            for f in os.listdir(full_path):
+                for f in os.listdir(full_path):
                 if f.endswith(".safetensors") or f.endswith(".bin"):
-                    size_bytes += os.path.getsize(os.path.join(full_path, f))
+                        size_bytes += os.path.getsize(os.path.join(full_path, f))
         except OSError:
             pass
         out.append({
-            "name": item,
-            "size": size_bytes,
-            "details": {"family": "HuggingFace Local"},
+                    "name": item,
+                    "size": size_bytes,
+                    "details": {"family": "HuggingFace Local"},
             "path": os.path.abspath(full_path),
         })
     return out
@@ -573,23 +582,57 @@ def start_evaluation_task():
     data = request.json or {}
     model_path = data.get("model_path")
     if not model_path or not os.path.exists(model_path):
-        return jsonify({"status": "error", "message": "模型路径无效"}), 400
+         return jsonify({"status": "error", "message": "模型路径无效"}), 400
     task_id = str(uuid.uuid4())[:8]
     created_at = time.time()
+    dataset = data.get("dataset", "hellaswag")
+    testset_id = (data.get("testset_id") or "").strip()
+    hf_dataset = (data.get("hf_dataset") or "").strip() or None
+    hf_subset = (data.get("hf_subset") or "").strip() or None
+    hf_split = (data.get("hf_split") or "").strip() or "test"
+    lm_eval_task = ""
+    if testset_id:
+        testset = None
+        for t in _testset_list():
+            if t.get("testset_id") == testset_id:
+                testset = t
+                break
+        if testset:
+            dataset = testset.get("hf_dataset") or dataset
+            hf_dataset = hf_dataset or testset.get("hf_dataset")
+            hf_subset = (hf_subset or "").strip() or testset.get("hf_subset") or None
+            hf_split = (hf_split or testset.get("hf_split") or "test").strip() or "test"
+            lm_eval_task = (testset.get("lm_eval_task") or "").strip()
+            if not lm_eval_task and hf_dataset and hf_subset:
+                lm_eval_task = _infer_lm_eval_task(hf_dataset, hf_subset)
+                if lm_eval_task:
+                    testsets = _load_testsets_dict()
+                    for tid, t in list(testsets.items()):
+                        if t.get("testset_id") == testset_id:
+                            testsets[tid] = {**t, "lm_eval_task": lm_eval_task}
+                            _save_testsets_dict(testsets)
+                            break
     task_data = {
         "id": task_id,
-        "type": "eval_only",
+        "type": "eval_only", 
         "model_path": model_path,
         "model_name": data.get("model_name", "Unknown Model"),
-        "dataset": data.get("dataset", "hellaswag"),
+        "dataset": dataset,
         "created_at": created_at,
         "status": "queued",
         "progress": 0,
         "message": "正在加入测试队列...",
+        "limit": data.get("limit", "0.5"),
+        "testset_id": testset_id or None,
+        "hf_dataset": hf_dataset,
+        "hf_subset": hf_subset,
+        "hf_split": hf_split,
+        "lm_eval_task": lm_eval_task or None,
     }
     _app_logger.info(
-        "[API] 提交评估任务 task_id=%s model_path=%s dataset=%s",
-        task_id, model_path, task_data.get("dataset"),
+        "[API] 提交评估任务 task_id=%s model_path=%s dataset=%s testset_id=%s hf_dataset=%s hf_subset=%s",
+        task_id, model_path, task_data.get("dataset"), task_data.get("testset_id"),
+        task_data.get("hf_dataset"), task_data.get("hf_subset"),
     )
     with scheduler_lock:
         tasks[task_id] = task_data
@@ -838,18 +881,8 @@ def api_resolve_model_path():
 
 
 def _testset_list():
-    data_path = os.path.join(Config.PROJECT_ROOT, "testset_repo", "data", "testsets.json")
-    if not os.path.isfile(data_path):
-        return []
-    try:
-        with open(data_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        testsets = data.get("testsets", data) if isinstance(data.get("testsets"), dict) else data
-        if isinstance(testsets, dict):
-            return list(testsets.values())
-        return testsets
-    except Exception:
-        return []
+    testsets = _load_testsets_dict()
+    return list(testsets.values()) if testsets else []
 
 
 @app.route("/api/testset/list")
@@ -867,14 +900,107 @@ def api_testset_search():
     return jsonify({"status": "success", "results": all_list[:limit], "total": len(all_list)})
 
 
+@app.route("/api/hf/datasets/search", methods=["GET", "POST"])
+def api_hf_datasets_search():
+    """在 HuggingFace 镜像上搜索数据集。GET/POST 均可，q 为搜索关键词。"""
+    q = (request.args.get("q") or (request.get_json(silent=True) or {}).get("q") or "").strip()
+    limit = int(request.args.get("limit") or (request.get_json(silent=True) or {}).get("limit", 20) or 20)
+    if not q:
+        return jsonify({"status": "error", "message": "q 必填"}), 400
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        # 使用镜像
+        endpoint = getattr(Config, "HF_ENDPOINT", None) or os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
+        ds_list = list(api.list_datasets(search=q, limit=min(limit, 50)))
+        out = [{"id": d.id, "author": getattr(d, "author", None), "downloads": getattr(d, "downloads", None)} for d in ds_list]
+        return jsonify({"status": "success", "results": out})
+    except Exception as e:
+        _app_logger.exception("api_hf_datasets_search: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+def _testset_repo_path():
+    return getattr(Config, "TESTSET_DATA_PATH", None) or os.path.join(Config.PROJECT_ROOT, "testset_repo", "data", "testsets.json")
+
+
+def _infer_lm_eval_task(hf_dataset, hf_subset):
+    """根据 hf_dataset / hf_subset 推断 lm_eval 任务名，与 merge_manager 逻辑一致。用于测试集创建或首次选用时自动写入映射。"""
+    if not (hf_dataset or "").strip():
+        return ""
+    key = (hf_dataset or "").strip().lower()
+    if key in ("cais/mmlu", "mmlu") and (hf_subset or "").strip():
+        return "mmlu_" + (hf_subset or "").strip().replace("-", "_")
+    return ""
+
+
+def _load_testsets_dict():
+    path = _testset_repo_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("testsets", data) if isinstance(data.get("testsets"), dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_testsets_dict(testsets_dict):
+    path = _testset_repo_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"testsets": testsets_dict}, f, ensure_ascii=False, indent=2)
+
+
 @app.route("/api/testset/create", methods=["POST"])
 def api_testset_create():
+    """创建测试集：从 HuggingFace 下载并登记到 testset_repo，测试集仓库可见。"""
     data = request.json or {}
     name = (data.get("name") or "").strip() or (data.get("dataset_name") or "").strip()
+    hf_dataset = (data.get("hf_dataset") or "").strip()
+    if not hf_dataset:
+        return jsonify({"status": "error", "message": "hf_dataset 必填"}), 400
     if not name:
-        return jsonify({"status": "error", "message": "name 或 dataset_name 必填"}), 400
-    # 占位：不实际写入 testset_repo，仅返回成功
-    return jsonify({"status": "success", "testset_id": str(uuid.uuid4())})
+        name = hf_dataset
+    hf_subset = (data.get("hf_subset") or "").strip() or None
+    hf_split = (data.get("hf_split") or "train").strip() or "train"
+    cache_dir = getattr(Config, "HF_DATASETS_CACHE", None) or os.environ.get("HF_DATASETS_CACHE")
+    split_name = (hf_split or "train").split("[")[0].strip() or "train"
+    n = 0
+    try:
+        from datasets import load_dataset
+        if hf_subset:
+            ds = load_dataset(hf_dataset, hf_subset, split=split_name, trust_remote_code=True, cache_dir=cache_dir)
+        else:
+            ds = load_dataset(hf_dataset, split=split_name, trust_remote_code=True, cache_dir=cache_dir)
+        n = len(ds) if ds else 0
+    except Exception as e:
+        _app_logger.warning("testset create load_dataset: %s", e)
+    testset_id = str(uuid.uuid4())
+    prompt_path = os.path.join(Config.PROJECT_ROOT, "yaml_template", "prompt.yaml")
+    if not os.path.isfile(prompt_path):
+        prompt_path = ""
+    lm_eval_task = _infer_lm_eval_task(hf_dataset, hf_subset)
+    entry = {
+        "testset_id": testset_id,
+        "name": name,
+        "hf_dataset": hf_dataset,
+        "hf_subset": hf_subset,
+        "hf_split": hf_split,
+        "lm_eval_task": lm_eval_task,
+        "yaml_template_path": prompt_path,
+        "sample_count": n,
+        "created_at": time.time(),
+        "created_by": "user",
+        "notes": "从 HuggingFace 添加: %s" % hf_dataset,
+        "question_type": "未知",
+    }
+    testsets = _load_testsets_dict()
+    testsets[testset_id] = entry
+    _save_testsets_dict(testsets)
+    return jsonify({"status": "success", "testset_id": testset_id, "testset": entry})
 
 
 @app.route("/api/testset/<testset_id>")

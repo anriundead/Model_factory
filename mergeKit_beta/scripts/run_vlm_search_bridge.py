@@ -204,14 +204,27 @@ def main():
         last_step = 0
         start_time = time_module.time()
         
-        while True:
-            line = proc.stdout.readline() if proc.stdout else ""
-            if not line and proc.poll() is not None:
-                break
-            if line:
-                out_lines.append(line)
-                sys.stdout.write(line)
-                sys.stdout.flush()
+        # 创建子进程输出日志文件
+        subprocess_log_path = os.path.join(merge_dir, "subprocess_output.log")
+        subprocess_log_file = open(subprocess_log_path, "w", encoding="utf-8")
+        logger.info("子进程输出将保存到: %s", subprocess_log_path)
+        
+        try:
+            while True:
+                line = proc.stdout.readline() if proc.stdout else ""
+                if not line and proc.poll() is not None:
+                    break
+                if line:
+                    out_lines.append(line)
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    # 写入子进程输出日志文件
+                    subprocess_log_file.write(line)
+                    subprocess_log_file.flush()
+                    
+                    # 同时写入 bridge.log（INFO 级别的重要信息）
+                    if "[eval]" in line or "[main]" in line or "step=" in line or "ERROR" in line.upper() or "WARNING" in line.upper():
+                        logger.info("子进程: %s", line.rstrip())
                 
                 # 解析评估日志：提取 step 和耗时信息
                 # 格式示例: "[eval] step=1 acc=0.1250 best_acc=0.1250 genotype=[...]"
@@ -263,8 +276,20 @@ def main():
                                 json.dump(prog, pf, ensure_ascii=False, indent=2)
                         except Exception:
                             pass
+        finally:
+            subprocess_log_file.close()
+            logger.info("子进程输出已保存到: %s", subprocess_log_path)
         
         proc.wait()
+        
+        # 任务完成后，记录子进程输出的统计信息
+        if out_lines:
+            eval_count = len([l for l in out_lines if "[eval]" in l or "step=" in l])
+            logger.info("子进程输出统计: 总行数=%d, 评估日志行数=%d", len(out_lines), eval_count)
+            # 记录最后100行输出（便于排查问题）
+            tail_lines = out_lines[-100:] if len(out_lines) > 100 else out_lines
+            logger.info("子进程输出（最后100行）:\n%s", "".join(tail_lines))
+        
         if proc.returncode != 0:
             tail = "".join(out_lines[-50:]) if len(out_lines) > 50 else "".join(out_lines)
             logger.warning("标准输出（最后500字符）: %s", tail[-500:])

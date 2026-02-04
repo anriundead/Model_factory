@@ -1,0 +1,4 @@
+{
+  "cais/mmlu": "mmlu",
+  "cais/mmlu|college_medicine": "mmlu_college_medicine"
+}

@@ -109,60 +109,133 @@
 
                         <div class="params-form" style="margin-top: 30px;">
                             <div class="form-group">
-                                <label>评估数据集</label>
-                                <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
-                                    <div class="ios-select-trigger">
-                                        <span class="selected-text">全部评测 (Standard Benchmark)</span>
-                                        <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                <label>数据集来源</label>
+                                <div class="segmented-control-wrapper" style="margin-top: 6px;">
+                                    <div class="segmented-control" id="eval-dataset-source-control">
+                                        <div class="segmented-option selected active" data-value="builtin">内置基准</div>
+                                        <div class="segmented-option" data-value="repo">测试集仓库</div>
+                                        <div class="segmented-option" data-value="custom">自定义 (HF)</div>
                                     </div>
-                                    <ul class="ios-select-options">
-                                        <li class="ios-option selected" data-value="all">
-                                            <div class="opt-left">
-                                                <i class="ri-dashboard-line" style="color:var(--apple-blue);"></i>
-                                                <span class="opt-name">全部评测 (Standard Benchmark)</span>
-                                            </div>
-                                            <span class="opt-desc">综合 HellaSwag, ARC, BoolQ, Winogrande</span>
-                                        </li>
-                                        <li class="ios-option" data-value="hellaswag">
-                                            <div class="opt-left">
-                                                <i class="ri-brain-line" style="color:#ff9f0a;"></i>
-                                                <span class="opt-name">HellaSwag</span>
-                                            </div>
-                                            <span class="opt-desc">常识推理 (Common Sense)</span>
-                                        </li>
-                                        <li class="ios-option" data-value="arc_easy">
-                                            <div class="opt-left">
-                                                <i class="ri-flask-line" style="color:#30b0c7;"></i>
-                                                <span class="opt-name">ARC-Easy</span>
-                                            </div>
-                                            <span class="opt-desc">科学问答 (Science QA)</span>
-                                        </li>
-                                        <li class="ios-option" data-value="boolq">
-                                            <div class="opt-left">
-                                                <i class="ri-question-answer-line" style="color:#ff375f;"></i>
-                                                <span class="opt-name">BoolQ</span>
-                                            </div>
-                                            <span class="opt-desc">阅读理解 (Yes/No)</span>
-                                        </li>
-                                        <li class="ios-option" data-value="winogrande">
-                                            <div class="opt-left">
-                                                <i class="ri-text-spacing" style="color:#bf5af2;"></i>
-                                                <span class="opt-name">Winogrande</span>
-                                            </div>
-                                            <span class="opt-desc">代词消歧 (Reasoning)</span>
-                                        </li>
-                                        <li class="ios-option" data-value="piqa">
-                                            <div class="opt-left">
-                                                <i class="ri-lightbulb-line" style="color:#32d74b;"></i>
-                                                <span class="opt-name">PIQA</span>
-                                            </div>
-                                            <span class="opt-desc">物理常识 (Physical Interaction)</span>
-                                        </li>
-                                    </ul>
-                                    <input type="hidden" id="eval-dataset" value="all">
                                 </div>
-                                
-                                <div class="segmented-control-wrapper">
+                                <input type="hidden" id="eval-dataset-source" value="builtin">
+
+                                <div id="eval-source-builtin" class="eval-source-panel" style="margin-top: 14px;">
+                                    <label class="segmented-label">评估数据集</label>
+                                    <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                        <div class="ios-select-trigger">
+                                            <span class="selected-text">全部评测 (Standard Benchmark)</span>
+                                            <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                        </div>
+                                        <ul class="ios-select-options">
+                                            <li class="ios-option selected" data-value="all">
+                                                <div class="opt-left">
+                                                    <i class="ri-dashboard-line" style="color:var(--apple-blue);"></i>
+                                                    <span class="opt-name">全部评测 (Standard Benchmark)</span>
+                                                </div>
+                                                <span class="opt-desc">综合 HellaSwag, ARC, BoolQ, Winogrande</span>
+                                            </li>
+                                            <li class="ios-option" data-value="hellaswag">
+                                                <div class="opt-left">
+                                                    <i class="ri-brain-line" style="color:#ff9f0a;"></i>
+                                                    <span class="opt-name">HellaSwag</span>
+                                                </div>
+                                                <span class="opt-desc">常识推理 (Common Sense)</span>
+                                            </li>
+                                            <li class="ios-option" data-value="arc_easy">
+                                                <div class="opt-left">
+                                                    <i class="ri-flask-line" style="color:#30b0c7;"></i>
+                                                    <span class="opt-name">ARC-Easy</span>
+                                                </div>
+                                                <span class="opt-desc">科学问答 (Science QA)</span>
+                                            </li>
+                                            <li class="ios-option" data-value="boolq">
+                                                <div class="opt-left">
+                                                    <i class="ri-question-answer-line" style="color:#ff375f;"></i>
+                                                    <span class="opt-name">BoolQ</span>
+                                                </div>
+                                                <span class="opt-desc">阅读理解 (Yes/No)</span>
+                                            </li>
+                                            <li class="ios-option" data-value="winogrande">
+                                                <div class="opt-left">
+                                                    <i class="ri-text-spacing" style="color:#bf5af2;"></i>
+                                                    <span class="opt-name">Winogrande</span>
+                                                </div>
+                                                <span class="opt-desc">代词消歧 (Reasoning)</span>
+                                            </li>
+                                            <li class="ios-option" data-value="piqa">
+                                                <div class="opt-left">
+                                                    <i class="ri-lightbulb-line" style="color:#32d74b;"></i>
+                                                    <span class="opt-name">PIQA</span>
+                                                </div>
+                                                <span class="opt-desc">物理常识 (Physical Interaction)</span>
+                                            </li>
+                                        </ul>
+                                        <input type="hidden" id="eval-dataset" value="all">
+                                    </div>
+                                </div>
+
+                                <div id="eval-source-repo" class="eval-source-panel" style="display:none; margin-top: 14px;">
+                                    <label class="segmented-label">测试集</label>
+                                    <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                        <div class="ios-select-trigger" id="eval-repo-trigger">
+                                            <span class="selected-text">请选择测试集</span>
+                                            <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                        </div>
+                                        <ul class="ios-select-options" id="eval-repo-options"></ul>
+                                        <input type="hidden" id="eval-testset-id" value="">
+                                        <input type="hidden" id="eval-hf-dataset" value="">
+                                    </div>
+                                    <label class="segmented-label" style="margin-top: 12px;">子集 (Subset)</label>
+                                    <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                        <div class="ios-select-trigger" id="eval-subset-trigger">
+                                            <span class="selected-text">—</span>
+                                            <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                        </div>
+                                        <ul class="ios-select-options" id="eval-subset-options"></ul>
+                                        <input type="hidden" id="eval-subset" value="">
+                                    </div>
+                                    <label class="segmented-label" style="margin-top: 12px;">分割 (Split)</label>
+                                    <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                        <div class="ios-select-trigger" id="eval-split-trigger">
+                                            <span class="selected-text">—</span>
+                                            <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                        </div>
+                                        <ul class="ios-select-options" id="eval-split-options"></ul>
+                                        <input type="hidden" id="eval-split" value="">
+                                    </div>
+                                </div>
+
+                                <div id="eval-source-custom" class="eval-source-panel" style="display:none; margin-top: 14px;">
+                                    <label class="segmented-label">HuggingFace 数据集</label>
+                                    <div style="display:flex; gap:8px; margin-top: 6px;">
+                                        <input type="text" id="eval-hf-search-input" class="input-text" placeholder="输入数据集名，如 cais/mmlu" style="flex:1; padding: 8px 12px; border: 1px solid var(--apple-border); border-radius: 8px;">
+                                        <button type="button" id="eval-hf-search-btn" class="btn btn-secondary" style="white-space:nowrap;">搜索</button>
+                                    </div>
+                                    <div id="eval-hf-results" class="limit-desc" style="margin-top: 8px; max-height: 120px; overflow-y: auto;"></div>
+                                    <div id="eval-custom-subset-split" style="display:none; margin-top: 12px;">
+                                        <label class="segmented-label">子集 (Subset)</label>
+                                        <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                            <div class="ios-select-trigger" id="eval-custom-subset-trigger">
+                                                <span class="selected-text">—</span>
+                                                <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                            </div>
+                                            <ul class="ios-select-options" id="eval-custom-subset-options"></ul>
+                                            <input type="hidden" id="eval-custom-subset" value="">
+                                        </div>
+                                        <label class="segmented-label" style="margin-top: 12px;">分割 (Split)</label>
+                                        <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                            <div class="ios-select-trigger" id="eval-custom-split-trigger">
+                                                <span class="selected-text">—</span>
+                                                <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                            </div>
+                                            <ul class="ios-select-options" id="eval-custom-split-options"></ul>
+                                            <input type="hidden" id="eval-custom-split" value="">
+                                        </div>
+                                        <button type="button" id="eval-hf-download-btn" class="btn btn-primary" style="margin-top: 12px;">下载并添加到测试集仓库</button>
+                                    </div>
+                                </div>
+
+                                <div class="segmented-control-wrapper" style="margin-top: 18px;">
                                     <label class="segmented-label">测试深度 (Limit)</label>
                                     <div class="segmented-control" id="eval-limit-control">
                                         <div class="segmented-option" data-value="0.1">10% (快速)</div>
@@ -215,6 +288,7 @@
                         <div class="value" id="context-len">--</div>
                     </div>
                 </div>
+                <p id="results-placeholder-hint" class="results-placeholder-hint" style="display: none;">当前为占位结果，未运行 lm_eval 或评测未返回数据。图中三角形仅为占位显示。</p>
                 <div class="chart-container">
                     <canvas id="evaluation-chart"></canvas>
                 </div>

@@ -398,10 +398,10 @@ async function executeMergeTask() {
     const modelPaths = state.selectedModels.map(m => (typeof m === 'string' ? null : m.path)).filter(Boolean);
     const modelNames = state.selectedModels.map(m => (typeof m === 'string' ? m : (m && m.name))).filter(Boolean);
     const payload = {
-        weights: weights,
-        method: method,
-        dtype: dtype,
-        priority: currentPriority,
+                weights: weights,
+                method: method,
+                dtype: dtype,
+                priority: currentPriority,
         custom_name: customName,
         limit: limit
     };

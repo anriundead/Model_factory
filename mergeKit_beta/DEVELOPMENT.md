@@ -273,9 +273,38 @@ python3 scripts/cleanup_orphaned_models.py
 
 ## 常见问题
 
-### Q: 为什么融合步骤显示为 1？
+### Q: 为什么融合步骤显示为 "1次评估 (1/5 迭代)"？
 
-A: `step` 表示评估次数，不是迭代次数。如果任务只完成了 1 次评估就结束，`step` 就是 1。前端会显示为 "1 次评估 (1/4 迭代)" 的格式。
+A: 这个显示有两个部分：
+1. **"1次评估"**：表示实际完成了 1 次评估（`step=1`）
+2. **"(1/5 迭代)"**：表示根据评估次数和种群大小计算的迭代进度
+
+**问题原因**：
+- `step` 表示**评估次数**，每次调用 `_evaluate()` 方法时 `step` 会加 1
+- CMA-ES 算法每次迭代应该评估 `pop_size` 个个体（例如 `pop_size=4` 时，每次迭代应评估 4 次）
+- 如果 `step=1`，说明只完成了 1 次评估，这可能是因为：
+  1. **任务提前终止**：CMA-ES 可能在第一次评估后就找到了足够好的解，或者遇到了错误
+  2. **并行评估问题**：如果使用 Ray 并行，可能某些评估任务失败或未完成
+  3. **进度更新延迟**：`progress.json` 可能没有及时更新所有评估结果
+  4. **CSV 保存问题**：`results_df` 可能没有正确保存到 CSV 文件（检查 `vlm_search_results/vlm_search/vlm_search.csv`）
+
+**如何判断是否正常**：
+- 如果任务状态为 `success` 且有最终模型输出，说明任务正常完成
+- 如果 `step` 远小于 `pop_size × n_iter`，可能是任务提前结束或遇到问题
+- 检查 `bridge.log` 和 `subprocess_output.log` 查看是否有错误信息
+- 检查 `vlm_search_results/vlm_search/configs/` 目录中的配置文件数量，如果有很多配置文件但 CSV 为空，可能是 CSV 保存逻辑有问题
+
+**显示逻辑说明**：
+前端使用 `Math.ceil(currentStep / popSize)` 计算迭代次数，这是估算值。例如：
+- `step=1, pop_size=4` → `Math.ceil(1/4) = 1` → 显示 "(1/5 迭代)"
+- `step=4, pop_size=4` → `Math.ceil(4/4) = 1` → 显示 "(1/5 迭代)"
+- `step=5, pop_size=4` → `Math.ceil(5/4) = 2` → 显示 "(2/5 迭代)"
+
+**排查方法**：
+1. 检查 `merges/<task_id>/subprocess_output.log` 文件，查看子进程的完整输出
+2. 检查 `vlm_search_results/vlm_search/configs/` 目录中的配置文件数量
+3. 检查 `vlm_search_results/vlm_search/vlm_search.csv` 文件是否有数据行
+4. 如果配置文件很多但 CSV 为空，可能是 `results_df.to_csv()` 调用时机有问题，或者 `results_df` 在保存前被清空
 
 ### Q: 准确率为什么是 0？
 
