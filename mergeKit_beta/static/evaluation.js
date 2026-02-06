@@ -19,6 +19,7 @@ function initEval() {
     setupSidebar(); 
     setupDeleteModal();
     initSegmentedControls();
+    setupTestsetRefresh();
 }
 
 function initSegmentedControls() {
@@ -47,20 +48,63 @@ function onDatasetSourceChange(value) {
 }
 
 let testsetsList = [];
-async function loadTestsetRepoOptions() {
+let activeRepoFetchKey = null;
+const TESTSETS_CACHE_KEY = 'testsets_cache_v1';
+function loadTestsetsCache() {
     try {
-        const res = await fetch('/api/testset/list');
+        const raw = sessionStorage.getItem(TESTSETS_CACHE_KEY);
+        return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+        return null;
+    }
+}
+function saveTestsetsCache(list) {
+    try { sessionStorage.setItem(TESTSETS_CACHE_KEY, JSON.stringify(list || [])); } catch (e) {}
+}
+function setupTestsetRefresh() {
+    const btn = document.getElementById('eval-testset-refresh');
+    if (!btn) return;
+    btn.addEventListener('click', () => loadTestsetRepoOptions(true));
+}
+async function loadTestsetRepoOptions(forceRefresh) {
+    try {
+        if (!forceRefresh) {
+            const cached = loadTestsetsCache();
+            const invalidCache = cached && cached.some(t => !t || !t.testset_id || String(t.testset_id).includes('/'));
+            if (cached && cached.length && !invalidCache) {
+                testsetsList = cached;
+                renderTestsetRepoOptions();
+                if (cached.some(t => !t.sample_count || Number(t.sample_count) <= 0)) {
+                    setTimeout(() => loadTestsetRepoOptions(true), 0);
+                }
+                return;
+            }
+        }
+        const res = await fetch('/api/testset/list?refresh=1');
         const data = await res.json();
         testsetsList = (data.testsets || []) || [];
+        saveTestsetsCache(testsetsList);
+        renderTestsetRepoOptions();
+    } catch (e) {
+        console.error(e);
+        document.getElementById('eval-repo-options').innerHTML = '<li class="ios-option" style="color:#999;">加载失败</li>';
+    }
+}
+function renderTestsetRepoOptions() {
         const ul = document.getElementById('eval-repo-options');
         ul.innerHTML = '';
         if (!testsetsList.length) {
             ul.innerHTML = '<li class="ios-option" style="color:#999;">暂无测试集</li>';
+            document.getElementById('eval-repo-trigger').querySelector('.selected-text').textContent = '请选择测试集';
+            document.getElementById('eval-testset-id').value = '';
+            document.getElementById('eval-hf-dataset').value = '';
             return;
         }
+        const prevSelectedId = document.getElementById('eval-testset-id').value || '';
+        const selectedTestset = testsetsList.find(t => (t.testset_id || '') === prevSelectedId) || testsetsList[0];
         testsetsList.forEach((t, i) => {
             const li = document.createElement('li');
-            li.className = 'ios-option' + (i === 0 ? ' selected' : '');
+            li.className = 'ios-option' + ((selectedTestset && (t.testset_id || '') === (selectedTestset.testset_id || '')) ? ' selected' : '');
             li.dataset.testsetId = t.testset_id || '';
             li.dataset.hfDataset = t.hf_dataset || '';
             li.dataset.hfSubset = t.hf_subset || '';
@@ -69,14 +113,13 @@ async function loadTestsetRepoOptions() {
             li.addEventListener('click', () => selectRepoTestset(t));
             ul.appendChild(li);
         });
-        document.getElementById('eval-repo-trigger').querySelector('.selected-text').textContent = testsetsList[0] ? (testsetsList[0].name || testsetsList[0].hf_dataset) : '请选择测试集';
-        document.getElementById('eval-testset-id').value = testsetsList[0] ? (testsetsList[0].testset_id || '') : '';
-        document.getElementById('eval-hf-dataset').value = testsetsList[0] ? (testsetsList[0].hf_dataset || '') : '';
-        if (testsetsList[0]) fillSubsetSplitFromTestset(testsetsList[0]);
-    } catch (e) {
-        console.error(e);
-        document.getElementById('eval-repo-options').innerHTML = '<li class="ios-option" style="color:#999;">加载失败</li>';
-    }
+        const nextSelectedId = selectedTestset ? (selectedTestset.testset_id || '') : '';
+        document.getElementById('eval-repo-trigger').querySelector('.selected-text').textContent = selectedTestset ? (selectedTestset.name || selectedTestset.hf_dataset || selectedTestset.testset_id) : '请选择测试集';
+        document.getElementById('eval-testset-id').value = nextSelectedId;
+        document.getElementById('eval-hf-dataset').value = selectedTestset ? (selectedTestset.hf_dataset || '') : '';
+        if (selectedTestset && nextSelectedId && nextSelectedId !== prevSelectedId) {
+            fillSubsetSplitFromTestset(selectedTestset);
+        }
 }
 
 function selectRepoTestset(t) {
@@ -89,30 +132,125 @@ function selectRepoTestset(t) {
 }
 
 function fillSubsetSplitFromTestset(t) {
-    const subsetVal = t.hf_subset || '';
-    const splitVal = t.hf_split || 'train';
+    const subsetVal = (t.hf_subset || '').trim();
+    const splitVal = (t.hf_split || 'train').trim();
     const subsetUl = document.getElementById('eval-subset-options');
     const splitUl = document.getElementById('eval-split-options');
-    subsetUl.innerHTML = '<li class="ios-option selected" data-value="">— 无</li>';
-    splitUl.innerHTML = '<li class="ios-option selected" data-value="train">train</li><li class="ios-option" data-value="validation">validation</li><li class="ios-option" data-value="test">test</li>';
-    document.getElementById('eval-subset-trigger').querySelector('.selected-text').textContent = subsetVal || '— 无';
-    document.getElementById('eval-split-trigger').querySelector('.selected-text').textContent = splitVal;
+    const subsetTrigger = document.getElementById('eval-subset-trigger');
+    const splitTrigger = document.getElementById('eval-split-trigger');
+    const subsetWrapper = subsetTrigger.closest('.ios-select-wrapper');
+    const splitWrapper = splitTrigger.closest('.ios-select-wrapper');
     document.getElementById('eval-subset').value = subsetVal;
     document.getElementById('eval-split').value = splitVal;
+    
+    // 如果有 hf_dataset，显示加载状态
     if (t.hf_dataset) {
-        fetch('/api/dataset/hf_info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hf_dataset: t.hf_dataset }) })
+        const fetchKey = (t.testset_id || '') + '|' + (t.hf_dataset || '');
+        activeRepoFetchKey = fetchKey;
+        // 显示加载进度条
+        subsetTrigger.querySelector('.selected-text').innerHTML = '<span class="loading-text"><span class="loading-dots"></span> 加载子集中...</span>';
+        splitTrigger.querySelector('.selected-text').innerHTML = '<span class="loading-text"><span class="loading-dots"></span> 加载分割中...</span>';
+        subsetWrapper.classList.add('loading');
+        splitWrapper.classList.add('loading');
+        subsetUl.innerHTML = '';
+        splitUl.innerHTML = '';
+        
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        fetch('/api/dataset/hf_info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hf_dataset: t.hf_dataset, hf_subset: subsetVal || undefined }), signal: controller.signal })
             .then(r => r.json())
             .then(d => {
-                if (d.status === 'success' && (d.configs && d.configs.length || d.splits && d.splits.length)) {
+                clearTimeout(timeoutId);
+                if (activeRepoFetchKey !== fetchKey) return;
+                if ((document.getElementById('eval-testset-id').value || '') !== (t.testset_id || '')) return;
+                if ((document.getElementById('eval-hf-dataset').value || '') !== (t.hf_dataset || '')) return;
+                // 移除加载状态
+                subsetWrapper.classList.remove('loading');
+                splitWrapper.classList.remove('loading');
+                
+                if (d.status === 'success') {
+                    // 更新子集下拉框
                     if (d.configs && d.configs.length) {
-                        subsetUl.innerHTML = '<li class="ios-option" data-value="">— 无</li>' + d.configs.map(c => '<li class="ios-option' + (c === subsetVal ? ' selected' : '') + '" data-value="' + c + '">' + c + '</li>').join('');
+                        const configs = d.configs.slice();
+                        const configsSet = new Set(configs);
+                        if (subsetVal && !configsSet.has(subsetVal)) {
+                            configs.unshift(subsetVal);
+                        }
+                        const nextSubset = subsetVal || (configs[0] || '');
+                        subsetUl.innerHTML = '<li class="ios-option' + (nextSubset ? '' : ' selected') + '" data-value="">— 无</li>' + configs.map(c => '<li class="ios-option' + (c === nextSubset ? ' selected' : '') + '" data-value="' + c + '">' + c + '</li>').join('');
+                        subsetTrigger.querySelector('.selected-text').textContent = nextSubset || '— 无';
+                        document.getElementById('eval-subset').value = nextSubset;
+                    } else {
+                        // 没有 configs 时设置默认值
+                        subsetUl.innerHTML = '<li class="ios-option' + (subsetVal ? '' : ' selected') + '" data-value="">— 无</li>';
+                        if (subsetVal) {
+                            subsetUl.innerHTML += '<li class="ios-option selected" data-value="' + subsetVal + '">' + subsetVal + '</li>';
+                        }
+                        subsetTrigger.querySelector('.selected-text').textContent = subsetVal || '— 无';
+                        document.getElementById('eval-subset').value = subsetVal;
                     }
+                    // 更新 split 下拉框
                     if (d.splits && d.splits.length) {
-                        splitUl.innerHTML = d.splits.map(s => '<li class="ios-option' + (s === splitVal ? ' selected' : '') + '" data-value="' + s + '">' + s + '</li>').join('');
+                        const splits = d.splits.slice();
+                        if (splitVal && !splits.includes(splitVal)) {
+                            splits.unshift(splitVal);
+                        }
+                        let nextSplit = splitVal;
+                        if (!nextSplit) {
+                            nextSplit = splits.includes('test') ? 'test' : splits[0];
+                        }
+                        splitUl.innerHTML = splits.map(s => '<li class="ios-option' + (s === nextSplit ? ' selected' : '') + '" data-value="' + s + '">' + s + '</li>').join('');
+                        splitTrigger.querySelector('.selected-text').textContent = nextSplit;
+                        document.getElementById('eval-split').value = nextSplit;
+                    } else {
+                        // 默认 splits
+                        splitUl.innerHTML = '<li class="ios-option' + (splitVal === 'train' ? ' selected' : '') + '" data-value="train">train</li><li class="ios-option' + (splitVal === 'validation' ? ' selected' : '') + '" data-value="validation">validation</li><li class="ios-option' + (splitVal === 'test' ? ' selected' : '') + '" data-value="test">test</li>';
+                        if (splitVal && !['train', 'validation', 'test'].includes(splitVal)) {
+                            splitUl.innerHTML = '<li class="ios-option selected" data-value="' + splitVal + '">' + splitVal + '</li>' + splitUl.innerHTML;
+                        }
+                        splitTrigger.querySelector('.selected-text').textContent = splitVal;
+                        document.getElementById('eval-split').value = splitVal;
                     }
+                } else {
+                    // API 返回失败，使用默认值
+                    setDefaultSubsetSplit(subsetVal, splitVal);
                 }
             })
-            .catch(() => {});
+            .catch(() => {
+                clearTimeout(timeoutId);
+                if (activeRepoFetchKey !== fetchKey) return;
+                // API 调用失败，移除加载状态并使用默认值
+                subsetWrapper.classList.remove('loading');
+                splitWrapper.classList.remove('loading');
+                setDefaultSubsetSplit(subsetVal, splitVal);
+            });
+    } else {
+        // 没有 hf_dataset 时直接设置默认值
+        setDefaultSubsetSplit(subsetVal, splitVal);
+    }
+    
+    function setDefaultSubsetSplit(subsetVal, splitVal) {
+        subsetUl.innerHTML = '<li class="ios-option' + (subsetVal ? '' : ' selected') + '" data-value="">— 无</li>';
+        splitUl.innerHTML = '<li class="ios-option' + (splitVal === 'train' ? ' selected' : '') + '" data-value="train">train</li><li class="ios-option' + (splitVal === 'validation' ? ' selected' : '') + '" data-value="validation">validation</li><li class="ios-option' + (splitVal === 'test' ? ' selected' : '') + '" data-value="test">test</li>';
+        subsetTrigger.querySelector('.selected-text').textContent = subsetVal || '— 无';
+        splitTrigger.querySelector('.selected-text').textContent = splitVal;
+        document.getElementById('eval-subset').value = subsetVal;
+        document.getElementById('eval-split').value = splitVal;
+        if (subsetVal) {
+            const li = document.createElement('li');
+            li.className = 'ios-option selected';
+            li.dataset.value = subsetVal;
+            li.textContent = subsetVal;
+            subsetUl.appendChild(li);
+            subsetUl.querySelector('[data-value=""]').classList.remove('selected');
+        }
+        if (splitVal && !['train', 'validation', 'test'].includes(splitVal)) {
+            const li = document.createElement('li');
+            li.className = 'ios-option selected';
+            li.dataset.value = splitVal;
+            li.textContent = splitVal;
+            splitUl.insertBefore(li, splitUl.firstChild);
+        }
     }
 }
 
@@ -158,8 +296,11 @@ async function selectCustomHfDataset(hfId) {
     document.querySelectorAll('.eval-hf-result-item').forEach(el => el.style.background = el.dataset.id === hfId ? 'var(--apple-blue)' : 'var(--apple-bg-secondary, #f5f5f7)');
     document.getElementById('eval-custom-subset-split').style.display = 'block';
     try {
-        const res = await fetch('/api/dataset/hf_info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hf_dataset: hfId }) });
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        const res = await fetch('/api/dataset/hf_info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hf_dataset: hfId }), signal: controller.signal });
         const data = await res.json();
+        clearTimeout(timeoutId);
         if (data.status === 'success') {
             customConfigs = data.configs || [];
             customSplits = data.splits || ['train', 'validation', 'test'];
@@ -172,7 +313,7 @@ async function selectCustomHfDataset(hfId) {
             document.getElementById('eval-custom-subset').value = '';
             document.getElementById('eval-custom-split').value = 'test';
         }
-    } catch (e) { console.error(e); }
+    } catch (e) { }
 }
 
 async function doHfDownloadAndAdd() {
@@ -209,11 +350,11 @@ async function loadHistoryList() {
     listEl.innerHTML = '';
     
     try {
-        const res = await fetch('/api/history');
+        const res = await fetch('/api/test_history');
         const data = await res.json();
         
         if (!data.history || data.history.length === 0) {
-            listEl.innerHTML = '<div style="padding:20px; text-align:center; color:#999; font-size:0.8rem;">暂无融合记录</div>';
+            listEl.innerHTML = '<div style="padding:20px; text-align:center; color:#999; font-size:0.8rem;">暂无测试记录</div>';
             return;
         }
 
@@ -227,19 +368,22 @@ async function loadHistoryList() {
             const timeStr = `${(date.getMonth()+1).toString().padStart(2, '0')}-${date.getDate().toString().padStart(2, '0')} ${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
             
             // 2. 名称
-            const displayName = item.custom_name || (item.models || []).join(' + ');
+            const displayName = item.model_name || item.custom_name || item.task_id || item.id || '';
+            const datasetLabel = item.dataset || item.hf_dataset || '评测任务';
+            const statusLabel = item.status || '';
 
             // 3. 构建 HTML
             div.innerHTML = `
                 <div class="h-content">
                     <div class="h-title">
-                        <i class="ri-git-merge-line" style="font-size:0.8rem; margin-right:4px; opacity:0.7;"></i>
+                        <i class="ri-flask-line" style="font-size:0.8rem; margin-right:4px; opacity:0.7;"></i>
                         ${displayName}
                     </div>
                     <div class="h-meta">
                         <span>${timeStr}</span>
                         <span>•</span>
-                        <span>${item.method || 'Merge'}</span>
+                        <span>${datasetLabel}</span>
+                        ${statusLabel ? '<span>•</span><span>' + statusLabel + '</span>' : ''}
                     </div>
                 </div>
                 <button class="btn-delete-history" onclick="confirmDelete(event, '${item.id}')">
@@ -407,13 +551,18 @@ function renderModelGrid(models, containerId, type) {
         card.dataset.modelType = type; 
         card.dataset.modelValue = model.path; 
         card.dataset.modelName = model.name;
+        const kindTag = model.is_vlm ? 'VLM' : 'LLM';
+        // VLM 紫色，LLM 蓝色，更直观的标签样式
+        const tagStyle = model.is_vlm
+            ? 'background: linear-gradient(135deg, rgba(139, 92, 246, 0.18), rgba(168, 85, 247, 0.22)); color: #7c3aed; border: 1px solid rgba(139, 92, 246, 0.25);'
+            : 'background: linear-gradient(135deg, rgba(0, 113, 227, 0.12), rgba(59, 130, 246, 0.16)); color: #2563eb; border: 1px solid rgba(0, 113, 227, 0.2);';
 
         card.innerHTML = `
             <div style="display:flex; align-items:center; gap:10px;">
                 <i class="${type === 'local' ? 'ri-hard-drive-2-line' : 'ri-git-merge-line'}" style="color:var(--apple-blue); font-size:1.2rem;"></i>
-                <div style="text-align:left;">
+                <div style="text-align:left; flex:1;">
                     <h4 style="font-size:0.8rem; margin:0;">${model.name}</h4>
-                    <p style="font-size:0.75rem; margin:0; opacity:0.6;">${type === 'local' ? 'Base Model' : 'Fused Model'}</p>
+                    <p style="font-size:0.75rem; margin:0; opacity:0.6;">${type === 'local' ? 'Base Model' : 'Fused Model'} <span style="margin-left:6px; font-size:0.7rem; padding:3px 10px; border-radius:8px; font-weight:600; ${tagStyle}">${kindTag}</span></p>
                 </div>
             </div>
         `;
@@ -512,17 +661,28 @@ async function startEvaluation() {
     setStatusUI("正在提交评估任务...", 0, true);
 
     const source = document.getElementById('eval-dataset-source').value;
+    const sampling = document.getElementById('eval-sampling').value;
     const payload = {
         model_path: evalState.selectedModel.path,
         model_name: evalState.selectedModel.name,
         task_type: 'eval_only',
-        limit: limit
+        limit: limit,
+        sampling: sampling
     };
     if (source === 'builtin') {
         payload.dataset = document.getElementById('eval-dataset').value;
     } else if (source === 'repo') {
-        payload.testset_id = document.getElementById('eval-testset-id').value;
-        payload.hf_dataset = document.getElementById('eval-hf-dataset').value || null;
+        const rawTestsetId = document.getElementById('eval-testset-id').value;
+        const rawHfDataset = document.getElementById('eval-hf-dataset').value || null;
+        let resolvedTestsetId = rawTestsetId;
+        if (!resolvedTestsetId || String(resolvedTestsetId).includes('/')) {
+            const match = testsetsList.find(t => t && (t.hf_dataset || '') === (rawHfDataset || ''));
+            if (match && match.testset_id) {
+                resolvedTestsetId = match.testset_id;
+            }
+        }
+        payload.testset_id = resolvedTestsetId || null;
+        payload.hf_dataset = rawHfDataset || null;
         payload.hf_subset = document.getElementById('eval-subset').value || null;
         payload.hf_split = document.getElementById('eval-split').value || null;
     } else {
@@ -563,18 +723,29 @@ async function stopEvalTask() {
     setStatusUI("测试已停止", 0, false, '#86868b');
 }
 
+function normalizeEvalStatusMessage(message, status) {
+    const raw = (message || '').toString().trim();
+    if (!raw || raw === 'None' || raw === 'null' || raw === 'undefined' || raw === '0' || raw === '0/0') {
+        return status === 'queued' ? '排队中...' : '正在评估...';
+    }
+    if (raw.length > 80) return raw.slice(0, 80);
+    return raw;
+}
 function pollStatus(taskId) {
     if (pollTimer) clearInterval(pollTimer);
-    
+    let pollCount = 0;
     pollTimer = setInterval(async () => {
         try {
             const res = await fetch(`/api/status/${taskId}`);
             const data = await res.json();
             
             if (data.status === 'running' || data.status === 'queued') {
-                const msg = data.status === 'queued' ? `排队中 (${data.queue_position})` : (data.message || "正在评估...");
-                const prog = data.status === 'queued' ? 100 : (data.progress || 0);
+                const msg = data.status === 'queued' ? `排队中 (${data.queue_position || 0})` : normalizeEvalStatusMessage(data.message, data.status);
+                let prog = data.status === 'queued' ? 100 : (data.progress || 0);
                 const stripe = data.status === 'queued';
+                if (data.status === 'running' && (!data.progress || data.progress <= 0)) {
+                    prog = Math.min(5, Math.floor(pollCount / 6) + 1);
+                }
                 
                 setStatusUI(msg, prog, stripe);
                 document.getElementById('start-eval').innerText = "正在运行...";
@@ -600,6 +771,7 @@ function pollStatus(taskId) {
                 }
             }
         } catch(e) { console.error(e); }
+        pollCount++;
     }, 1000);
 }
 
@@ -638,7 +810,7 @@ function renderResults(metrics) {
         if (isPlaceholder && metrics.eval_note) {
             hintEl.textContent = metrics.eval_note;
         } else if (isPlaceholder) {
-            hintEl.textContent = '当前为占位结果，未运行 lm_eval 或评测未返回数据。图中三角形仅为占位显示。';
+            hintEl.textContent = '当前为占位结果，评测未返回数据。图中三角形仅为占位显示。';
         }
     }
 

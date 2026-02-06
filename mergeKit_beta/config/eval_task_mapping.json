@@ -1,0 +1,8 @@
+{
+  "TIGER-Lab/MMLU-Pro|default": "fld_logical_formula_default",
+  "TIGER-Lab/MMLU-Pro|health_and_medicine": "mmlu_flan_n_shot_loglikelihood_professional_medicine",
+  "openai/gsm8k": "gsm8k",
+  "openai/gsm8k|socratic": "gsm8k",
+  "openai/gsm8k|main": "gsm8k",
+  "openai/gsm8k|health_and_medicine": "gsm8k"
+}

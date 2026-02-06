@@ -135,12 +135,16 @@
                     <h3>本地可用模型</h3>
                     <span class="helper-text">Local Models</span>
                 </div>
+                <p class="limit-desc" style="margin-bottom: 8px;">基座模型与已有融合模型（含完整权重）；点击加入工作台。</p>
                 <div id="models-container" class="models-grid">
                     <div class="loading-state">
                         <div class="spinner"></div>
                         <p>正在扫描本地模型库...</p>
                     </div>
                 </div>
+                <div class="section-header" style="margin-top: 16px;"><h3>融合配方</h3> <span class="helper-text">Recipes</span></div>
+                <p class="limit-desc" style="margin-bottom: 8px;">选择配方可先物化再参与融合（二代/三代）。</p>
+                <div id="recipes-merge-container" class="models-grid"></div>
             </section>
 
             <div class="two-column-layout">
@@ -270,8 +274,8 @@
                     <p class="limit-desc" style="margin-bottom: 16px;">选择至少 2 个模型，设置种群、迭代、最大样本量及数据集与子集；涉及 VLM 时请选用 CMMMU 等图像数据集。</p>
                     <div class="evolutionary-main-layout">
                         <div class="evolutionary-left">
-                            <div class="two-column-layout">
-                                <section class="section apple-card">
+                            <div class="evolutionary-workspace-column">
+                                <section class="section apple-card evolutionary-workspace-card">
                                     <div class="section-header">
                                         <h3>融合工作台</h3>
                                         <span class="helper-text">Merge Workspace</span>
@@ -285,13 +289,13 @@
                                         <div id="evolutionary-selected-list" class="selected-models"></div>
                                     </div>
                                 </section>
-                                <section class="section apple-card">
+                                <section class="section apple-card evolutionary-pool-card">
                                     <div class="section-header">
                                         <h3>参与融合的模型（多选）</h3>
                                         <span class="helper-text">可选模型 · 已标 VLM/LLM</span>
                                     </div>
-                                    <div id="evolutionary-models-container" class="models-grid evolutionary-models-pool"></div>
-                                    <p class="limit-desc">点击卡片选中/取消，至少选 2 个</p>
+                                    <p class="limit-desc evolutionary-pool-hint">点击卡片选中/取消，至少选 2 个</p>
+                                    <div id="evolutionary-models-container" class="evolutionary-models-pool"></div>
                                 </section>
                             </div>
                         </div>

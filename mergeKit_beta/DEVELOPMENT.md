@@ -103,6 +103,18 @@ mergeKit_beta/
 - `DELETE /api/history/<task_id>` - 删除历史记录
 - `GET /api/fusion_history` - 获取融合历史（含性能指标）
 
+### 评估任务
+
+- `POST /api/evaluate` - 提交评估任务（支持内置基准、测试集仓库、自定义数据集）
+- `GET /api/status/<task_id>` - 获取任务状态和进度（含评估结果）
+
+### 测试集管理
+
+- `GET /api/testset/list` - 获取测试集仓库列表
+- `POST /api/testset/create` - 创建新测试集（从 HuggingFace 下载）
+- `POST /api/testset/search` - 搜索测试集
+- `POST /api/dataset/hf_info` - 获取 HuggingFace 数据集信息（configs、splits）
+
 ### 配方管理
 
 - `GET /api/recipes` - 获取所有配方列表
@@ -271,6 +283,51 @@ python3 scripts/cleanup_orphaned_models.py
    curl http://localhost:5000/api/status/<task_id>
    ```
 
+## 评估功能详解
+
+### 评估任务执行流程
+
+1. **前端提交**：用户选择模型、数据集、测试深度（10%/50%/100%）、采样方式（顺序/随机）
+2. **后端处理**：`app.py` 的 `start_evaluation_task()` 接收参数，生成任务 ID
+3. **任务执行**：`merge_manager.py` 的 `run_eval_only_task()` 调用 `run_lm_eval_stream()`
+4. **lm_eval 执行**：根据数据集自动发现或映射到对应的 lm_eval 任务名，执行评估
+5. **结果解析**：从 lm_eval 输出中提取准确率、F1、样本数、上下文长度等指标
+6. **结果展示**：前端显示数值和雷达图（Accuracy、Efficiency、Context 三维）
+
+### 数据集支持
+
+- **内置基准**：`all`、`hellaswag`、`arc_easy`、`boolq`、`winogrande`、`piqa`
+- **测试集仓库**：从 HuggingFace 下载的数据集（如 `TIGER-Lab/MMLU-Pro`）
+- **自定义数据集**：支持任意 HuggingFace 数据集 ID
+
+### 自动任务映射
+
+系统支持自动发现 HuggingFace 数据集到 lm_eval 任务的映射：
+
+1. **优先级**：手动配置 > 内置映射 > 自动发现
+2. **自动发现策略**：
+   - 精确匹配数据集和子集名称
+   - 关键词匹配（如 `health_and_medicine` → `professional_medicine`）
+   - MMLU 特殊处理（支持 MMLU-Pro 等变体）
+   - 智能评分选择最佳匹配任务
+3. **映射保存**：自动发现的映射会保存到 `config/eval_task_mapping.json`
+
+### 任务组过滤
+
+系统会过滤掉 lm_eval 任务组（如 `mmlu`），只使用具体任务（如 `mmlu_professional_medicine`），避免 `TypeError: TaskConfig.__init__() got an unexpected keyword argument 'group'` 错误。
+
+### 采样方式
+
+- **顺序采样**：使用 `--limit` 参数，从数据集开头顺序取样本
+- **随机采样**：由于 lm_eval CLI 不支持 `--samples`，当前使用 `--limit` 近似实现（未来可改进）
+
+### 评估指标计算
+
+- **Accuracy**：从 lm_eval 结果中提取
+- **F1 Score**：从 lm_eval 结果中提取（如有）
+- **Efficiency**：基于 `samples/time` 计算，归一化到 0-100（基准：100 samples/s = 100分）
+- **Context**：从模型配置中提取上下文长度，归一化到 0-100
+
 ## 常见问题
 
 ### Q: 为什么融合步骤显示为 "1次评估 (1/5 迭代)"？
@@ -343,7 +400,50 @@ ps aux | grep app.py | grep -v grep | awk '{print $2}' | xargs kill
 ./start_app.sh
 ```
 
+### Q: 评估任务失败，提示 "无法推断有效的 lm_eval 任务名"？
+
+A: 可能原因：
+1. 数据集名称或子集名称无法映射到 lm_eval 任务
+2. 自动发现功能未找到匹配的任务
+
+解决方法：
+1. 检查 `config/eval_task_mapping.json`，手动添加映射
+2. 查看日志中的自动发现过程，确认是否找到候选任务
+3. 对于 MMLU-Pro 等新数据集，系统会自动尝试智能匹配
+
+### Q: 评估结果显示 0 或 N/A？
+
+A: 可能原因：
+1. lm_eval 执行失败（检查 `eval_stderr.txt`）
+2. 数据集加载失败
+3. 任务组被误用（应使用具体任务名）
+
+解决方法：
+1. 查看任务目录下的 `eval_stderr.txt` 文件
+2. 检查数据集是否正确下载到缓存目录
+3. 确认使用的任务名不是任务组（如 `mmlu` 应改为 `mmlu_professional_medicine`）
+
+### Q: 测试集下载后，下拉栏中看不到子集？
+
+A: 系统会优先从本地已加载的数据集读取真实的 splits 和 configs。如果看不到：
+1. 确认数据集已成功下载到缓存目录
+2. 检查 `config/eval_task_mapping.json` 中是否有该数据集的映射
+3. 前端会自动添加已存储的 `hf_subset` 到下拉选项
+
 ## 版本历史
+
+### v1.1 (2026-02-04)
+
+- ✅ 修复评估结果显示 0s/N/A 的问题
+- ✅ 修复雷达图显示问题，支持单任务三维展示
+- ✅ 修复 lm_eval CLI 参数错误（移除不支持的 --task_args）
+- ✅ 实现 Efficiency 参数的有意义计算（基于 samples/time）
+- ✅ 修复测试集下载后 hf_subset 和 sample_count 显示问题
+- ✅ 实现随机采样和顺序采样功能
+- ✅ 修复 TypeError: TaskConfig.__init__() got an unexpected keyword argument 'group' 错误
+- ✅ 实现自动发现 lm_eval 任务映射功能（支持 MMLU-Pro 等新数据集）
+- ✅ 优化从本地数据集读取真实的 splits 和 configs
+- ✅ 增强任务组过滤和验证机制
 
 ### v1.0 (2026-02-03)
 

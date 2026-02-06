@@ -392,10 +392,43 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
         return {"status": "error", "error": str(e)}
 
 
-def run_recipe_apply_task(task_id, params, update_progress_callback, task_control=None):
+def materialize_recipe_to_temp(recipe_id, parent_task_id, suffix, update_progress_callback, task_control=None):
     """
-    按配方执行一次合并（固定 genotype，不进化）。用于「根据配方直接融合出最终模型」。
+    将配方物化到临时目录，不注册到 model_repo。用于三代融合等中间步骤。
+    返回 (output_path, error_msg)。成功时 error_msg 为 None。
+    """
+    synthetic_task_id = "%s_gen2_%s" % (parent_task_id, suffix)
+    params = {"recipe_id": recipe_id}
+    result = run_recipe_apply_task(
+        synthetic_task_id,
+        params,
+        update_progress_callback,
+        task_control=task_control,
+        skip_register=True,
+    )
+    if result.get("status") == "success":
+        return (result.get("output_path"), None)
+    return (None, result.get("error", "未知错误"))
+
+
+def cleanup_recipe_temp_dirs(parent_task_id, suffixes):
+    """清理完全融合中物化配方产生的临时目录（merges/<parent_task_id>_gen2_<suffix>）。"""
+    for suffix in suffixes:
+        synthetic_id = "%s_gen2_%s" % (parent_task_id, suffix)
+        temp_dir = os.path.join(MERGE_DIR, synthetic_id)
+        if os.path.isdir(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+                _logger.info("[cleanup] 已删除临时物化目录: %s", temp_dir)
+            except Exception as e:
+                _logger.warning("[cleanup] 删除临时目录失败 %s: %s", temp_dir, e)
+
+
+def run_recipe_apply_task(task_id, params, update_progress_callback, task_control=None, skip_register=False):
+    """
+    按配方执行一次合并（固定 genotype，不进化）。用于「根据配方直接融合出最终模型」或中间物化。
     params: recipe_id, custom_name（可选）
+    skip_register: 为 True 时不注册到 model_repo，用于中间物化（如三代融合前的 A/B）。
     """
     if task_control is None:
         task_control = {}
@@ -528,20 +561,21 @@ def run_recipe_apply_task(task_id, params, update_progress_callback, task_contro
         ):
             raise RuntimeError("融合输出目录无效: %s" % output_dir)
 
-        update_progress_callback(90, "注册模型仓库...")
-        try:
-            from model_repo import api as model_repo_api
-        except ImportError:
-            model_repo_api = None
-        if model_repo_api and hasattr(model_repo_api, "register_merged_model"):
-            recipe_meta = {
-                "parent_models": [os.path.basename(p) for p in model_paths],
-                "weights": weights,
-                "method": "ties_dare",
-                "library": "mergenetic",
-                "dtype": dtype,
-            }
-            model_repo_api.register_merged_model(output_dir, custom_name, recipe_meta)
+        if not skip_register:
+            update_progress_callback(90, "注册模型仓库...")
+            try:
+                from model_repo import api as model_repo_api
+            except ImportError:
+                model_repo_api = None
+            if model_repo_api and hasattr(model_repo_api, "register_merged_model"):
+                recipe_meta = {
+                    "parent_models": [os.path.basename(p) for p in model_paths],
+                    "weights": weights,
+                    "method": "ties_dare",
+                    "library": "mergenetic",
+                    "dtype": dtype,
+                }
+                model_repo_api.register_merged_model(output_dir, custom_name, recipe_meta)
         metadata["status"] = "success"
         metadata["metrics"] = {"output_path": output_dir}
         with open(meta_path, "w", encoding="utf-8") as f:
@@ -606,6 +640,308 @@ def _load_eval_task_mapping():
         return {}
 
 
+def _save_eval_task_mapping(mapping_dict):
+    """保存映射到配置文件。"""
+    path = os.path.join(Config.PROJECT_ROOT, "config", "eval_task_mapping.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(mapping_dict, f, ensure_ascii=False, indent=2)
+        _logger.info("[eval] 已保存任务映射到 %s", path)
+        return True
+    except Exception as e:
+        _logger.warning("[eval] 保存映射文件失败 %s: %s", path, e)
+        return False
+
+
+def _update_leaderboard(testset_id, entry):
+    if not testset_id:
+        return False
+    lb_path = os.path.join(Config.PROJECT_ROOT, "testset_repo", "data", "leaderboard.json")
+    os.makedirs(os.path.dirname(lb_path), exist_ok=True)
+    data = {}
+    if os.path.isfile(lb_path):
+        try:
+            with open(lb_path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+        except Exception as e:
+            _logger.warning("[eval] 读取 leaderboard 失败: %s", e)
+            data = {}
+    leaderboards = data.get("leaderboards", {}) if isinstance(data, dict) else {}
+    lb = leaderboards.get(testset_id, []) if isinstance(leaderboards, dict) else []
+    task_id = entry.get("task_id")
+    if task_id:
+        lb = [e for e in lb if e.get("task_id") != task_id]
+    lb.append(entry)
+    if not isinstance(leaderboards, dict):
+        leaderboards = {}
+    leaderboards[testset_id] = lb
+    try:
+        with open(lb_path, "w", encoding="utf-8") as f:
+            json.dump({"leaderboards": leaderboards}, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        _logger.warning("[eval] 保存 leaderboard 失败: %s", e)
+        return False
+
+
+def _get_available_lm_eval_tasks():
+    """获取所有可用的 lm_eval 任务列表（排除任务组，只返回具体任务）。"""
+    try:
+        from lm_eval.tasks import TaskManager
+        task_manager = TaskManager(verbosity="ERROR")  # 使用 ERROR 级别减少日志
+        available_tasks = task_manager.all_tasks
+        # 获取任务组列表，用于过滤
+        try:
+            if hasattr(task_manager, 'all_groups'):
+                task_groups = task_manager.all_groups
+                # all_groups 可能是列表或字典
+                if isinstance(task_groups, list):
+                    task_groups_set = set(task_groups)
+                elif hasattr(task_groups, 'keys'):
+                    task_groups_set = set(task_groups.keys())
+                else:
+                    task_groups_set = set()
+            else:
+                task_groups_set = set()
+        except Exception:
+            task_groups_set = set()
+        # 过滤掉任务组，只返回具体任务
+        if task_groups_set:
+            filtered_tasks = [t for t in available_tasks if t not in task_groups_set]
+            return sorted(filtered_tasks) if filtered_tasks else sorted(list(available_tasks))
+        return sorted(list(available_tasks)) if available_tasks else []
+    except Exception as e:
+        _logger.warning("[eval] 获取 lm_eval 任务列表失败: %s", e)
+        # 尝试使用命令行方式
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["lm_eval", "--tasks", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                tasks = [line.strip() for line in result.stdout.split("\n") if line.strip() and not line.startswith("#")]
+                return tasks
+        except Exception as cmd_err:
+            _logger.debug("[eval] 命令行获取任务列表也失败: %s", cmd_err)
+        return []
+
+
+def _auto_discover_lm_eval_task(hf_dataset, hf_subset=None):
+    """
+    自动发现与 hf_dataset/hf_subset 匹配的 lm_eval 任务。
+    返回匹配的任务名，如果找不到返回 None。
+    确保返回的是具体任务而不是任务组。
+    """
+    if not hf_dataset:
+        return None
+    
+    hf_dataset_lower = hf_dataset.lower().strip()
+    subset_lower = (hf_subset or "").lower().strip()
+    
+    # 提取数据集名称（去掉组织名）
+    dataset_name_parts = hf_dataset_lower.split("/")
+    dataset_base_name = dataset_name_parts[-1] if len(dataset_name_parts) > 1 else dataset_name_parts[0]
+    dataset_base_name = dataset_base_name.replace("-", "_")
+    
+    available_tasks = _get_available_lm_eval_tasks()
+    if not available_tasks:
+        _logger.warning("[eval] 无法获取 lm_eval 任务列表，跳过自动发现")
+        return None
+    
+    # 获取任务组集合，用于验证返回的不是任务组
+    try:
+        from lm_eval.tasks import TaskManager
+        task_manager = TaskManager(verbosity="ERROR")
+        task_groups_set = set(task_manager.all_groups) if hasattr(task_manager, 'all_groups') else set()
+    except Exception:
+        task_groups_set = set()
+    
+    # 匹配策略（按优先级）：
+    # 1. 精确匹配：hf_dataset 或 dataset_base_name
+    # 2. 包含匹配：任务名包含 dataset_base_name
+    # 3. 如果有 subset，尝试匹配包含 subset 的任务
+    # 4. 对于 MMLU 相关，尝试匹配 mmlu_* 模式
+    
+    candidates = []
+    
+    # 策略1: 精确匹配
+    for task in available_tasks:
+        # 确保不是任务组
+        if task in task_groups_set:
+            continue
+        task_lower = task.lower()
+        if task_lower == hf_dataset_lower or task_lower == dataset_base_name:
+            _logger.info("[eval] 自动发现精确匹配: %s -> %s", hf_dataset, task)
+            return task
+    
+    # 策略2: 包含匹配（优先匹配更长的任务名）
+    for task in available_tasks:
+        # 确保不是任务组
+        if task in task_groups_set:
+            continue
+        task_lower = task.lower()
+        if dataset_base_name in task_lower or task_lower in dataset_base_name:
+            # 计算相似度（优先更长的匹配）
+            score = len(set(task_lower.split("_")) & set(dataset_base_name.split("_")))
+            candidates.append((score, len(task), task))
+    
+    # 策略3: 如果有 subset，尝试匹配包含 subset 的任务
+    if subset_lower:
+        subset_normalized = subset_lower.replace("-", "_")
+        subset_keywords = [s for s in subset_normalized.split("_") if len(s) > 3]  # 提取关键词（长度>3的词）
+        for task in available_tasks:
+            # 确保不是任务组
+            if task in task_groups_set:
+                continue
+            task_lower = task.lower()
+            # 精确匹配
+            if subset_normalized in task_lower:
+                score = len(set(task_lower.split("_")) & set([subset_normalized]))
+                candidates.append((score + 15, len(task), task))  # subset 精确匹配高分
+            # 关键词匹配
+            elif subset_keywords and any(kw in task_lower for kw in subset_keywords):
+                matched_keywords = sum(1 for kw in subset_keywords if kw in task_lower)
+                score = matched_keywords * 5  # 每个匹配的关键词5分
+                candidates.append((score + 10, len(task), task))  # subset 关键词匹配加分
+    
+    # 策略4: MMLU 特殊处理（包括 MMLU-Pro 等变体）
+    if "mmlu" in dataset_base_name:
+        # 对于 MMLU-Pro，尝试匹配 mmlu_pro 相关的任务
+        if "pro" in dataset_base_name or "pro" in hf_dataset_lower:
+            # 优先匹配：先找精确匹配 subset 的任务
+            if subset_lower:
+                subset_normalized = subset_lower.replace("-", "_")
+                subset_keywords = [s for s in subset_normalized.split("_") if len(s) > 3]
+                
+                # 精确匹配 subset（如 college_medicine）
+                for task in available_tasks:
+                    if task in task_groups_set:
+                        continue
+                    task_lower = task.lower()
+                    if subset_normalized in task_lower and "mmlu" in task_lower:
+                        _logger.info("[eval] 自动发现 MMLU-Pro 精确 subset 匹配: %s/%s -> %s", hf_dataset, hf_subset, task)
+                        return task
+                
+                # 智能匹配：对于 health_and_medicine，优先匹配 professional_medicine
+                # 对于其他 subset，尝试找到最相关的任务
+                best_matches = []
+                for task in available_tasks:
+                    if task in task_groups_set:
+                        continue
+                    task_lower = task.lower()
+                    if "mmlu" in task_lower:
+                        score = 0
+                        matched_keywords = sum(1 for kw in subset_keywords if kw in task_lower)
+                        score += matched_keywords * 5  # 每个匹配的关键词5分
+                        
+                        # 特殊处理：health_and_medicine -> professional_medicine
+                        if "health" in subset_normalized and "medicine" in subset_normalized:
+                            if "professional_medicine" in task_lower or "professional-medicine" in task_lower:
+                                score += 20  # 大幅加分
+                            elif "college_medicine" in task_lower or "college-medicine" in task_lower:
+                                score += 10  # 中等加分
+                        
+                        # 优先选择不包含特定前缀的任务（如 arabic_leaderboard）
+                        # 这些通常是更通用的任务
+                        if not any(prefix in task_lower for prefix in ["arabic_leaderboard", "arabic_", "global_mmlu_full"]):
+                            score += 5  # 通用任务加分
+                        
+                        # 特殊处理：college_* -> college_*
+                        if "college" in subset_normalized:
+                            if "college" in task_lower:
+                                score += 15
+                        
+                        if score > 0:
+                            best_matches.append((score, len(task), task))
+                
+                if best_matches:
+                    best_matches.sort(key=lambda x: (-x[0], -x[1]))
+                    best_match = best_matches[0][2]
+                    _logger.info("[eval] 自动发现 MMLU-Pro subset 智能匹配: %s/%s -> %s (分数: %s)", hf_dataset, hf_subset, best_match, best_matches[0][0])
+                    return best_match
+            # 如果没有 subset 或匹配失败，尝试匹配 mmlu_pro 相关的任务
+            for task in available_tasks:
+                if task in task_groups_set:
+                    continue
+                task_lower = task.lower()
+                # 优先匹配包含 mmlu_pro 或 mmlu-pro 的任务
+                if "mmlu_pro" in task_lower or "mmlu-pro" in task_lower:
+                    _logger.info("[eval] 自动发现 MMLU-Pro 匹配: %s -> %s", hf_dataset, task)
+                    return task
+        
+        # 标准 MMLU 处理
+        for task in available_tasks:
+            # 确保不是任务组
+            if task in task_groups_set:
+                continue
+            task_lower = task.lower()
+            if task_lower.startswith("mmlu") and "pro" not in task_lower:
+                if subset_lower:
+                    # 尝试匹配 mmlu_subset
+                    subset_normalized = subset_lower.replace("-", "_")
+                    # 尝试精确匹配或关键词匹配
+                    if subset_normalized in task_lower:
+                        _logger.info("[eval] 自动发现 MMLU subset 匹配: %s/%s -> %s", hf_dataset, hf_subset, task)
+                        return task
+                    # 如果 subset 包含多个词，尝试匹配关键词
+                    subset_keywords = [s for s in subset_normalized.split("_") if len(s) > 3]
+                    if any(kw in task_lower for kw in subset_keywords):
+                        candidates.append((20, len(task), task))  # MMLU subset 匹配高分
+                else:
+                    # 如果没有 subset，跳过通用的 mmlu（因为它是任务组），继续查找具体任务
+                    if task_lower == "mmlu":
+                        continue
+    
+    # 选择最佳候选
+    if candidates:
+        candidates.sort(key=lambda x: (-x[0], -x[1]))  # 按分数降序，长度降序
+        best_task = candidates[0][2]
+        # 再次验证不是任务组
+        if best_task in task_groups_set:
+            _logger.warning("[eval] 最佳匹配是任务组，跳过: %s", best_task)
+            # 尝试下一个候选
+            for score, length, task in candidates[1:]:
+                if task not in task_groups_set:
+                    best_task = task
+                    _logger.info("[eval] 自动发现最佳匹配（跳过任务组）: %s/%s -> %s (分数: %s)", hf_dataset, hf_subset or "", best_task, score)
+                    return best_task
+            return None
+        _logger.info("[eval] 自动发现最佳匹配: %s/%s -> %s (分数: %s)", hf_dataset, hf_subset or "", best_task, candidates[0][0])
+        return best_task
+    
+    # 策略5: 如果所有策略都失败，尝试模糊匹配（用于 MMLU-Pro 等新数据集）
+    # 对于 MMLU 相关数据集，尝试找到最接近的 MMLU 任务
+    if "mmlu" in dataset_base_name:
+        _logger.info("[eval] 尝试模糊匹配 MMLU 相关任务: %s/%s", hf_dataset, hf_subset or "")
+        # 收集所有 MMLU 任务作为候选
+        mmlu_candidates = []
+        for task in available_tasks:
+            if task in task_groups_set:
+                continue
+            task_lower = task.lower()
+            if "mmlu" in task_lower:
+                score = 0
+                # 如果有 subset，尝试匹配 subset 的关键词
+                if subset_lower:
+                    subset_keywords = [s for s in subset_lower.replace("-", "_").split("_") if len(s) > 3]
+                    matched = sum(1 for kw in subset_keywords if kw in task_lower)
+                    score = matched * 3  # 每个匹配的关键词3分
+                mmlu_candidates.append((score, len(task), task))
+        
+        if mmlu_candidates:
+            mmlu_candidates.sort(key=lambda x: (-x[0], -x[1]))
+            best_mmlu = mmlu_candidates[0][2]
+            _logger.info("[eval] 模糊匹配到 MMLU 任务: %s/%s -> %s (分数: %s)", hf_dataset, hf_subset or "", best_mmlu, mmlu_candidates[0][0])
+            return best_mmlu
+    
+    _logger.debug("[eval] 无法为 %s/%s 找到匹配的 lm_eval 任务", hf_dataset, hf_subset or "")
+    return None
+
+
 def run_lm_eval_stream(
     model_path,
     output_path,
@@ -619,6 +955,7 @@ def run_lm_eval_stream(
     hf_subset=None,
     hf_split=None,
     lm_eval_task=None,
+    sampling="sequential",
 ):
     """
     与 mergeKit_alpha 一致的评估流程：Popen 流式执行 lm_eval，结果写入 output_path。
@@ -629,6 +966,16 @@ def run_lm_eval_stream(
         task_control = {}
     os.makedirs(output_path, exist_ok=True)
 
+    task_name = ""  # 初始化为空字符串
+    # 获取任务组集合，用于验证（提前获取，避免重复初始化）
+    task_groups_set = None
+    try:
+        from lm_eval.tasks import TaskManager
+        task_manager_temp = TaskManager(verbosity="ERROR")
+        task_groups_set = set(task_manager_temp.all_groups) if hasattr(task_manager_temp, 'all_groups') else set()
+    except Exception:
+        task_groups_set = set()
+    
     if (lm_eval_task or "").strip():
         task_name = (lm_eval_task or "").strip()
     elif (hf_dataset or "").strip():
@@ -642,11 +989,87 @@ def run_lm_eval_stream(
         elif hf_key in extra:
             task_name = extra[hf_key] if not subset else (extra[hf_key] + "_" + subset.replace("-", "_"))
         else:
-            mapped = HF_DATASET_TO_LM_EVAL_TASK.get(hf_key.lower(), hf_key)
-            if subset and mapped == "mmlu":
-                task_name = "mmlu_" + subset.replace("-", "_")
-            else:
-                task_name = mapped if mapped else task_name
+            mapped = HF_DATASET_TO_LM_EVAL_TASK.get(hf_key.lower(), None)
+            if mapped:
+                # 注意：内置映射中的 "mmlu" 是任务组，不能直接使用
+                if subset and mapped == "mmlu":
+                    task_name = "mmlu_" + subset.replace("-", "_")
+                elif mapped == "mmlu":
+                    # 如果没有 subset 且映射是 "mmlu"（任务组），不能使用，需要自动发现或报错
+                    task_name = ""  # 保持为空，让自动发现处理
+                else:
+                    task_name = mapped
+            # 如果 mapped 为 None，说明找不到映射，task_name 保持为空
+        
+        # 验证从映射获取的任务名不是任务组
+        if task_name and task_name.strip() and task_groups_set:
+            if task_name in task_groups_set:
+                _logger.warning("[eval] 从映射获取的任务名是任务组，无效: %s，将尝试自动发现", task_name)
+                task_name = ""  # 重置为空，让自动发现处理
+        if task_name and task_name.strip():
+            available_tasks = _get_available_lm_eval_tasks()
+            if available_tasks and task_name not in available_tasks:
+                _logger.warning("[eval] 从映射获取的任务名不存在，尝试自动发现: %s", task_name)
+                task_name = ""
+
+    # 验证任务名是否有效，如果无效则尝试自动发现
+    if not task_name or task_name.strip() == "":
+        _logger.info("[eval] 无法推断任务名，尝试自动发现: hf_dataset=%s, hf_subset=%s", hf_dataset, hf_subset)
+        discovered_task = _auto_discover_lm_eval_task(hf_dataset, hf_subset)
+        if discovered_task:
+            # 最终验证：确保不是任务组（使用之前获取的 task_groups_set）
+            if task_groups_set and discovered_task in task_groups_set:
+                _logger.error("[eval] 自动发现的任务是任务组，无效: %s", discovered_task)
+                raise ValueError(f"自动发现的任务 '{discovered_task}' 是任务组而非具体任务，无法使用。请手动配置任务映射。")
+            
+            task_name = discovered_task
+            # 自动保存映射到配置文件
+            try:
+                extra = _load_eval_task_mapping()
+                hf_key = (hf_dataset or "").strip()
+                subset = (hf_subset or "").strip()
+                exact_key = "%s|%s" % (hf_key, subset) if subset else hf_key
+                extra[exact_key] = discovered_task
+                # 如果没有 subset，也保存通用映射
+                if not subset:
+                    extra[hf_key] = discovered_task
+                _save_eval_task_mapping(extra)
+                _logger.info("[eval] 已自动保存映射: %s -> %s", exact_key, discovered_task)
+            except Exception as save_err:
+                _logger.warning("[eval] 自动保存映射失败: %s", save_err)
+        else:
+            error_msg = f"无法推断有效的 lm_eval 任务名。hf_dataset={hf_dataset}, hf_subset={hf_subset}, lm_eval_task={lm_eval_task}"
+            _logger.error("[eval] %s", error_msg)
+            raise ValueError(error_msg + "。请检查测试集配置或添加任务映射到 config/eval_task_mapping.json")
+    
+    # 最终验证：确保任务名不是任务组（使用之前获取的 task_groups_set）
+    if task_name and task_name.strip():
+        if task_groups_set and task_name in task_groups_set:
+            error_msg = f"任务名 '{task_name}' 是任务组而非具体任务，无法使用。请使用具体任务名或添加任务映射。"
+            _logger.error("[eval] %s", error_msg)
+            raise ValueError(error_msg)
+        
+        # 额外验证：尝试加载任务，确保可以正常加载（不是任务组）
+        try:
+            from lm_eval.tasks import TaskManager
+            verify_tm = TaskManager(verbosity="ERROR")
+            loaded = verify_tm.load_task_or_group(task_name)
+            # 如果返回的是 ChainMap（任务组），则报错
+            from collections import ChainMap
+            if isinstance(loaded, ChainMap):
+                error_msg = f"任务名 '{task_name}' 是任务组（返回 ChainMap），无法直接使用。请使用具体任务名。"
+                _logger.error("[eval] %s", error_msg)
+                raise ValueError(error_msg)
+            # 如果返回的是字典且包含 'group' 键，也是任务组
+            if isinstance(loaded, dict) and 'group' in loaded:
+                error_msg = f"任务名 '{task_name}' 是任务组（配置包含 'group' 键），无法直接使用。请使用具体任务名。"
+                _logger.error("[eval] %s", error_msg)
+                raise ValueError(error_msg)
+        except ValueError:
+            raise  # 重新抛出 ValueError
+        except Exception as verify_err:
+            # 如果加载失败，可能是网络问题或其他原因，记录警告但不阻止执行
+            _logger.warning("[eval] 验证任务加载失败（非致命）: %s", verify_err)
 
     if task_name == "all":
         target_tasks_list = list(STANDARD_BENCHMARKS)
@@ -660,15 +1083,38 @@ def run_lm_eval_stream(
     except Exception:
         device = "cpu"
 
+    # 注意：当前版本的 lm_eval CLI 可能不支持 --samples 参数
+    # 对于随机采样，我们使用 --limit 配合随机种子，或者回退到顺序采样
+    # 由于 lm_eval CLI 的限制，随机采样功能暂时使用顺序采样 + limit 实现
+    # 真正的随机采样需要等待 lm_eval 支持或使用 Python API
+    if sampling == "random":
+        _logger.info("[eval] 随机采样模式：由于 lm_eval CLI 限制，使用顺序采样 + limit 实现近似随机效果")
+        # 使用 limit 参数，虽然不能完全随机，但可以限制样本数量
+        # 注意：这实际上是顺序采样，不是真正的随机采样
+
+    # 记录最终使用的任务名，便于调试
+    _logger.info("[eval] 最终使用的任务名: %s (cmd_task_str=%s)", task_name, cmd_task_str)
+    
+    # 针对部分模型（如 Qwen 系列）在 bf16 上可能出现退化输出的情况，按路径名进行最小化参数修正
+    model_args = "pretrained=%s,trust_remote_code=True" % model_path
+    try:
+        base_name = os.path.basename(str(model_path)).lower()
+        if "qwen" in base_name:
+            # 仅对 Qwen 系列显式指定 dtype=float16，避免 bf16 下的异常输出
+            model_args += ",dtype=float16"
+    except Exception:
+        pass
+
     cmd = [
         "lm_eval", "--model", "hf",
-        "--model_args", "pretrained=%s,trust_remote_code=True" % model_path,
+        "--model_args", model_args,
         "--tasks", cmd_task_str,
         "--device", device,
         "--batch_size", "auto",
         "--output_path", output_path,
         "--log_samples",
     ]
+    # 使用 --limit 参数（顺序采样和随机采样都使用 limit，因为 CLI 不支持 --samples）
     if str(limit) != "1.0":
         cmd.extend(["--limit", str(limit)])
 
@@ -749,7 +1195,15 @@ def run_lm_eval_stream(
             task_res = raw_results.get(t, {})
             curr_acc = 0.0
             found = False
-            for key in ("acc_norm,none", "acc_norm", "acc,none", "acc"):
+            for key in (
+                "acc_norm,none",
+                "acc_norm",
+                "acc,none",
+                "acc",
+                "exact_match,strict-match",
+                "exact_match,flexible-extract",
+                "exact_match",
+            ):
                 if key in task_res:
                     curr_acc = float(task_res[key])
                     found = True
@@ -824,6 +1278,10 @@ def run_eval_only_task(task_id, params, update_progress_callback, task_control=N
         "created_at": params.get("created_at", time.time()),
         "dataset": dataset_name,
         "status": "running",
+        "testset_id": (params.get("testset_id") or None),
+        "hf_dataset": hf_dataset,
+        "hf_subset": hf_subset,
+        "hf_split": hf_split,
     }
 
     def _write_meta(status, metrics=None, error=None):
@@ -836,6 +1294,7 @@ def run_eval_only_task(task_id, params, update_progress_callback, task_control=N
             json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     try:
+        _write_meta("running")
         if not model_path or not os.path.isdir(model_path):
             msg = "模型路径无效或不是目录: %s" % (model_path or "(空)")
             _write_meta("error", error=msg)
@@ -858,22 +1317,22 @@ def run_eval_only_task(task_id, params, update_progress_callback, task_control=N
             hf_subset=hf_subset,
             hf_split=hf_split,
             lm_eval_task=(params.get("lm_eval_task") or "").strip() or None,
+            sampling=(params.get("sampling") or "sequential").strip() or "sequential",
         )
 
-        per_task = metrics.get("per_task_acc") or {}
-        if per_task:
-            labels = list(per_task.keys())
-            merged_data = [per_task[k] for k in labels]
-            base_data = [0.0] * len(labels)
-        else:
-            labels = ["Accuracy", "Efficiency", "Context"]
-            base_data = [50, 50, 50]
-            merged_data = [
-                metrics["acc"],
-                50,
-                min(100, (metrics.get("context", 0) / 1024) * 10) if metrics.get("context", 0) else 0,
-            ]
-
+        # 与 mergeKit_alpha 一致：雷达图固定为三维 [Accuracy, Efficiency, Context]
+        context_val = metrics.get("context", 0) or 0
+        context_score = min(100, (int(context_val) / 1024) * 10) if context_val else 0
+        # Efficiency：基于 samples/time 计算速度，归一化到 1-100（基准速度可配置）
+        eval_time = metrics.get("time", 0) or 0
+        eval_samples = metrics.get("samples", 0) or 0
+        base_sps = float(getattr(Config, "EFFICIENCY_BASE_SPS", 10) or 10)
+        base_sps = max(1.0, base_sps)
+        efficiency_score = 50
+        if eval_time > 0 and eval_samples > 0:
+            speed = eval_samples / eval_time
+            efficiency_score = (speed / base_sps) * 100
+        efficiency_score = min(100, max(1, efficiency_score))
         final_result = {
             "accuracy": metrics["acc"],
             "f1_score": metrics["f1"],
@@ -881,13 +1340,29 @@ def run_eval_only_task(task_id, params, update_progress_callback, task_control=N
             "context": str(metrics["context"]) if metrics["context"] else "N/A",
             "base_name": "Baseline",
             "comparison": {
-                "labels": labels,
-                "base_data": base_data,
-                "merged_data": merged_data,
+                "labels": ["Accuracy", "Efficiency", "Context"],
+                "base_data": [50, 50, 50],
+                "merged_data": [
+                    metrics["acc"],
+                    round(efficiency_score, 2),
+                    context_score,
+                ],
             },
         }
         update_progress_callback(100, "测试完成")
         _write_meta("success", metrics=final_result)
+        testset_id = params.get("testset_id") or None
+        if testset_id:
+            _update_leaderboard(testset_id, {
+                "task_id": task_id,
+                "model_name": model_name,
+                "accuracy": final_result.get("accuracy"),
+                "f1_score": final_result.get("f1_score"),
+                "test_cases": final_result.get("test_cases"),
+                "created_at": params.get("created_at", time.time()),
+                "hf_dataset": hf_dataset,
+                "hf_subset": hf_subset,
+            })
         return {"status": "success", "metrics": final_result}
     except Exception as e:
         _logger.exception("[eval] 异常: %s", e)

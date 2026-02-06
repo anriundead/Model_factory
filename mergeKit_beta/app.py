@@ -154,18 +154,44 @@ def get_all_history():
         meta_path = os.path.join(task_path, "metadata.json")
         if not os.path.exists(meta_path):
             continue
-        if not os.path.exists(meta_path):
-            continue
-            try:
+        try:
             with open(meta_path, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
+                meta = json.load(f)
             if meta.get("type") == "eval_only":
-                        continue
+                continue
             if "id" not in meta:
                 meta["id"] = task_id
-                    history_list.append(meta)
-            except Exception as e:
+            history_list.append(meta)
+        except Exception as e:
             print("Error reading metadata for %s: %s" % (task_id, e))
+    return sorted(history_list, key=lambda x: x.get("created_at", 0), reverse=True)
+
+
+def get_all_eval_history():
+    history_list = []
+    if not os.path.exists(MERGE_DIR):
+        return []
+    for task_id in os.listdir(MERGE_DIR):
+        task_path = os.path.join(MERGE_DIR, task_id)
+        if not os.path.isdir(task_path):
+            continue
+        meta_path = os.path.join(task_path, "metadata.json")
+        if not os.path.exists(meta_path):
+            continue
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if meta.get("type") != "eval_only":
+                continue
+            if "id" not in meta:
+                meta["id"] = task_id
+            if "task_id" not in meta:
+                meta["task_id"] = task_id
+            if not meta.get("model_name"):
+                meta["model_name"] = meta.get("custom_name")
+            history_list.append(meta)
+        except Exception as e:
+            print("Error reading eval metadata for %s: %s" % (task_id, e))
     return sorted(history_list, key=lambda x: x.get("created_at", 0), reverse=True)
 
 
@@ -197,7 +223,7 @@ def worker():
     print("--- 任务处理 Worker 已启动 ---")
     while True:
         try:
-        priority_score, created_at, task_id, data = task_queue.get()
+            priority_score, created_at, task_id, data = task_queue.get()
         except Exception:
             continue
         if tasks.get(task_id, {}).get("status") == "stopped":
@@ -254,57 +280,87 @@ def worker():
                 )
 
             if task_type == "merge_evolutionary":
-                # VLM 进化搜索：启动 run_vlm_search_bridge 子进程（若存在）
-                script_path = os.path.join(Config.PROJECT_ROOT, "scripts", "run_vlm_search_bridge.py")
-                if not os.path.isfile(script_path):
-                    tasks[task_id]["status"] = "error"
-                    tasks[task_id]["message"] = "scripts/run_vlm_search_bridge.py 不存在"
-                    result = {"status": "error", "error": "run_vlm_search_bridge.py 未找到"}
-            else:
-                    import subprocess
-                    merge_dir = os.path.join(MERGE_DIR, task_id)
-                    os.makedirs(merge_dir, exist_ok=True)
-                    progress_path = os.path.join(merge_dir, "progress.json")
-                    meta_path = os.path.join(merge_dir, "metadata.json")
-                    with open(meta_path, "w", encoding="utf-8") as f:
-                        json.dump({"id": task_id, "type": "merge_evolutionary", "status": "running", **data}, f, ensure_ascii=False, indent=2)
-                    proc = subprocess.Popen(
-                        [Config.MERGENETIC_PYTHON, script_path, "--task-id", task_id],
-                        cwd=Config.PROJECT_ROOT,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        **_popen_group_kwargs(),
-                    )
-                    task_control["process"] = proc
-                    try:
-                        while True:
-                            if task_control.get("aborted"):
-                                ProcessManager.kill_process_tree(proc)
-                                raise Exception("任务已停止")
-                            line = proc.stdout.readline() if proc.stdout else ""
-                            if not line and proc.poll() is not None:
+                import merge_manager as _mm
+                _data = dict(data)
+                _temp_suffixes = []
+                _result = None
+                if _data.get("items") and len(_data["items"]) == 2:
+                    resolved_paths = []
+                    for idx, it in enumerate(_data["items"]):
+                        if it.get("type") == "path" and it.get("path"):
+                            resolved_paths.append(it["path"])
+                        elif it.get("type") == "recipe" and it.get("recipe_id"):
+                            suffix = "a" if idx == 0 else "b"
+                            _temp_suffixes.append(suffix)
+                            update_progress(5 + idx * 10, "正在根据配方物化模型…")
+                            path, err = _mm.materialize_recipe_to_temp(
+                                it["recipe_id"], task_id, suffix, update_progress, task_control
+                            )
+                            if err:
+                                _result = {"status": "error", "error": "物化配方失败: %s" % err}
                                 break
-                            if line:
-                                update_progress(50, line.strip()[:80])
-                        if proc.returncode != 0:
-                            raise RuntimeError("子进程退出码: %s" % proc.returncode)
-                        result = {"status": "success"}
-                        _app_logger.info("[worker] 完全融合完成 task_id=%s", task_id)
-                    except Exception as e:
-                        _app_logger.exception("[worker] 完全融合失败 task_id=%s error=%s", task_id, e)
-                        with open(progress_path, "w", encoding="utf-8") as f:
-                            json.dump({"status": "error", "message": str(e)}, f, ensure_ascii=False)
+                            resolved_paths.append(path)
+                        else:
+                            _result = {"status": "error", "error": "items[%d] 格式无效" % idx}
+                            break
+                    else:
+                        _data["model_paths"] = resolved_paths
+                if _result is None:
+                    script_path = os.path.join(Config.PROJECT_ROOT, "scripts", "run_vlm_search_bridge.py")
+                    if not os.path.isfile(script_path):
+                        tasks[task_id]["status"] = "error"
+                        tasks[task_id]["message"] = "scripts/run_vlm_search_bridge.py 不存在"
+                        _result = {"status": "error", "error": "run_vlm_search_bridge.py 未找到"}
+                    else:
+                        import subprocess
+                        merge_dir = os.path.join(MERGE_DIR, task_id)
+                        os.makedirs(merge_dir, exist_ok=True)
+                        progress_path = os.path.join(merge_dir, "progress.json")
+                        meta_path = os.path.join(merge_dir, "metadata.json")
+                        with open(meta_path, "w", encoding="utf-8") as f:
+                            json.dump({"id": task_id, "type": "merge_evolutionary", "status": "running", **_data}, f, ensure_ascii=False, indent=2)
+                        proc = subprocess.Popen(
+                            [Config.MERGENETIC_PYTHON, script_path, "--task-id", task_id],
+                            cwd=Config.PROJECT_ROOT,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            **_popen_group_kwargs(),
+                        )
+                        task_control["process"] = proc
                         try:
-                            with open(meta_path, "r", encoding="utf-8") as f:
-                                m = json.load(f)
-                            m["status"] = "error"
-                            m["error"] = str(e)
-                            with open(meta_path, "w", encoding="utf-8") as f:
-                                json.dump(m, f, ensure_ascii=False, indent=2)
-                        except Exception:
-                            pass
-                        result = {"status": "error", "error": str(e)}
+                            while True:
+                                if task_control.get("aborted"):
+                                    ProcessManager.kill_process_tree(proc)
+                                    raise Exception("任务已停止")
+                                line = proc.stdout.readline() if proc.stdout else ""
+                                if not line and proc.poll() is not None:
+                                    break
+                                if line:
+                                    update_progress(50, line.strip()[:80])
+                            if proc.returncode != 0:
+                                raise RuntimeError("子进程退出码: %s" % proc.returncode)
+                            _result = {"status": "success"}
+                            _app_logger.info("[worker] 完全融合完成 task_id=%s", task_id)
+                            if _temp_suffixes:
+                                _mm.cleanup_recipe_temp_dirs(task_id, _temp_suffixes)
+                        except Exception as e:
+                            _app_logger.exception("[worker] 完全融合失败 task_id=%s error=%s", task_id, e)
+                            with open(progress_path, "w", encoding="utf-8") as f:
+                                json.dump({"status": "error", "message": str(e)}, f, ensure_ascii=False)
+                            try:
+                                with open(meta_path, "r", encoding="utf-8") as f:
+                                    m = json.load(f)
+                                m["status"] = "error"
+                                m["error"] = str(e)
+                                with open(meta_path, "w", encoding="utf-8") as f:
+                                    json.dump(m, f, ensure_ascii=False, indent=2)
+                            except Exception:
+                                pass
+                            _result = {"status": "error", "error": str(e)}
+                            if _temp_suffixes:
+                                _mm.cleanup_recipe_temp_dirs(task_id, _temp_suffixes)
+                result = _result
             elif task_type == "eval_only":
                 # 每次评估前重新加载 merge_manager，确保使用最新 run_eval_only_task 实现（避免进程未重启时仍跑旧占位逻辑）
                 import importlib
@@ -318,10 +374,38 @@ def worker():
                 else:
                     _app_logger.warning("[worker] 配方融合失败 task_id=%s error=%s", task_id, result.get("error", ""))
             else:
-                result = run_merge_task(task_id, data, update_progress, task_control)
-                if result.get("status") == "success":
-                    _app_logger.info("[worker] 标准融合完成 task_id=%s output=%s", task_id, result.get("output_dir", ""))
+                # 标准融合：若存在 items（含 recipe），先物化再融合并清理临时目录
+                _data = dict(data)
+                _merge_temp_suffixes = []
+                if _data.get("items") and len(_data["items"]) == 2:
+                    import merge_manager as _mm_merge
+                    paths = []
+                    for idx, it in enumerate(_data["items"]):
+                        if it.get("type") == "path" and it.get("path"):
+                            paths.append(it["path"])
+                        elif it.get("type") == "recipe" and it.get("recipe_id"):
+                            suf = "m1" if idx == 0 else "m2"
+                            _merge_temp_suffixes.append(suf)
+                            path, err = _mm_merge.materialize_recipe_to_temp(
+                                it["recipe_id"], task_id, suf, update_progress, task_control
+                            )
+                            if err:
+                                result = {"status": "error", "error": "物化配方失败: %s" % err}
+                                break
+                            paths.append(path)
+                        else:
+                            result = {"status": "error", "error": "items[%d] 格式无效" % idx}
+                            break
+                    else:
+                        _data["model_paths"] = paths
+                        result = run_merge_task(task_id, _data, update_progress, task_control)
+                    if _merge_temp_suffixes:
+                        _mm_merge.cleanup_recipe_temp_dirs(task_id, _merge_temp_suffixes)
                 else:
+                    result = run_merge_task(task_id, data, update_progress, task_control)
+                if result and result.get("status") == "success":
+                    _app_logger.info("[worker] 标准融合完成 task_id=%s output=%s", task_id, result.get("output_dir", ""))
+                elif result and result.get("status") != "success":
                     _app_logger.warning("[worker] 标准融合失败 task_id=%s error=%s", task_id, result.get("error", ""))
 
             if task_type == "eval_only" and result:
@@ -407,33 +491,57 @@ def _list_models_from_dir(root_path):
         full_path = os.path.join(root_path, item)
         if not os.path.isdir(full_path) or not os.path.isfile(os.path.join(full_path, "config.json")):
             continue
-                size_bytes = 0
+        size_bytes = 0
         try:
-                for f in os.listdir(full_path):
+            for f in os.listdir(full_path):
                 if f.endswith(".safetensors") or f.endswith(".bin"):
-                        size_bytes += os.path.getsize(os.path.join(full_path, f))
+                    size_bytes += os.path.getsize(os.path.join(full_path, f))
         except OSError:
             pass
         out.append({
-                    "name": item,
-                    "size": size_bytes,
-                    "details": {"family": "HuggingFace Local"},
+            "name": item,
+            "size": size_bytes,
+            "details": {"family": "HuggingFace Local"},
             "path": os.path.abspath(full_path),
         })
     return out
 
 
+def _output_has_safetensors(output_path):
+    """判断 output 目录是否包含完整权重（至少一个 .safetensors）。"""
+    if not output_path or not os.path.isdir(output_path):
+        return False
+    try:
+        for f in os.listdir(output_path):
+            if f.endswith(".safetensors"):
+                return True
+    except OSError:
+        pass
+    return False
+
+
 @app.route("/api/models")
 def get_models():
-    """本地基座模型列表：优先从 LOCAL_MODELS_PATH 读取，并标注 is_vlm 便于完全融合选择。"""
+    """本地基座模型列表：同时扫描 LOCAL_MODELS_PATH 与 MODEL_POOL_PATH，去重并标注 is_vlm。"""
     try:
+        seen_paths = set()
+        models = []
+        for base_path in (
+            getattr(Config, "LOCAL_MODELS_PATH", None),
+            MODEL_POOL_PATH,
+        ):
+            if not base_path or not os.path.exists(base_path):
+                if base_path:
+                    os.makedirs(base_path, exist_ok=True)
+                continue
+            for m in _list_models_from_dir(base_path):
+                path = (m.get("path") or "").strip()
+                if path and path not in seen_paths:
+                    seen_paths.add(path)
+                    m["is_vlm"] = _model_is_vlm(path)
+                    m["source"] = "base"
+                    models.append(m)
         base_path = getattr(Config, "LOCAL_MODELS_PATH", None) or MODEL_POOL_PATH
-        if not os.path.exists(base_path):
-            os.makedirs(base_path, exist_ok=True)
-            return jsonify({"status": "success", "models": [], "base_path": base_path})
-        models = _list_models_from_dir(base_path)
-        for m in models:
-            m["is_vlm"] = _model_is_vlm(m.get("path") or "")
         return jsonify({"status": "success", "models": models, "base_path": base_path})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -446,20 +554,31 @@ def get_models_pool():
 
 @app.route("/api/merged_models")
 def get_merged_models():
+    """已融合模型列表：仅包含 output 目录下存在 .safetensors 的条目，并标注 is_vlm。"""
     models = []
     if not os.path.exists(MERGE_DIR):
-        return jsonify({"status": "success", "models": []})
+        return jsonify({"status": "success", "models": models})
     for task_id in os.listdir(MERGE_DIR):
         output_path = os.path.join(MERGE_DIR, task_id, "output")
         meta_path = os.path.join(MERGE_DIR, task_id, "metadata.json")
-        if os.path.isfile(meta_path) and os.path.isdir(output_path):
-            try:
-                with open(meta_path, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                    if meta.get("status") == "success":
-                        models.append({"name": meta.get("custom_name", task_id), "path": os.path.abspath(output_path), "type": "merged"})
-            except Exception:
+        if not os.path.isfile(meta_path) or not os.path.isdir(output_path):
+            continue
+        if not _output_has_safetensors(output_path):
+            continue
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if meta.get("status") != "success":
                 continue
+            path = os.path.abspath(output_path)
+            models.append({
+                "name": meta.get("custom_name", task_id),
+                "path": path,
+                "type": "merged",
+                "is_vlm": _model_is_vlm(path),
+            })
+        except Exception:
+            continue
     return jsonify({"status": "success", "models": models})
 
 
@@ -473,10 +592,27 @@ def start_merge():
         return jsonify({"status": "error", "message": "模型名称不能为空"}), 400
     if is_name_duplicate(custom_name):
         return jsonify({"status": "error", "message": "名称 '%s' 已存在。" % custom_name}), 409
-    # 支持 model_paths（绝对路径）或 models（名称，相对 MODEL_POOL_PATH）
+    # 支持 model_paths（两个路径）、models（名称）、或 items（path/recipe 混合）
     model_paths = data.get("model_paths") or []
     models = data.get("models") or []
-    if model_paths:
+    items = data.get("items")
+    if items and len(items) == 2:
+        resolved = []
+        for i, it in enumerate(items):
+            if not isinstance(it, dict):
+                return jsonify({"status": "error", "message": "items[%d] 格式无效" % i}), 400
+            if it.get("type") == "recipe" and (it.get("recipe_id") or "").strip():
+                resolved.append({"type": "recipe", "recipe_id": (it.get("recipe_id") or "").strip()})
+            elif it.get("type") == "path" or it.get("path"):
+                path = _resolve_model_path(it.get("path") or "")
+                if not path:
+                    return jsonify({"status": "error", "message": "items[%d] 路径无效" % i}), 400
+                resolved.append({"type": "path", "path": path})
+            else:
+                return jsonify({"status": "error", "message": "items[%d] 需为 path 或 recipe" % i}), 400
+        data["items"] = resolved
+        data["model_paths"] = [x["path"] for x in resolved if x.get("type") == "path"]
+    elif model_paths:
         resolved = []
         for p in model_paths:
             path = p if isinstance(p, str) else str(p)
@@ -487,7 +623,7 @@ def start_merge():
     elif models:
         data["model_paths"] = None  # 由 merge_manager 用 MODEL_POOL_PATH + name 解析
     else:
-        return jsonify({"status": "error", "message": "请提供 model_paths 或 models"}), 400
+        return jsonify({"status": "error", "message": "请提供 model_paths、models 或 items"}), 400
     task_id = str(uuid.uuid4())[:8]
     created_at = time.time()
     data["created_at"] = created_at
@@ -513,20 +649,38 @@ def start_merge():
 
 @app.route("/api/merge_evolutionary", methods=["POST"])
 def start_merge_evolutionary():
-    """完全融合：进化迭代，使用 mergenetic，需种群大小、迭代次数、最大样本量、MMLU 子集等。"""
+    """完全融合：进化迭代。支持 model_paths（两个路径）或 items（两个 path/recipe 项）。"""
     data = request.json or {}
+    items = data.get("items")
     model_paths = data.get("model_paths") or []
-    if len(model_paths) < 2:
-        return jsonify({"status": "error", "message": "至少需要 2 个模型"}), 400
     resolved = []
-    for p in model_paths:
-        path = _resolve_model_path(p)
-        if not path:
-            return jsonify({
-                "status": "error",
-                "message": "模型路径不存在: %s（已尝试 LOCAL_MODELS_PATH 与 MODEL_POOL_PATH 及目录名匹配）" % (p,),
-            }), 400
-        resolved.append(path)
+    if items and len(items) == 2:
+        for i, it in enumerate(items):
+            if not isinstance(it, dict):
+                return jsonify({"status": "error", "message": "items[%d] 格式无效" % i}), 400
+            if it.get("type") == "recipe":
+                rid = (it.get("recipe_id") or "").strip()
+                if not rid:
+                    return jsonify({"status": "error", "message": "items[%d] 缺少 recipe_id" % i}), 400
+                resolved.append({"type": "recipe", "recipe_id": rid})
+            elif it.get("type") == "path" or it.get("path"):
+                path = _resolve_model_path(it.get("path") or "")
+                if not path:
+                    return jsonify({"status": "error", "message": "items[%d] 路径无效: %s" % (i, it.get("path", ""))}), 400
+                resolved.append({"type": "path", "path": path})
+            else:
+                return jsonify({"status": "error", "message": "items[%d] 需为 type:path 或 type:recipe" % i}), 400
+    else:
+        if len(model_paths) < 2:
+            return jsonify({"status": "error", "message": "至少需要 2 个模型（或提供 items 数组）"}), 400
+        for p in model_paths:
+            path = _resolve_model_path(p)
+            if not path:
+                return jsonify({
+                    "status": "error",
+                    "message": "模型路径不存在: %s（已尝试 LOCAL_MODELS_PATH 与 MODEL_POOL_PATH 及目录名匹配）" % (p,),
+                }), 400
+            resolved.append({"type": "path", "path": path})
     dataset_type = "cmmmu" if "CMMMU" in (data.get("hf_dataset") or "") else "mmlu"
     hf_subset_raw = data.get("hf_subset") or data.get("hf_subset_group") or ("health_and_medicine" if dataset_type == "cmmmu" else "college_medicine")
     hf_subsets = data.get("hf_subsets")
@@ -536,11 +690,13 @@ def start_merge_evolutionary():
         hf_subsets = [hf_subset_raw]
     task_id = str(uuid.uuid4())[:8]
     created_at = time.time()
+    has_recipe = any(x.get("type") == "recipe" for x in resolved)
     task_data = {
         "type": "merge_evolutionary",
         "task_id": task_id,
         "custom_name": data.get("custom_name", "进化融合-%s" % task_id),
-        "model_paths": resolved,
+        "model_paths": [x.get("path") for x in resolved if x.get("type") == "path"] if not has_recipe else [],
+        "items": resolved if has_recipe else None,
         "vlm_path": data.get("vlm_path", ""),
         "eval_mode": data.get("eval_mode", "text"),
         "hf_dataset": data.get("hf_dataset", "cais/mmlu"),
@@ -603,8 +759,34 @@ def start_evaluation_task():
             hf_subset = (hf_subset or "").strip() or testset.get("hf_subset") or None
             hf_split = (hf_split or testset.get("hf_split") or "test").strip() or "test"
             lm_eval_task = (testset.get("lm_eval_task") or "").strip()
-            if not lm_eval_task and hf_dataset and hf_subset:
-                lm_eval_task = _infer_lm_eval_task(hf_dataset, hf_subset)
+            if not lm_eval_task:
+                # 尝试推断：优先使用 hf_subset，如果没有则尝试从 hf_dataset 推断
+                if hf_dataset and hf_subset:
+                    lm_eval_task = _infer_lm_eval_task(hf_dataset, hf_subset)
+                elif hf_dataset:
+                    # 对于没有 subset 的数据集，尝试从映射文件或内置映射中查找
+                    try:
+                        import merge_manager as mm
+                        extra = mm._load_eval_task_mapping()
+                        hf_key = hf_dataset.strip().lower()
+                        if hf_dataset in extra:
+                            lm_eval_task = extra[hf_dataset]
+                        elif hf_key in mm.HF_DATASET_TO_LM_EVAL_TASK:
+                            lm_eval_task = mm.HF_DATASET_TO_LM_EVAL_TASK[hf_key]
+                        # 如果仍然找不到，尝试自动发现
+                        if not lm_eval_task:
+                            discovered_task = mm._auto_discover_lm_eval_task(hf_dataset, hf_subset)
+                            if discovered_task:
+                                lm_eval_task = discovered_task
+                                # 保存到映射文件和测试集记录
+                                exact_key = "%s|%s" % (hf_dataset.strip(), hf_subset.strip()) if hf_subset else hf_dataset.strip()
+                                extra[exact_key] = discovered_task
+                                if not hf_subset:
+                                    extra[hf_dataset.strip()] = discovered_task
+                                mm._save_eval_task_mapping(extra)
+                                _app_logger.info("[eval] 已自动发现并保存映射: %s -> %s", exact_key, discovered_task)
+                    except Exception:
+                        pass  # 如果导入失败，保持 lm_eval_task 为空，让 merge_manager 处理
                 if lm_eval_task:
                     testsets = _load_testsets_dict()
                     for tid, t in list(testsets.items()):
@@ -612,6 +794,14 @@ def start_evaluation_task():
                             testsets[tid] = {**t, "lm_eval_task": lm_eval_task}
                             _save_testsets_dict(testsets)
                             break
+        else:
+            if not hf_dataset and "/" in testset_id:
+                hf_dataset = testset_id
+            if hf_dataset:
+                dataset = hf_dataset
+            testset_id = ""
+    elif hf_dataset:
+        dataset = hf_dataset
     task_data = {
         "id": task_id,
         "type": "eval_only", 
@@ -623,6 +813,7 @@ def start_evaluation_task():
         "progress": 0,
         "message": "正在加入测试队列...",
         "limit": data.get("limit", "0.5"),
+        "sampling": data.get("sampling", "sequential"),
         "testset_id": testset_id or None,
         "hf_dataset": hf_dataset,
         "hf_subset": hf_subset,
@@ -870,6 +1061,52 @@ def api_model_repo_path(model_id):
     return jsonify({"status": "error", "message": "Not found"}), 404
 
 
+def _model_repo_load_raw():
+    """从 model_repo 存储文件加载 models 字典（用于删除等写操作）。"""
+    data_path = os.path.join(Config.PROJECT_ROOT, "model_repo", "data", "models.json")
+    if not os.path.isfile(data_path):
+        return {}
+    with open(data_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("models", data) if isinstance(data.get("models"), dict) else {}
+
+
+def _model_repo_save_raw(models):
+    data_path = os.path.join(Config.PROJECT_ROOT, "model_repo", "data", "models.json")
+    os.makedirs(os.path.dirname(data_path), exist_ok=True)
+    with open(data_path, "w", encoding="utf-8") as f:
+        json.dump({"models": models}, f, ensure_ascii=False, indent=2)
+
+
+@app.route("/api/model_repo/<model_id>", methods=["DELETE"])
+def api_model_repo_delete(model_id):
+    """删除模型：从仓库移除并删除磁盘上的模型目录。二次确认由前端完成。"""
+    model_id = (model_id or "").strip()
+    if not model_id:
+        return jsonify({"status": "error", "message": "模型 ID 无效"}), 400
+    models = _model_repo_load_raw()
+    if not isinstance(models, dict):
+        return jsonify({"status": "error", "message": "仓库数据异常"}), 500
+    m = models.get(model_id)
+    if not m:
+        return jsonify({"status": "error", "message": "模型不存在"}), 404
+    path = m.get("path")
+    if path and os.path.isdir(path):
+        try:
+            shutil.rmtree(path)
+            _app_logger.info("[model_repo] 已删除磁盘目录: %s", path)
+        except Exception as e:
+            _app_logger.exception("[model_repo] 删除目录失败: %s", path)
+            return jsonify({"status": "error", "message": "删除磁盘文件失败: %s" % str(e)}), 500
+    try:
+        del models[model_id]
+        _model_repo_save_raw(models)
+    except Exception as e:
+        _app_logger.exception("[model_repo] 保存仓库失败")
+        return jsonify({"status": "error", "message": "更新仓库失败: %s" % str(e)}), 500
+    return jsonify({"status": "success"})
+
+
 @app.route("/api/resolve_model_path")
 def api_resolve_model_path():
     """根据模型名或路径解析为绝对路径，供前端校验或展示。"""
@@ -880,21 +1117,56 @@ def api_resolve_model_path():
     return jsonify({"status": "error", "message": "未找到对应模型目录"}), 404
 
 
-def _testset_list():
+def _testset_list(refresh=True):
     testsets = _load_testsets_dict()
-    return list(testsets.values()) if testsets else []
+    return _refresh_testsets_counts(testsets) if refresh else list(testsets.values())
+
+
+def _refresh_single_testset_count(entry):
+    if not entry or not (entry.get("hf_dataset") or "").strip():
+        return entry
+    if int(entry.get("sample_count") or 0) > 0:
+        return entry
+    cache_dir = getattr(Config, "HF_DATASETS_CACHE", None) or os.environ.get("HF_DATASETS_CACHE")
+    n, actual_split, actual_subset = _resolve_dataset_sample_count(
+        entry.get("hf_dataset"),
+        entry.get("hf_subset"),
+        entry.get("hf_split"),
+        cache_dir,
+    )
+    if n > 0:
+        entry["sample_count"] = n
+        if actual_split:
+            entry["hf_split"] = actual_split
+        if actual_subset and not (entry.get("hf_subset") or "").strip():
+            entry["hf_subset"] = actual_subset
+    return entry
+
+
+def _get_testset_by_id(testset_id, refresh=False):
+    testsets = _load_testsets_dict()
+    entry = testsets.get(testset_id)
+    if not entry:
+        return None
+    if refresh:
+        entry = _refresh_single_testset_count(entry)
+        testsets[testset_id] = entry
+        _save_testsets_dict(testsets)
+    return entry
 
 
 @app.route("/api/testset/list")
 def api_testset_list():
-    return jsonify({"status": "success", "testsets": _testset_list()})
+    refresh = request.args.get("refresh", "0") in ("1", "true", "yes")
+    return jsonify({"status": "success", "testsets": _testset_list(refresh=refresh)})
 
 
 @app.route("/api/testset/search")
 def api_testset_search():
     q = (request.args.get("q") or "").strip().lower()
     limit = int(request.args.get("limit", 20))
-    all_list = _testset_list()
+    refresh = request.args.get("refresh", "0") in ("1", "true", "yes")
+    all_list = _testset_list(refresh=refresh)
     if q:
         all_list = [t for t in all_list if q in (t.get("name") or "").lower() or q in (t.get("hf_dataset") or "").lower()]
     return jsonify({"status": "success", "results": all_list[:limit], "total": len(all_list)})
@@ -922,6 +1194,73 @@ def api_hf_datasets_search():
 
 def _testset_repo_path():
     return getattr(Config, "TESTSET_DATA_PATH", None) or os.path.join(Config.PROJECT_ROOT, "testset_repo", "data", "testsets.json")
+
+
+def _resolve_dataset_sample_count(hf_dataset, hf_subset, hf_split, cache_dir):
+    if not (hf_dataset or "").strip():
+        return 0, None, None
+    try:
+        from datasets import load_dataset_builder, get_dataset_config_names
+        subset_candidates = []
+        if (hf_subset or "").strip():
+            subset_candidates = [hf_subset]
+        else:
+            subset_candidates = [None]
+            try:
+                configs = get_dataset_config_names(hf_dataset, trust_remote_code=True) or []
+                subset_candidates.extend([c for c in configs if c])
+            except Exception:
+                pass
+        for subset_name in subset_candidates:
+            try:
+                builder = load_dataset_builder(hf_dataset, name=subset_name or None, trust_remote_code=True, cache_dir=cache_dir)
+                splits = getattr(builder.info, "splits", None) or {}
+                if splits:
+                    preferred = []
+                    if hf_split:
+                        preferred.append(hf_split.split("[")[0].strip())
+                    preferred.extend(["test", "validation", "dev", "val", "train"])
+                    for split_name in preferred:
+                        if split_name in splits:
+                            return int(getattr(splits[split_name], "num_examples", 0) or 0), split_name, subset_name
+                    first_key = list(splits.keys())[0]
+                    return int(getattr(splits[first_key], "num_examples", 0) or 0), first_key, subset_name
+            except Exception:
+                continue
+    except Exception as e:
+        _app_logger.debug("testset count metadata failed: %s", e)
+    return 0, None, None
+
+
+def _refresh_testsets_counts(testsets_dict):
+    if not testsets_dict:
+        return []
+    cache_dir = getattr(Config, "HF_DATASETS_CACHE", None) or os.environ.get("HF_DATASETS_CACHE")
+    changed = False
+    for tid, entry in list(testsets_dict.items()):
+        if not entry:
+            continue
+        if not (entry.get("hf_dataset") or "").strip():
+            continue
+        if int(entry.get("sample_count") or 0) > 0:
+            continue
+        n, actual_split, actual_subset = _resolve_dataset_sample_count(
+            entry.get("hf_dataset"),
+            entry.get("hf_subset"),
+            entry.get("hf_split"),
+            cache_dir,
+        )
+        if n > 0:
+            entry["sample_count"] = n
+            if actual_split:
+                entry["hf_split"] = actual_split
+            if actual_subset and not (entry.get("hf_subset") or "").strip():
+                entry["hf_subset"] = actual_subset
+            testsets_dict[tid] = entry
+            changed = True
+    if changed:
+        _save_testsets_dict(testsets_dict)
+    return list(testsets_dict.values())
 
 
 def _infer_lm_eval_task(hf_dataset, hf_subset):
@@ -964,32 +1303,155 @@ def api_testset_create():
         return jsonify({"status": "error", "message": "hf_dataset 必填"}), 400
     if not name:
         name = hf_dataset
-    hf_subset = (data.get("hf_subset") or "").strip() or None
-    hf_split = (data.get("hf_split") or "train").strip() or "train"
+    hf_subset_raw = (data.get("hf_subset") or "").strip()
+    hf_subset = hf_subset_raw if hf_subset_raw else None  # 空字符串转为 None
+    hf_split_raw = (data.get("hf_split") or "").strip()
+    hf_split = hf_split_raw if hf_split_raw else None
     cache_dir = getattr(Config, "HF_DATASETS_CACHE", None) or os.environ.get("HF_DATASETS_CACHE")
-    split_name = (hf_split or "train").split("[")[0].strip() or "train"
+    # 尝试多个 split（test/validation/train），优先 test/validation 用于评估
+    split_candidates = []
+    if hf_split:
+        split_candidates.append(hf_split.split("[")[0].strip())
+    split_candidates.extend(["test", "validation", "dev", "val", "train"])
+    split_candidates = list(dict.fromkeys(split_candidates))  # 去重保持顺序
     n = 0
+    actual_split = None
+    load_error = None
     try:
         from datasets import load_dataset
-        if hf_subset:
-            ds = load_dataset(hf_dataset, hf_subset, split=split_name, trust_remote_code=True, cache_dir=cache_dir)
-        else:
-            ds = load_dataset(hf_dataset, split=split_name, trust_remote_code=True, cache_dir=cache_dir)
-        n = len(ds) if ds else 0
+        for split_name in split_candidates:
+            try:
+                if hf_subset:
+                    ds = load_dataset(hf_dataset, hf_subset, split=split_name, trust_remote_code=True, cache_dir=cache_dir)
+                else:
+                    ds = load_dataset(hf_dataset, split=split_name, trust_remote_code=True, cache_dir=cache_dir)
+                # 处理 DatasetDict（返回所有 splits）和 Dataset（单个 split）两种情况
+                if ds:
+                    try:
+                        n = 0
+                        # 优先尝试按 split_name 访问（DatasetDict 情况）
+                        if hasattr(ds, "__getitem__") and hasattr(ds, "keys"):
+                            try:
+                                keys_list = list(ds.keys())
+                                if split_name in keys_list:
+                                    n = len(ds[split_name]) if hasattr(ds[split_name], "__len__") else 0
+                                elif len(keys_list) > 0:
+                                    # 如果请求的 split 不存在，取第一个可用的
+                                    first_key = keys_list[0]
+                                    n = len(ds[first_key]) if hasattr(ds[first_key], "__len__") else 0
+                                    if n > 0:
+                                        actual_split = first_key  # 使用实际存在的 split
+                            except (KeyError, AttributeError, TypeError) as dict_err:
+                                _app_logger.debug("testset create 访问 DatasetDict 失败: %s", dict_err)
+                        # 如果 DatasetDict 访问失败或 n 仍为 0，尝试直接取长度（Dataset 情况）
+                        if n == 0 and hasattr(ds, "__len__"):
+                            try:
+                                n = len(ds)
+                            except Exception as len_err:
+                                _app_logger.debug("testset create 获取 Dataset 长度失败: %s", len_err)
+                        # 如果成功获取到样本数，记录并跳出循环
+                        if n > 0:
+                            if not actual_split:
+                                actual_split = split_name
+                            break
+                    except Exception as parse_err:
+                        _app_logger.debug("testset create 解析数据集失败: %s", parse_err)
+                        continue
+            except Exception as split_err:
+                load_error = str(split_err)
+                _app_logger.debug("testset create 尝试 split=%s 失败: %s", split_name, split_err)
+                continue
+        if n == 0:
+            _app_logger.warning("testset create 所有 split 均失败: hf_dataset=%s hf_subset=%s splits=%s error=%s", hf_dataset, hf_subset, split_candidates, load_error)
+            # 尝试最后一次：不指定 split，让 load_dataset 返回所有 splits
+            if not hf_subset:
+                try:
+                    ds_all = load_dataset(hf_dataset, trust_remote_code=True, cache_dir=cache_dir)
+                    if ds_all:
+                        if hasattr(ds_all, "__getitem__") and hasattr(ds_all, "keys"):
+                            keys_list = list(ds_all.keys())
+                            if len(keys_list) > 0:
+                                first_key = keys_list[0]
+                                n = len(ds_all[first_key]) if hasattr(ds_all[first_key], "__len__") else 0
+                                if n > 0 and not actual_split:
+                                    actual_split = first_key
+                        elif hasattr(ds_all, "__len__"):
+                            n = len(ds_all)
+                except Exception as fallback_err:
+                    _app_logger.debug("testset create 回退加载失败: %s", fallback_err)
     except Exception as e:
-        _app_logger.warning("testset create load_dataset: %s", e)
+        load_error = str(e)
+        _app_logger.warning("testset create load_dataset 异常: %s", e)
+    if n == 0:
+        meta_n, meta_split, meta_subset = _resolve_dataset_sample_count(hf_dataset, hf_subset, hf_split, cache_dir)
+        if meta_n > 0:
+            n = meta_n
+            if not actual_split:
+                actual_split = meta_split
+            if not hf_subset and meta_subset:
+                hf_subset = meta_subset
+    # 使用实际成功的 split，否则用第一个候选
+    hf_split = actual_split or (split_candidates[0] if split_candidates else "test")
     testset_id = str(uuid.uuid4())
     prompt_path = os.path.join(Config.PROJECT_ROOT, "yaml_template", "prompt.yaml")
     if not os.path.isfile(prompt_path):
         prompt_path = ""
     lm_eval_task = _infer_lm_eval_task(hf_dataset, hf_subset)
+    # 如果无法推断，尝试自动发现
+    if not lm_eval_task and hf_dataset:
+        try:
+            import merge_manager as mm
+            discovered_task = mm._auto_discover_lm_eval_task(hf_dataset, hf_subset)
+            if discovered_task:
+                lm_eval_task = discovered_task
+                # 自动保存映射到配置文件
+                try:
+                    extra = mm._load_eval_task_mapping()
+                    hf_key = hf_dataset.strip()
+                    subset_key = hf_subset.strip() if hf_subset else None
+                    exact_key = "%s|%s" % (hf_key, subset_key) if subset_key else hf_key
+                    extra[exact_key] = discovered_task
+                    if not subset_key:
+                        extra[hf_key] = discovered_task
+                    mm._save_eval_task_mapping(extra)
+                    _app_logger.info("[testset] 已自动发现并保存映射: %s -> %s", exact_key, discovered_task)
+                except Exception as save_err:
+                    _app_logger.warning("[testset] 自动保存映射失败: %s", save_err)
+        except Exception as discover_err:
+            _app_logger.debug("[testset] 自动发现任务失败: %s", discover_err)
+    if not lm_eval_task and hf_dataset:
+        try:
+            import merge_manager as mm
+            available = mm._get_available_lm_eval_tasks()
+            hf_key = hf_dataset.strip().lower()
+            base_name = hf_key.split("/")[-1]
+            target = None
+            for t in available:
+                t_lower = t.lower()
+                if t_lower == hf_key or t_lower == base_name:
+                    target = t
+                    break
+            if target:
+                lm_eval_task = target
+                try:
+                    extra = mm._load_eval_task_mapping()
+                    exact_key = "%s|%s" % (hf_dataset.strip(), hf_subset.strip()) if hf_subset else hf_dataset.strip()
+                    extra[exact_key] = target
+                    if not hf_subset:
+                        extra[hf_dataset.strip()] = target
+                    mm._save_eval_task_mapping(extra)
+                except Exception as save_err:
+                    _app_logger.warning("[testset] 自动保存映射失败: %s", save_err)
+        except Exception as e:
+            _app_logger.debug("[testset] 任务精确匹配失败: %s", e)
+    
     entry = {
         "testset_id": testset_id,
         "name": name,
         "hf_dataset": hf_dataset,
         "hf_subset": hf_subset,
         "hf_split": hf_split,
-        "lm_eval_task": lm_eval_task,
+        "lm_eval_task": lm_eval_task or "",  # 即使为空也保存，后续评估时会再次尝试自动发现
         "yaml_template_path": prompt_path,
         "sample_count": n,
         "created_at": time.time(),
@@ -1003,17 +1465,55 @@ def api_testset_create():
     return jsonify({"status": "success", "testset_id": testset_id, "testset": entry})
 
 
+def _load_leaderboard():
+    """加载 leaderboard 数据。"""
+    lb_path = os.path.join(Config.PROJECT_ROOT, "testset_repo", "data", "leaderboard.json")
+    if not os.path.isfile(lb_path):
+        return {}
+    try:
+        with open(lb_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("leaderboards", {})
+    except Exception:
+        return {}
+
+
 @app.route("/api/testset/<testset_id>")
 def api_testset_get(testset_id):
-    for t in _testset_list():
-        if t.get("testset_id") == testset_id:
-            return jsonify({"status": "success", "testset": t})
-    return jsonify({"status": "error", "message": "Not found"}), 404
+    """获取测试集详情，包含 leaderboard（在该测试集上测评过的模型+分数）。"""
+    refresh = request.args.get("refresh", "0") in ("1", "true", "yes")
+    testset = _get_testset_by_id(testset_id, refresh=refresh)
+    if not testset:
+        return jsonify({"status": "error", "message": "Not found"}), 404
+    # 获取该测试集的 leaderboard
+    leaderboards = _load_leaderboard()
+    lb = leaderboards.get(testset_id, [])
+    lb_norm = []
+    for item in lb:
+        acc = item.get("accuracy", None)
+        acc_val = None
+        try:
+            if acc is not None:
+                acc_val = float(acc)
+        except Exception:
+            acc_val = None
+        if acc_val is not None and acc_val <= 1:
+            acc_val = acc_val * 100
+        new_item = dict(item)
+        if acc_val is not None:
+            new_item["accuracy"] = round(acc_val, 4)
+        lb_norm.append(new_item)
+    lb_sorted = sorted(lb_norm, key=lambda x: x.get("accuracy", 0) or 0, reverse=True)
+    return jsonify({
+        "status": "success",
+        "testset": testset,
+        "leaderboard": lb_sorted,
+    })
 
 
 @app.route("/api/test_history")
 def api_test_history():
-    return jsonify({"status": "success", "history": []})
+    return jsonify({"status": "success", "history": get_all_eval_history()})
 
 
 # MMLU 子集列表（保留用于兼容）
@@ -1225,6 +1725,7 @@ def _check_merge_compatible(model_paths: list) -> tuple[bool, str, list]:
 def api_dataset_hf_info():
     """
     根据 HuggingFace 数据集名称拉取信息并返回子集(config)与 split 列表，供完全融合界面选择。
+    优先从本地已加载的数据集读取真实的 splits 和 configs，而不是使用固定字段。
     请求体: { "hf_dataset": "cais/mmlu" }。会触发缓存/下载到 HF_DATASETS_CACHE 或默认缓存。
     """
     data = request.json or {}
@@ -1232,20 +1733,277 @@ def api_dataset_hf_info():
     if not hf_dataset:
         return jsonify({"status": "error", "message": "hf_dataset 必填"}), 400
     try:
-        from datasets import get_dataset_config_names, load_dataset_builder
-        configs = get_dataset_config_names(hf_dataset, trust_remote_code=True)
-        if not configs:
-            return jsonify({"status": "success", "hf_dataset": hf_dataset, "configs": [], "splits": []})
-        # 取第一个 config 探测 splits（多数数据集各 config 的 split 一致）
-        try:
-            builder = load_dataset_builder(hf_dataset, configs[0], trust_remote_code=True)
-            splits = list(builder.info.splits.keys()) if builder.info.splits else ["train", "validation", "test"]
-        except Exception:
-            splits = ["train", "validation", "test"]
+        from datasets import get_dataset_config_names, load_dataset_builder, load_dataset
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError
+        import glob
+        cache_dir = getattr(Config, "EVAL_HF_DATASETS_CACHE", None) or os.environ.get("HF_DATASETS_CACHE")
+        
+        configs = []
+        splits = []
+
+        def _load_ds():
+            try:
+                ds_local = load_dataset(hf_dataset, trust_remote_code=True, cache_dir=cache_dir)
+                if ds_local and hasattr(ds_local, "keys") and callable(getattr(ds_local, "keys", None)):
+                    return list(ds_local.keys())
+            except Exception as e:
+                _app_logger.debug("[hf_info] 本地数据集读取失败: %s", e)
+            return []
+
+        def _get_configs():
+            try:
+                return get_dataset_config_names(hf_dataset, trust_remote_code=True)
+            except Exception as e:
+                _app_logger.debug("[hf_info] 获取 configs 失败: %s", e)
+                return []
+
+        def _get_splits_from_builder(first_config):
+            try:
+                b = load_dataset_builder(hf_dataset, first_config or None, trust_remote_code=True, cache_dir=cache_dir)
+                return list(b.info.splits.keys()) if b.info.splits else []
+            except Exception as e:
+                _app_logger.debug("[hf_info] builder 读取 splits 失败: %s", e)
+                return []
+        
+        def _get_default_splits():
+            return ["train", "validation", "test"]
+        
+        def _collect_local_infos(cache_root):
+            if not cache_root or not os.path.isdir(cache_root):
+                return {}
+            base_name = hf_dataset.split("/")[-1]
+            norm_name = hf_dataset.replace("/", "___")
+            roots = [cache_root, os.path.join(cache_root, "datasets")]
+            files = []
+            for r in roots:
+                if not r or not os.path.isdir(r):
+                    continue
+                files.extend(glob.glob(os.path.join(r, norm_name, "**", "dataset_info.json"), recursive=True))
+                files.extend(glob.glob(os.path.join(r, base_name, "**", "dataset_info.json"), recursive=True))
+                files.extend(glob.glob(os.path.join(r, norm_name, "**", "dataset_infos.json"), recursive=True))
+                files.extend(glob.glob(os.path.join(r, base_name, "**", "dataset_infos.json"), recursive=True))
+            def _parse_readme_dataset_info(text):
+                lines = text.splitlines()
+                if not lines:
+                    return {}
+                idx = 0
+                if lines[0].strip() == "---":
+                    idx = 1
+                else:
+                    return {}
+                in_dataset_info = False
+                in_splits = False
+                infos = {}
+                current_cfg = ""
+                current_splits = []
+                while idx < len(lines):
+                    line = lines[idx]
+                    if line.strip() == "---":
+                        break
+                    stripped = line.strip()
+                    if stripped == "dataset_info:":
+                        in_dataset_info = True
+                        in_splits = False
+                        idx += 1
+                        continue
+                    if not in_dataset_info:
+                        idx += 1
+                        continue
+                    if stripped.startswith("- config_name:"):
+                        if current_cfg:
+                            infos[current_cfg] = current_splits
+                        current_cfg = stripped.split(":", 1)[1].strip()
+                        current_splits = []
+                        in_splits = False
+                        idx += 1
+                        continue
+                    if stripped == "splits:":
+                        in_splits = True
+                        idx += 1
+                        continue
+                    if in_splits and stripped.startswith("- name:"):
+                        split_name = stripped.split(":", 1)[1].strip()
+                        if split_name:
+                            current_splits.append(split_name)
+                        idx += 1
+                        continue
+                    if stripped.startswith("download_size:") or stripped.startswith("dataset_size:") or stripped.startswith("features:"):
+                        in_splits = False
+                    idx += 1
+                if current_cfg:
+                    infos[current_cfg] = current_splits
+                return infos
+            infos = {}
+            for p in files:
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        info = json.load(f)
+                    if isinstance(info, dict) and "splits" in info:
+                        ds_name = (info.get("dataset_name") or "").strip().lower()
+                        if ds_name and ds_name != base_name.lower():
+                            continue
+                        cfg = (info.get("config_name") or "").strip()
+                        split_info = info.get("splits") or {}
+                        split_keys = list(split_info.keys()) if isinstance(split_info, dict) else []
+                        if cfg:
+                            infos[cfg] = split_keys
+                    else:
+                        for cfg_key, cfg_info in (info or {}).items():
+                            if not isinstance(cfg_info, dict):
+                                continue
+                            ds_name = (cfg_info.get("dataset_name") or "").strip().lower()
+                            if ds_name and ds_name != base_name.lower():
+                                continue
+                            cfg = (cfg_info.get("config_name") or cfg_key or "").strip()
+                            split_info = cfg_info.get("splits") or {}
+                            split_keys = list(split_info.keys()) if isinstance(split_info, dict) else []
+                            if cfg:
+                                infos[cfg] = split_keys
+                except Exception:
+                    continue
+            downloads_dir = os.path.join(cache_root, "downloads")
+            if os.path.isdir(downloads_dir):
+                meta_files = glob.glob(os.path.join(downloads_dir, "*.json"))
+                for meta_path in meta_files:
+                    try:
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                        url = (meta.get("url") or "").strip()
+                        if not url:
+                            continue
+                        if ("/datasets/" + hf_dataset.strip("/") + "/") not in url:
+                            continue
+                        if not url.endswith("README.md"):
+                            continue
+                        content_path = meta_path[:-5]
+                        if not os.path.isfile(content_path):
+                            continue
+                        with open(content_path, "r", encoding="utf-8") as f:
+                            text = f.read()
+                        yaml_infos = _parse_readme_dataset_info(text)
+                        for cfg, splits_list in (yaml_infos or {}).items():
+                            if cfg and cfg not in infos:
+                                infos[cfg] = splits_list or []
+                    except Exception:
+                        continue
+            return infos
+
+        def _collect_lm_task_infos():
+            base_name = hf_dataset.split("/")[-1].lower()
+            project_root = getattr(Config, "PROJECT_ROOT", None)
+            if not project_root:
+                return {}
+            base_root = os.path.abspath(os.path.join(project_root, "..", ".."))
+            lm_root = os.path.join(base_root, "Packages", "mergenetic", "lm_tasks")
+            if not os.path.isdir(lm_root):
+                return {}
+            target_dir = os.path.join(lm_root, base_name)
+            if not os.path.isdir(target_dir):
+                return {}
+            yaml_files = glob.glob(os.path.join(target_dir, "*.yaml")) + glob.glob(os.path.join(target_dir, "*.yml"))
+            infos = {}
+            for p in yaml_files:
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                    dataset_path = ""
+                    dataset_name = ""
+                    training_split = ""
+                    test_split = ""
+                    fewshot_split = ""
+                    for raw in lines:
+                        line = raw.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if line.startswith("dataset_path:"):
+                            dataset_path = line.split(":", 1)[1].strip()
+                            continue
+                        if line.startswith("dataset_name:"):
+                            dataset_name = line.split(":", 1)[1].strip()
+                            continue
+                        if line.startswith("training_split:"):
+                            training_split = line.split(":", 1)[1].strip()
+                            continue
+                        if line.startswith("test_split:"):
+                            test_split = line.split(":", 1)[1].strip()
+                            continue
+                        if line.startswith("fewshot_split:"):
+                            fewshot_split = line.split(":", 1)[1].strip()
+                            continue
+                    if dataset_path and dataset_path.lower() != base_name:
+                        continue
+                    cfg = dataset_name or ""
+                    splits = []
+                    for s in [training_split, fewshot_split, test_split]:
+                        if s and s not in splits:
+                            splits.append(s)
+                    if cfg and cfg not in infos:
+                        infos[cfg] = splits
+                except Exception:
+                    continue
+            return infos
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            try:
+                configs = ex.submit(_get_configs).result(timeout=5)
+            except TimeoutError:
+                _app_logger.warning("[hf_info] 获取 configs 超时 5s")
+                configs = []
+            try:
+                splits = ex.submit(_load_ds).result(timeout=5)
+            except TimeoutError:
+                _app_logger.warning("[hf_info] 读取本地数据集 splits 超时 5s")
+                splits = []
+
+        local_infos = {}
+        default_hf_cache = os.path.join(str(Path.home()), ".cache", "huggingface", "datasets")
+        cache_candidates = [
+            cache_dir,
+            getattr(Config, "HF_DATASETS_CACHE", None),
+            getattr(Config, "EVAL_HF_DATASETS_CACHE", None),
+            default_hf_cache,
+        ]
+        for c in cache_candidates:
+            local_infos.update(_collect_local_infos(c))
+        lm_task_infos = _collect_lm_task_infos()
+        for cfg, split_list in (lm_task_infos or {}).items():
+            if cfg and cfg not in local_infos:
+                local_infos[cfg] = split_list
+
+        configs_set = set([c for c in (configs or []) if c])
+        configs_set.update(local_infos.keys())
+        configs = list(configs_set)
+        configs.sort()
+
+        requested_subset = (data.get("hf_subset") or "").strip()
+        target_config = requested_subset if requested_subset and requested_subset in configs_set else (configs[0] if configs else None)
+        
+        if configs:
+            splits = local_infos.get(target_config) or splits
+            if not splits:
+                with ThreadPoolExecutor(max_workers=1) as ex:
+                    try:
+                        splits = ex.submit(_get_splits_from_builder, target_config).result(timeout=5)
+                    except TimeoutError:
+                        _app_logger.warning("[hf_info] builder 读取 splits 超时 5s")
+                        splits = []
+        else:
+            if not splits:
+                with ThreadPoolExecutor(max_workers=1) as ex:
+                    try:
+                        splits = ex.submit(_get_splits_from_builder, None).result(timeout=5)
+                    except TimeoutError:
+                        _app_logger.warning("[hf_info] builder 读取 splits 超时 5s")
+                        splits = []
+        
+        if not splits:
+            splits = _get_default_splits()
+            _app_logger.warning("[hf_info] 无法读取 splits，使用默认值: %s", splits)
+        
         return jsonify({
             "status": "success",
             "hf_dataset": hf_dataset,
-            "configs": configs,
+            "configs": configs or [],
             "splits": splits,
         })
     except Exception as e:
@@ -1253,19 +2011,61 @@ def api_dataset_hf_info():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+def _get_recipe_arch_path(recipe_id: str) -> str | None:
+    """
+    获取配方的架构代表路径（父代模型之一）。
+    配方物化后的模型架构与其父代模型一致，用第一个父代的路径来判断架构。
+    """
+    recipe_path = os.path.join(RECIPES_DIR, f"{recipe_id}.json")
+    if not os.path.isfile(recipe_path):
+        return None
+    try:
+        with open(recipe_path, "r", encoding="utf-8") as f:
+            r = json.load(f)
+        model_paths = r.get("model_paths") or []
+        if model_paths and os.path.isdir(model_paths[0]):
+            return model_paths[0]
+    except Exception:
+        pass
+    return None
+
+
 @app.route("/api/merge_evolutionary_check", methods=["POST"])
 def api_merge_evolutionary_check():
-    """检查所选模型是否可融合，用于前端在选择时弹窗提示。"""
+    """
+    检查所选模型是否可融合，用于前端在选择时弹窗提示。
+    支持 model_paths（纯路径）或 items（包含 path/recipe 类型）。
+    """
     data = request.json or {}
+    items = data.get("items") or []
     paths = data.get("model_paths") or []
-    if len(paths) < 2:
+
+    # 如果是 items 格式（可能包含配方），转换为路径列表
+    if items and len(items) >= 2:
+        resolved = []
+        for it in items:
+            if it.get("type") == "path" and it.get("path"):
+                ab = _resolve_model_path(it["path"])
+                if not ab:
+                    return jsonify({"status": "error", "message": "模型路径无效: %s" % it["path"]}), 400
+                resolved.append(ab)
+            elif it.get("type") == "recipe" and it.get("recipe_id"):
+                arch_path = _get_recipe_arch_path(it["recipe_id"])
+                if not arch_path:
+                    return jsonify({"status": "error", "message": "配方无效或父代模型缺失: %s" % it["recipe_id"]}), 400
+                resolved.append(arch_path)
+            else:
+                return jsonify({"status": "error", "message": "items 格式无效"}), 400
+    elif len(paths) >= 2:
+        resolved = []
+        for p in paths:
+            ab = _resolve_model_path(p)
+            if not ab:
+                return jsonify({"status": "error", "message": "模型路径无效: %s" % (p,)}), 400
+            resolved.append(ab)
+    else:
         return jsonify({"status": "success", "compatible": True, "reason": ""})
-    resolved = []
-    for p in paths:
-        ab = _resolve_model_path(p)
-        if not ab:
-            return jsonify({"status": "error", "message": "模型路径无效: %s" % (p,)}), 400
-        resolved.append(ab)
+
     compatible, reason, model_types = _check_merge_compatible(resolved)
     return jsonify({
         "status": "success",
@@ -1280,7 +2080,7 @@ RECIPES_DIR = getattr(Config, "RECIPES_DIR", None) or os.path.join(Config.PROJEC
 
 @app.route("/api/recipes")
 def api_recipes_list():
-    """列出所有已保存的完全融合配方，供前端查询。"""
+    """列出所有已保存的完全融合配方，供前端查询。每个配方带 is_vlm 字段，根据父代模型判断。"""
     if not os.path.isdir(RECIPES_DIR):
         return jsonify({"status": "success", "recipes": []})
     recipes = []
@@ -1292,6 +2092,10 @@ def api_recipes_list():
             with open(path, "r", encoding="utf-8") as fp:
                 r = json.load(fp)
             r["recipe_id"] = os.path.splitext(f)[0]
+            # 根据父代模型判断是否 VLM（任一父代是 VLM 则为 VLM）
+            model_paths = r.get("model_paths") or []
+            is_vlm = any(_model_is_vlm(p) for p in model_paths if p and os.path.isdir(p))
+            r["is_vlm"] = is_vlm
             recipes.append(r)
         except Exception:
             continue
@@ -1488,6 +2292,9 @@ def api_fusion_history():
                     except Exception:
                         pass
             meta["evolution_progress"] = evo_progress
+            # 对于 recipe_apply 类型，使用 recipe_id 而不是 task_id 来检查配方文件
+            if meta.get("type") == "recipe_apply" and meta.get("recipe_id"):
+                recipe_path = os.path.join(RECIPES_DIR, "%s.json" % meta.get("recipe_id"))
             meta["has_recipe"] = os.path.isfile(recipe_path)
             # 添加 pop_size 和 n_iter 信息供前端计算迭代次数
             meta["pop_size"] = meta.get("pop_size")
@@ -1508,6 +2315,13 @@ def fusion_history_page():
 
 
 if __name__ == "__main__":
+    try:
+        from app import app as modular_app
+        app_to_run = modular_app
+        print("--- 使用模块化应用入口 ---")
+    except Exception:
+        app_to_run = app
+        print("--- 模块化入口不可用，回退到本文件内置应用 ---")
     port = int(os.environ.get("PORT", 5001))
     print("--- mergeKit_beta 后端启动 (port=%s) ---" % port)
-    app.run(host="0.0.0.0", debug=True, port=port, use_reloader=False)
+    app_to_run.run(host="0.0.0.0", debug=True, port=port, use_reloader=False)

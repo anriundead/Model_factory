@@ -1,0 +1,44 @@
+{
+  "task_id": "c7d36dbe",
+  "output_dir_name": "Meta-Llama-3-8B-Instruct_Bio-Medical-Llama-3-8B_20260204-174133",
+  "custom_name": "Fusion-0.8",
+  "model_paths": [
+    "/home/a/ServiceEndFiles/Models/Meta-Llama-3-8B-Instruct",
+    "/home/a/ServiceEndFiles/Models/Bio-Medical-Llama-3-8B"
+  ],
+  "parent_names": [
+    "Meta-Llama-3-8B-Instruct",
+    "Bio-Medical-Llama-3-8B"
+  ],
+  "best_genotype": [
+    0.0065572124494910735,
+    0.5350807043071962
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "college_medicine",
+    "college_biology",
+    "clinical_knowledge",
+    "professional_medicine",
+    "anatomy",
+    "medical_genetics",
+    "virology",
+    "high_school_biology",
+    "human_aging",
+    "human_sexuality"
+  ],
+  "hf_subset_group": "biology_medicine",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 10,
+  "n_iter": 6,
+  "max_samples": 32,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 2,
+  "eval_mode": "text",
+  "completed_at": "2026-02-04T17:41:40.222993",
+  "current_best_acc": 0.28125,
+  "final_test_acc": null
+}

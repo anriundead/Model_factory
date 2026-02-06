@@ -695,24 +695,53 @@ function clearPolling() {
 
 // ===================== 业务逻辑：模型加载/选择 =====================
 
-// 1. 加载本地模型
+// 1. 加载本地模型（基座 + 已融合且含 .safetensors 的 output）
 async function loadModels() {
     const container = document.getElementById('models-container');
     container.innerHTML = '<div class="loading">正在连接后端...</div>';
 
     try {
-        const response = await fetch('/api/models');
-        const data = await response.json();
-
-        if (data.status === 'success') {
-            state.availableModels = data.models || [];
-            renderModelList(state.availableModels);
-        } else {
-            container.innerHTML = `<div class="error">加载失败: ${data.message || 'Unknown error'}</div>`;
-        }
+        const [modelsRes, mergedRes] = await Promise.all([fetch('/api/models'), fetch('/api/merged_models')]);
+        const modelsData = await modelsRes.json();
+        const mergedData = await mergedRes.json();
+        const baseList = (modelsData.status === 'success' && modelsData.models) ? modelsData.models : [];
+        const mergedList = (mergedData.status === 'success' && mergedData.models) ? mergedData.models : [];
+        state.availableModels = baseList.map(m => ({ ...m, source: 'base' })).concat(mergedList.map(m => ({ ...m, source: 'merged' })));
+        renderModelList(state.availableModels);
+        loadRecipeListForMerge();
     } catch (error) {
         console.error('API Error:', error);
         container.innerHTML = '<div class="error">无法连接后端服务，请检查 app.py 是否运行。</div>';
+    }
+}
+
+// 加载配方列表到标准融合的「融合配方」区
+async function loadRecipeListForMerge() {
+    const container = document.getElementById('recipes-merge-container');
+    if (!container) return;
+    try {
+        const res = await fetch('/api/recipes');
+        const data = await res.json();
+        const list = (data.recipes || []).slice(0, 30);
+        if (list.length === 0) {
+            container.innerHTML = '<p class="limit-desc">暂无配方</p>';
+            return;
+        }
+        container.innerHTML = list.map(r => {
+            const name = (r.custom_name || r.recipe_id || '未命名').toString().slice(0, 28);
+            const rid = r.recipe_id || r.task_id || '';
+            return '<div class="model-card recipe-card" data-recipe-id="' + rid + '" data-recipe-name="' + (name.replace(/"/g, '&quot;')) + '" title="点击加入工作台">' +
+                '<h4>' + name + '</h4><p class="limit-desc">配方</p></div>';
+        }).join('');
+        container.querySelectorAll('.recipe-card').forEach(el => {
+            el.addEventListener('click', () => {
+                const recipeId = el.getAttribute('data-recipe-id');
+                const name = el.getAttribute('data-recipe-name') || recipeId;
+                addModelToSelection({ type: 'recipe', recipe_id: recipeId, name: name });
+            });
+        });
+    } catch (e) {
+        container.innerHTML = '<p class="limit-desc">加载失败</p>';
     }
 }
 
@@ -752,7 +781,7 @@ function renderModelList(models) {
         });
 
         card.addEventListener('click', () => {
-            addModelToSelection(model);
+            addModelToSelection({ type: 'path', path: model.path, name: model.name });
         });
 
         container.appendChild(card);
@@ -837,8 +866,8 @@ function renderEvolutionaryWorkspace() {
     }
     if (placeholder) placeholder.style.display = 'none';
     evolutionarySelectedList.forEach((item, index) => {
-        const tag = item.is_vlm ? 'VLM' : 'LLM';
-        const tagClass = item.is_vlm ? 'evol-tag-vlm' : 'evol-tag-llm';
+        const tag = item.type === 'recipe' ? '蓝图' : (item.is_vlm ? 'VLM' : 'LLM');
+        const tagClass = item.type === 'recipe' ? 'evol-tag-recipe' : (item.is_vlm ? 'evol-tag-vlm' : 'evol-tag-llm');
         const div = document.createElement('div');
         div.className = 'selected-model-item';
         div.innerHTML = '<span class="evol-model-name">' + (item.name || '') + '</span> <span class="evol-tag ' + tagClass + '">' + tag + '</span> <button type="button" class="remove-btn" data-evol-index="' + index + '">×</button>';
@@ -852,13 +881,14 @@ function renderEvolutionaryWorkspace() {
 
 function removeEvolutionarySelection(index) {
     if (index < 0 || index >= evolutionarySelectedList.length) return;
-    const path = evolutionarySelectedList[index].path;
+    const item = evolutionarySelectedList[index];
     evolutionarySelectedList.splice(index, 1);
-    evolutionarySelectedPaths = evolutionarySelectedList.map(m => m.path);
+    evolutionarySelectedPaths = evolutionarySelectedList.map(m => m.path).filter(Boolean);
     renderEvolutionaryWorkspace();
     const container = document.getElementById('evolutionary-models-container');
-    if (container) container.querySelectorAll('.model-card[data-path]').forEach(card => {
-        if (card.dataset.path === path) card.classList.remove('selected');
+    if (container) container.querySelectorAll('.model-card').forEach(card => {
+        if (item.type === 'recipe' && card.dataset.recipeId === item.recipe_id) card.classList.remove('selected');
+        else if (item.path && card.dataset.path === item.path) card.classList.remove('selected');
     });
     checkVlmAndSwitchDataset();
 }
@@ -867,68 +897,104 @@ function loadEvolutionaryModels() {
     const container = document.getElementById('evolutionary-models-container');
     if (!container) return;
     container.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>加载中...</p></div>';
-    fetch('/api/models').then(r => r.json()).then(data => {
+    Promise.all([fetch('/api/models').then(r => r.json()), fetch('/api/merged_models').then(r => r.json()), fetch('/api/recipes').then(r => r.json())]).then(([modelsData, mergedData, recipesData]) => {
+        const baseList = (modelsData.status === 'success' && modelsData.models) ? modelsData.models : [];
+        const mergedList = (mergedData.status === 'success' && mergedData.models) ? mergedData.models : [];
+        const recipesList = (recipesData.status === 'success' && recipesData.recipes) ? recipesData.recipes : [];
+        const allModels = baseList.concat(mergedList);
         container.innerHTML = '';
-        if (!data.models || data.models.length === 0) {
-            container.innerHTML = '<p class="limit-desc">暂无本地模型，请先添加模型到模型池。</p>';
+        if (allModels.length === 0 && recipesList.length === 0) {
+            container.innerHTML = '<p class="limit-desc">暂无本地模型或配方，请先添加模型或完成一次完全融合。</p>';
             return;
         }
-        data.models.forEach(m => {
-            const name = m.name;
-            const path = m.path || name;
-            // 后端 is_vlm 为主；若未标注则按名称兜底（避免 VLM 被标成 LLM）
-            const nameHintsVlm = /vl|vision|vlm|llava|qwen2\.?5?\s*vl|qwen2-vl|cogvlm|minicpm-v/i.test(name || '');
-            const isVlm = !!m.is_vlm || nameHintsVlm;
-            const tag = isVlm ? 'VLM' : 'LLM';
-            const tagClass = isVlm ? 'evol-tag-vlm' : 'evol-tag-llm';
+        function addCard(m, path, name, isVlm, type) {
+            // VLM/LLM 标签（紫色/蓝色），蓝图（无本地模型）额外显示蓝图标签
+            const vlmTag = isVlm ? 'VLM' : 'LLM';
+            const vlmClass = isVlm ? 'evol-tag-vlm' : 'evol-tag-llm';
+            let tagsHtml = '<span class="evol-tag ' + vlmClass + '">' + vlmTag + '</span>';
+            if (type === 'recipe') {
+                tagsHtml += '<span class="evol-tag evol-tag-recipe">蓝图</span>';
+            }
             const card = document.createElement('div');
             card.className = 'model-card';
             card.style.cursor = 'pointer';
-            card.dataset.path = path;
+            card.dataset.path = path || '';
             card.dataset.name = name;
+            card.dataset.type = type || 'path';
+            card.dataset.recipeId = (type === 'recipe' && m.recipe_id) ? m.recipe_id : '';
             card.dataset.isVlm = isVlm ? '1' : '0';
-            card.innerHTML = '<div class="model-name">' + name + '</div><div class="limit-desc"><span class="evol-tag ' + tagClass + '">' + tag + '</span></div>';
+            card.innerHTML = '<div class="model-name">' + name + '</div><div class="limit-desc">' + tagsHtml + '</div>';
             card.addEventListener('click', async () => {
-                const idx = evolutionarySelectedPaths.indexOf(path);
+                const key = type === 'recipe' ? (m.recipe_id || m.task_id) : path;
+                const idx = evolutionarySelectedList.findIndex(x => (x.type === 'recipe' ? (x.recipe_id === key) : (x.path === key)));
                 if (idx >= 0) {
                     evolutionarySelectedList.splice(idx, 1);
-                    evolutionarySelectedPaths.splice(idx, 1);
+                    evolutionarySelectedPaths = evolutionarySelectedList.map(x => x.path).filter(Boolean);
                     card.classList.remove('selected');
                 } else {
-                    evolutionarySelectedList.push({ name, path, is_vlm: isVlm });
-                    evolutionarySelectedPaths.push(path);
-                    card.classList.add('selected');
-                    if (evolutionarySelectedPaths.length >= 2) {
+                    // 先添加到列表
+                    if (type === 'recipe') {
+                        evolutionarySelectedList.push({ type: 'recipe', recipe_id: m.recipe_id || m.task_id, name: name, is_vlm: isVlm });
+                    } else {
+                        evolutionarySelectedList.push({ name, path, is_vlm: isVlm, type: 'path' });
+                        evolutionarySelectedPaths.push(path);
+                    }
+                    // 选择 >=2 个时进行架构兼容性检查
+                    if (evolutionarySelectedList.length >= 2) {
                         try {
+                            // 构建 items 格式进行检查
+                            const items = evolutionarySelectedList.map(x => {
+                                if (x.type === 'recipe' && x.recipe_id) {
+                                    return { type: 'recipe', recipe_id: x.recipe_id };
+                                } else {
+                                    return { type: 'path', path: x.path };
+                                }
+                            });
                             const checkRes = await fetch('/api/merge_evolutionary_check', {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ model_paths: evolutionarySelectedPaths })
+                                body: JSON.stringify({ items })
                             });
                             const checkData = await checkRes.json();
                             if (checkData.status === 'success' && checkData.compatible === false) {
-                                alert('所选模型无法融合：' + (checkData.reason || '架构不一致'));
+                                alert('所选模型/配方无法融合：' + (checkData.reason || '架构不一致'));
                                 evolutionarySelectedList.pop();
-                                evolutionarySelectedPaths.pop();
+                                if (type !== 'recipe') evolutionarySelectedPaths.pop();
                                 card.classList.remove('selected');
+                            } else {
+                                card.classList.add('selected');
                             }
-                        } catch (e) { /* ignore */ }
+                        } catch (e) {
+                            card.classList.add('selected');
+                        }
+                    } else {
+                        card.classList.add('selected');
                     }
                 }
+                evolutionarySelectedPaths = evolutionarySelectedList.map(x => x.path).filter(Boolean);
                 renderEvolutionaryWorkspace();
                 checkVlmAndSwitchDataset();
             });
             container.appendChild(card);
+        }
+        allModels.forEach(m => {
+            const name = m.name;
+            const path = m.path || name;
+            const nameHintsVlm = /vl|vision|vlm|llava|qwen2\.?5?\s*vl|qwen2-vl|cogvlm|minicpm-v/i.test(name || '');
+            const isVlm = !!m.is_vlm || nameHintsVlm;
+            addCard(m, path, name, isVlm, 'path');
         });
-        var kept = [];
-        evolutionarySelectedPaths.forEach(function(p) {
-            var m = data.models.find(function(x) { return (x.path || x.name) === p; });
-            if (m) kept.push({ name: m.name, path: m.path || m.name, is_vlm: !!m.is_vlm });
+        recipesList.slice(0, 20).forEach(r => {
+            const name = (r.custom_name || r.recipe_id || '未命名').toString().slice(0, 32);
+            const isVlm = !!r.is_vlm;
+            addCard(r, null, name, isVlm, 'recipe');
         });
-        evolutionarySelectedList = kept;
-        evolutionarySelectedPaths = kept.map(function(x) { return x.path; });
+        evolutionarySelectedPaths = evolutionarySelectedList.map(x => x.path).filter(Boolean);
         container.querySelectorAll('.model-card').forEach(function(card) {
-            if (evolutionarySelectedPaths.indexOf(card.dataset.path) >= 0) card.classList.add('selected');
+            const path = card.dataset.path;
+            const recipeId = card.dataset.recipeId;
+            const isSelected = recipeId ? evolutionarySelectedList.some(x => x.type === 'recipe' && x.recipe_id === recipeId) : evolutionarySelectedPaths.indexOf(path) >= 0;
+            if (isSelected) card.classList.add('selected');
         });
         renderEvolutionaryWorkspace();
     }).catch(() => { if (container) container.innerHTML = '<p class="limit-desc">加载失败</p>'; });
@@ -1117,8 +1183,8 @@ function setupEvolutionaryMerge() {
     const btn = document.getElementById('start-evolutionary-merge');
     if (!btn) return;
     btn.addEventListener('click', async () => {
-        if (evolutionarySelectedPaths.length < 2) {
-            alert('请至少选择 2 个模型');
+        if (evolutionarySelectedList.length < 2) {
+            alert('请至少选择 2 个模型或配方');
             return;
         }
         const customName = (document.getElementById('evolutionary-custom-name') && document.getElementById('evolutionary-custom-name').value.trim()) || ('进化融合-' + Date.now());
@@ -1133,8 +1199,8 @@ function setupEvolutionaryMerge() {
         const hfSplit = (document.getElementById('evolutionary-hf-split') && document.getElementById('evolutionary-hf-split').value) || (datasetType === 'cmmmu' ? 'val' : 'validation');
         const dtype = document.getElementById('evolutionary-dtype')?.value || 'bfloat16';
         const rayGpus = parseInt(document.getElementById('evolutionary-ray-gpus')?.value || 2, 10);
+        const hasRecipe = evolutionarySelectedList.some(x => x.type === 'recipe');
         const body = {
-            model_paths: evolutionarySelectedPaths,
             custom_name: customName,
             pop_size: popSize,
             n_iter: nIter,
@@ -1144,6 +1210,14 @@ function setupEvolutionaryMerge() {
             dtype,
             ray_num_gpus: rayGpus,
         };
+        if (hasRecipe) {
+            body.items = evolutionarySelectedList.map(x => {
+                if (x.type === 'recipe') return { type: 'recipe', recipe_id: x.recipe_id };
+                return { type: 'path', path: x.path };
+            });
+        } else {
+            body.model_paths = evolutionarySelectedPaths;
+        }
         if (hfSplit === 'validation' || hfSplit === 'val') body.hf_split_final = 'test';
         if (useCustomDataset) {
             const subsetEl = document.getElementById('evolutionary-mmlu-subset');
@@ -1448,16 +1522,27 @@ function setupRecipeApply() {
     });
 }
 
-// 4. 添加模型到选择区（model 为 {name, path} 或仅 name 字符串，path 可选）
+// 4. 添加模型到选择区（model 为 {name, path}、{ type:'recipe', recipe_id, name } 或 name 字符串）
 function addModelToSelection(model) {
     const clearBtn = document.getElementById('clear-selection');
     if (clearBtn.dataset.mode === 'stop') {
         alert('任务运行中，无法修改选择列表。请先停止任务。');
         return;
     }
-    const entry = typeof model === 'string' ? { name: model, path: null } : { name: model.name, path: model.path || null };
-    if (state.selectedModels.some(m => (m.name || m) === entry.name)) {
-        alert('该模型已在列表中');
+    if (state.selectedModels.length >= 2) {
+        alert('最多选择 2 个模型或配方');
+        return;
+    }
+    let entry;
+    if (typeof model === 'string') {
+        entry = { type: 'path', name: model, path: null };
+    } else if (model.type === 'recipe') {
+        entry = { type: 'recipe', name: model.name || model.recipe_id, recipe_id: model.recipe_id };
+    } else {
+        entry = { type: 'path', name: model.name || model, path: model.path || null };
+    }
+    if (state.selectedModels.some(m => (m.name || m) === (entry.name || entry.recipe_id))) {
+        alert('该模型/配方已在列表中');
         return;
     }
     state.selectedModels.push(entry);
@@ -1585,7 +1670,13 @@ async function startMergeTask() {
     
     const startBtn = document.getElementById('start-merge');
     const statusDiv = document.getElementById('task-status');
-    
+    const customNameInput = document.getElementById('model-name-input');
+    const customName = customNameInput && customNameInput.value.trim();
+    if (!customName) {
+        if (customNameInput) { customNameInput.classList.add('input-error'); customNameInput.focus(); }
+        alert('请填写模型名称');
+        return;
+    }
     const method = document.getElementById('merge-method').value;
     const dtype = document.getElementById('dtype').value;
     if (state.selectedModels.length === 0) return;
@@ -1619,10 +1710,19 @@ async function startMergeTask() {
         weights.push(parseFloat(input.value));
     });
 
-    const modelPaths = state.selectedModels.map(m => (typeof m === 'string' ? null : m.path)).filter(Boolean);
-    const modelNames = state.selectedModels.map(m => (typeof m === 'string' ? m : (m && m.name))).filter(Boolean);
-    const payload = { weights: weights, method: method, dtype: dtype };
-    if (modelPaths.length === state.selectedModels.length) payload.model_paths = modelPaths; else payload.models = modelNames;
+    const hasRecipe = state.selectedModels.some(m => m && m.type === 'recipe');
+    const payload = { weights: weights, method: method, dtype: dtype, custom_name: customName };
+    if (hasRecipe) {
+        payload.items = state.selectedModels.map(m => {
+            if (m.type === 'recipe') return { type: 'recipe', recipe_id: m.recipe_id };
+            return { type: 'path', path: m.path };
+        });
+    } else {
+        const modelPaths = state.selectedModels.map(m => (m && m.path)).filter(Boolean);
+        const modelNames = state.selectedModels.map(m => (m && m.name)).filter(Boolean);
+        if (modelPaths.length === state.selectedModels.length) payload.model_paths = modelPaths;
+        else payload.models = modelNames;
+    }
     try {
         const response = await fetch('/api/merge', {
             method: 'POST',
@@ -1987,10 +2087,21 @@ async function showTaskCompletionModal(taskId, statusData, evoProgress) {
 
     // 检查配方是否保存
     try {
-        const recipeRes = await fetch(`/api/recipes/${taskId}`);
+        // 先获取任务详情，检查是否有 recipe_id（对于 recipe_apply 类型）
+        const detailRes = await fetch(`/api/history/${taskId}`);
+        const detailData = await detailRes.json();
+        let recipeId = taskId; // 默认使用 taskId
+        if (detailData.status === 'success' && detailData.data) {
+            // 如果是 recipe_apply 类型，使用 recipe_id
+            if (detailData.data.type === 'recipe_apply' && detailData.data.recipe_id) {
+                recipeId = detailData.data.recipe_id;
+            }
+        }
+        
+        const recipeRes = await fetch(`/api/recipes/${recipeId}`);
         const recipeData = await recipeRes.json();
         if (recipeData.status === 'success' && recipeData.recipe) {
-            recipeStatusEl.textContent = '✓ 已保存到 recipes/' + taskId + '.json';
+            recipeStatusEl.textContent = '✓ 已保存到 recipes/' + recipeId + '.json';
             recipeStatusEl.style.color = 'var(--success)';
         } else {
             recipeStatusEl.textContent = '✗ 未找到配方文件';

@@ -578,18 +578,35 @@ h3 {
     min-width: 320px;
     max-width: 680px;
 }
-.evolutionary-left .two-column-layout {
-    gap: 28px;
+/* 完全融合左侧：上下布局，工作台在上、模型池在下，避免横向挤在一起 */
+.evolutionary-workspace-column {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    width: 100%;
 }
 .evolutionary-left .section.apple-card {
     padding: 24px 28px;
+}
+.evolutionary-workspace-card {
+    flex-shrink: 0;
+}
+.evolutionary-pool-card {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+.evolutionary-pool-hint {
+    margin-bottom: 12px;
+    margin-top: -4px;
 }
 .evolutionary-left .section-header {
     margin-bottom: 18px;
 }
 /* 融合工作台：更大拖放区与已选列表间距 */
 .evolutionary-left .dropzone {
-    min-height: 260px;
+    min-height: 200px;
     padding: 24px;
 }
 .evolutionary-left .dropzone-content {
@@ -734,14 +751,12 @@ h3 {
    ========================================= */
 .models-grid {
     display: grid;
-    /* 【修改】强制两列，等宽 */
-    grid-template-columns: repeat(2, 1fr); 
-    gap: 15px;
-    max-height: 260px; 
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 18px;
+    max-height: 320px;
     overflow-y: auto;
     overflow-x: hidden;
-    padding-right: 10px; 
-    padding-bottom: 5px;
+    padding: 6px 10px 10px 0;
 }
 
 /* 【新增】Webkit 滚动条美化 (Chrome/Edge/Safari) */
@@ -764,31 +779,51 @@ h3 {
     background-color: #86868b; /* 悬停变深 */
 }
 
-/* 完全融合·模型池：更高、更疏，名称完整显示 */
-.evolutionary-models-pool.models-grid,
-#evolutionary-models-container.models-grid {
-    max-height: 320px;
-    gap: 20px;
-    padding: 18px 14px 18px 18px;
+/* 完全融合·模型池：网格多列、自动换行，名称完整显示 */
+.evolutionary-models-pool {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 14px 18px;
+    max-height: 340px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 4px 6px 12px 0;
+}
+.evolutionary-models-pool::-webkit-scrollbar {
+    width: 6px;
+}
+.evolutionary-models-pool::-webkit-scrollbar-track {
+    background: transparent;
+}
+.evolutionary-models-pool::-webkit-scrollbar-thumb {
+    background-color: #d2d2d7;
+    border-radius: 3px;
 }
 .evolutionary-left .model-card {
-    padding: 20px 22px;
-    min-height: 76px;
+    padding: 16px 18px;
+    min-height: 72px;
     text-align: left;
 }
 .evolutionary-left .model-card h4 {
-    font-size: 1rem;
-    line-height: 1.4;
+    font-size: 0.95rem;
+    line-height: 1.35;
     white-space: normal;
     word-break: break-word;
-    margin-bottom: 8px;
+    margin-bottom: 6px;
 }
 .evolutionary-left .model-card p {
-    font-size: 0.82rem;
+    font-size: 0.8rem;
 }
 .evolutionary-left .limit-desc {
-    margin-top: 14px;
+    margin-top: 10px;
     margin-bottom: 0;
+}
+
+/* 模型仓库等页面的卡片网格：多列等间距 */
+#model-repo-merged.models-grid,
+#model-repo-base.models-grid,
+#model-repo-recipes.models-grid {
+    min-height: 120px;
 }
 
 .model-card {
@@ -799,7 +834,7 @@ h3 {
     transition: var(--transition);
     border: 2px solid transparent;
     text-align: center;
-    width: 100%; 
+    width: 100%;
     box-sizing: border-box;
 }
 
@@ -1121,22 +1156,29 @@ select:focus {
     font-family: 'Misans ExtraLight';
 }
 
-/* 完全融合：VLM/LLM 标签 */
+/* 完全融合：VLM/LLM/蓝图 标签 */
 .evol-tag {
     display: inline-block;
-    padding: 2px 8px;
-    border-radius: 6px;
+    padding: 3px 10px;
+    border-radius: 8px;
     font-size: 0.75rem;
     font-weight: 600;
-    margin-left: 6px;
+    margin-right: 6px;
 }
 .evol-tag-vlm {
-    background: rgba(175, 82, 222, 0.15);
-    color: #8b5cf6;
+    background: linear-gradient(135deg, rgba(139, 92, 246, 0.18), rgba(168, 85, 247, 0.22));
+    color: #7c3aed;
+    border: 1px solid rgba(139, 92, 246, 0.25);
 }
 .evol-tag-llm {
-    background: rgba(0, 113, 227, 0.12);
-    color: var(--apple-blue);
+    background: linear-gradient(135deg, rgba(0, 113, 227, 0.12), rgba(59, 130, 246, 0.16));
+    color: #2563eb;
+    border: 1px solid rgba(0, 113, 227, 0.2);
+}
+.evol-tag-recipe {
+    background: linear-gradient(135deg, rgba(234, 179, 8, 0.15), rgba(245, 158, 11, 0.2));
+    color: #b45309;
+    border: 1px solid rgba(234, 179, 8, 0.25);
 }
 .evol-model-name {
     margin-right: 6px;
@@ -1606,6 +1648,32 @@ footer{
     opacity: 0.5;
 }
 
+.page-evaluation .status-message,
+.page-test-history .status-message {
+    font-family: 'MiSans Medium';
+    font-weight: 500;
+    color: #1d1d1f;
+}
+
+.page-evaluation .h-title,
+.page-test-history .h-title {
+    font-weight: 500;
+    color: #1d1d1f;
+}
+
+.page-evaluation .h-meta,
+.page-test-history .h-meta {
+    font-family: 'MiSans';
+    font-weight: 400;
+    color: #6e6e73;
+}
+
+.page-evaluation .selected-model-item {
+    font-family: 'MiSans';
+    font-weight: 500;
+    color: #1d1d1f;
+}
+
 .history-item:hover .btn-delete-history {
     opacity: 1;
     pointer-events: auto;
@@ -1651,4 +1719,43 @@ footer{
     pointer-events: none;
     background-color: #f9f9f9;
     color: #888;
+}
+
+/* --- 下拉框加载状态 --- */
+.ios-select-wrapper.loading .ios-select-trigger {
+    pointer-events: none;
+    background: linear-gradient(90deg, #f5f5f7 25%, #e8e8ed 50%, #f5f5f7 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+}
+
+.ios-select-wrapper.loading .ios-select-trigger .chevron-icon {
+    display: none;
+}
+
+@keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+.loading-text {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: #86868b;
+    font-size: 0.85rem;
+}
+
+.loading-dots {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid #0071e3;
+    border-radius: 50%;
+    border-top-color: transparent;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
 }

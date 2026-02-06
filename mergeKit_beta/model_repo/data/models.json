@@ -1,55 +1,53 @@
 {
   "models": {
-    "0924e7d9-0939-4196-a5af-6eff5e6e9bb9": {
-      "model_id": "0924e7d9-0939-4196-a5af-6eff5e6e9bb9",
-      "name": "KaLM v2.5-0.5B_Qwen2.5-0.5B_20260129120144",
+    "5e5f9dae-d742-4d5c-b690-9fb009bc98e2": {
+      "model_id": "5e5f9dae-d742-4d5c-b690-9fb009bc98e2",
+      "name": "Fusion-0.81",
+      "path": "/home/a/ServiceEndFiles/Workspaces/mergeKit_beta/merges/975b2e4f/output",
       "architecture": "Qwen2ForCausalLM",
       "model_type": "LLM",
       "is_merged": true,
       "recipe": {
         "parent_models": [
-          "KaLM v2.5-0.5B",
-          "Qwen2.5-0.5B"
+          "Meta-Llama-3-8B-Instruct",
+          "Bio-Medical-Llama-3-8B"
         ],
         "weights": [
-          0.5,
-          0.5
+          0.0065572124494910735,
+          0.5350807043071962
         ],
-        "method": "linear",
+        "method": "ties_dare",
         "library": "mergenetic",
-        "dtype": "float16",
-        "search_method": null,
-        "search_params": null
+        "dtype": "bfloat16"
       },
-      "param_count": 272269312,
-      "created_at": 1769688209.9965546,
+      "param_count": 0,
+      "created_at": 1770198207.6478848,
       "created_by": "system",
       "eval_history": [],
       "tags": []
     },
-    "b62642a0-9e9e-4cad-a807-104bb2546d19": {
-      "model_id": "b62642a0-9e9e-4cad-a807-104bb2546d19",
-      "name": "KaLM v2.5-0.5B_Qwen2.5-0.5B_639ba201",
+    "1adcf88e-784e-4836-80b2-057de70f4e19": {
+      "model_id": "1adcf88e-784e-4836-80b2-057de70f4e19",
+      "name": "Fusion-0.81",
+      "path": "/home/a/ServiceEndFiles/Workspaces/mergeKit_beta/merges/3f1b2a2a/output",
       "architecture": "Qwen2ForCausalLM",
       "model_type": "LLM",
       "is_merged": true,
       "recipe": {
         "parent_models": [
-          "KaLM v2.5-0.5B",
-          "Qwen2.5-0.5B"
+          "Meta-Llama-3-8B-Instruct",
+          "Bio-Medical-Llama-3-8B"
         ],
         "weights": [
-          1,
-          1
+          0.0065572124494910735,
+          0.5350807043071962
         ],
         "method": "ties_dare",
         "library": "mergenetic",
-        "dtype": "float16",
-        "search_method": null,
-        "search_params": null
+        "dtype": "bfloat16"
       },
-      "param_count": 272269312,
-      "created_at": 1769766214.4443493,
+      "param_count": 0,
+      "created_at": 1770198544.6125305,
       "created_by": "system",
       "eval_history": [],
       "tags": []

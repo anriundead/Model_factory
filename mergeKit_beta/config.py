@@ -42,6 +42,7 @@ class Config:
     STANDARD_BENCHMARKS = ["hellaswag", "arc_easy", "boolq", "winogrande"]
     DEFAULT_DATASET = "hellaswag"
     DEFAULT_LIMIT = "0.5"
+    EFFICIENCY_BASE_SPS = 10
     # 内置基准测试专用：lm_eval 使用的 HF 数据集缓存目录，与系统默认缓存隔离，避免版本兼容问题
     # 可通过环境变量 MERGEKIT_EVAL_HF_CACHE 覆盖，不设则使用项目下 cache/eval_datasets
     # 说明：内置基准(hellaswag/arc_easy/boolq/winogrande)由 lm_eval 加载，lm_eval 依赖 HuggingFace 的 datasets 库；
@@ -59,7 +60,11 @@ class Config:
     MERGE_LIBRARY = "mergenetic"
 
     # ==================== Mergenetic 使用的 Python 环境（可选） ====================
-    MERGENETIC_PYTHON = os.environ.get("MERGENETIC_PYTHON", "python")
+    # 优先使用环境变量，否则尝试 mergenetic conda 环境，最后回退到 python
+    _default_mergenetic_python = "/home/a/miniconda3/envs/mergenetic/bin/python"
+    if not os.path.isfile(_default_mergenetic_python):
+        _default_mergenetic_python = "python"
+    MERGENETIC_PYTHON = os.environ.get("MERGENETIC_PYTHON", _default_mergenetic_python)
 
     @classmethod
     def setup_environment(cls):

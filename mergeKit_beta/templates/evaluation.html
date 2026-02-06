@@ -11,7 +11,7 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/misans-webfont/misans-style.css" />
     <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
 </head>
-<body>
+<body class="page-evaluation">
 
     <header class="sticky-header">
         <div class="header-content">
@@ -54,6 +54,10 @@
                 <i class="ri-archive-line"></i>
                 <span>模型仓库</span>
             </a>
+            <a href="/fusion_history" class="nav-item">
+                <i class="ri-time-line"></i>
+                <span>融合历史</span>
+            </a>
         </nav>
 
         <div style="padding: 0 25px; margin-top: 10px; font-size: 0.85rem; color: #86868b; font-family:'Misans Medium'">历史记录</div>
@@ -65,7 +69,7 @@
         <main>
             <div class="page-header">
                 <h2>性能评估</h2>
-                <p class="page-subtitle">选择待测模型与数据集，基于 lm_eval 进行标准化能力测试</p>
+                <p class="page-subtitle">选择待测模型与数据集，基于评测引擎进行标准化能力测试</p>
             </div>
 
             <div class="two-column-layout">
@@ -175,7 +179,10 @@
                                 </div>
 
                                 <div id="eval-source-repo" class="eval-source-panel" style="display:none; margin-top: 14px;">
-                                    <label class="segmented-label">测试集</label>
+                                    <label class="segmented-label" style="display:flex; align-items:center; gap:8px;">
+                                        测试集
+                                        <button type="button" id="eval-testset-refresh" class="icon-btn" title="刷新测试集列表" style="font-size:0.95rem;"><i class="ri-refresh-line"></i></button>
+                                    </label>
                                     <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
                                         <div class="ios-select-trigger" id="eval-repo-trigger">
                                             <span class="selected-text">请选择测试集</span>
@@ -242,8 +249,16 @@
                                         <div class="segmented-option selected active" data-value="0.5">50% (均衡)</div>
                                         <div class="segmented-option" data-value="1.0">100% (完整)</div>
                                     </div>
+                                    <div class="segmented-control-wrapper" style="margin-top: 12px;">
+                                        <label class="segmented-label">采样方式</label>
+                                        <div class="segmented-control" id="eval-sampling-control">
+                                            <div class="segmented-option selected active" data-value="sequential">顺序采样</div>
+                                            <div class="segmented-option" data-value="random">随机采样</div>
+                                        </div>
+                                    </div>
                                     <div class="limit-desc">注：测试用例跑得越多，结果越准，耗时越久</div>
                                     <input type="hidden" id="eval-limit" value="0.5">
+                                    <input type="hidden" id="eval-sampling" value="sequential">
                                 </div>
 
                             </div> </div> </section>
@@ -288,7 +303,7 @@
                         <div class="value" id="context-len">--</div>
                     </div>
                 </div>
-                <p id="results-placeholder-hint" class="results-placeholder-hint" style="display: none;">当前为占位结果，未运行 lm_eval 或评测未返回数据。图中三角形仅为占位显示。</p>
+                <p id="results-placeholder-hint" class="results-placeholder-hint" style="display: none;">当前为占位结果，评测未返回数据。图中三角形仅为占位显示。</p>
                 <div class="chart-container">
                     <canvas id="evaluation-chart"></canvas>
                 </div>
