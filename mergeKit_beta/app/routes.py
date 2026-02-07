@@ -569,6 +569,60 @@ def register_routes(app, state, services, dataset_service):
 
     @app.route("/api/testset/create", methods=["POST"])
     def api_testset_create():
+        def _download_dataset_yaml(repo_id, subset):
+            if not repo_id:
+                return ""
+            endpoint = getattr(state.config, "HF_ENDPOINT", None) or os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
+            try:
+                from huggingface_hub import HfApi, hf_hub_download
+            except Exception as e:
+                state.logger.debug("testset create 缺少 huggingface_hub: %s", e)
+                return ""
+            try:
+                api = HfApi(endpoint=endpoint) if endpoint else HfApi()
+                files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+            except Exception as e:
+                state.logger.debug("testset create 获取 dataset 文件列表失败: %s", e)
+                return ""
+            candidates = [
+                "eval.yaml",
+                "eval.yml",
+                "prompt.yaml",
+                "prompt.yml",
+                "eval/prompt.yaml",
+                "eval/prompt.yml",
+                "configs/eval.yaml",
+                "configs/eval.yml",
+            ]
+            target = ""
+            for name in candidates:
+                if name in files:
+                    target = name
+                    break
+            if not target:
+                return ""
+            try:
+                cached = hf_hub_download(
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    filename=target,
+                    endpoint=endpoint,
+                )
+            except Exception as e:
+                state.logger.debug("testset create 下载 yaml 失败: %s", e)
+                return ""
+            safe_repo = repo_id.replace("/", "___")
+            suffix = ("__" + subset.strip()) if (subset or "").strip() else ""
+            yaml_dir = os.path.join(state.project_root, "testset_repo", "yaml")
+            os.makedirs(yaml_dir, exist_ok=True)
+            local_name = "%s%s__%s" % (safe_repo, suffix, os.path.basename(target))
+            local_path = os.path.join(yaml_dir, local_name)
+            try:
+                shutil.copyfile(cached, local_path)
+            except Exception:
+                return ""
+            return local_path
+
         data = request.json or {}
         name = (data.get("name") or "").strip() or (data.get("dataset_name") or "").strip()
         hf_dataset = (data.get("hf_dataset") or "").strip()
@@ -661,6 +715,9 @@ def register_routes(app, state, services, dataset_service):
         prompt_path = os.path.join(state.project_root, "yaml_template", "prompt.yaml")
         if not os.path.isfile(prompt_path):
             prompt_path = ""
+        downloaded_yaml = _download_dataset_yaml(hf_dataset, hf_subset)
+        if downloaded_yaml:
+            prompt_path = downloaded_yaml
         lm_eval_task = services.infer_lm_eval_task(hf_dataset, hf_subset)
         if not lm_eval_task and hf_dataset:
             try:

@@ -41,6 +41,54 @@ logging.basicConfig(
 logger = logging.getLogger("桥接脚本")
 
 
+class TestsetYamlResolver:
+    def __init__(self, testset_data_path: str):
+        self.testset_data_path = testset_data_path
+
+    def _load_entries(self) -> dict:
+        path = self.testset_data_path or ""
+        if not path or not os.path.isfile(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("testsets"), dict):
+                return data.get("testsets") or {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def resolve(self, hf_dataset, hf_subsets, testset_id):
+        entries = self._load_entries()
+        if testset_id and entries.get(testset_id):
+            yaml_path = (entries.get(testset_id) or {}).get("yaml_template_path", "")
+            return yaml_path if yaml_path and os.path.isfile(yaml_path) else ""
+        if not hf_dataset:
+            return ""
+        subsets = [s for s in (hf_subsets or []) if s]
+        candidates: list[tuple[int, float, str]] = []
+        for entry in entries.values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("hf_dataset") != hf_dataset:
+                continue
+            yaml_path = entry.get("yaml_template_path", "")
+            if not yaml_path or not os.path.isfile(yaml_path):
+                continue
+            entry_subset = entry.get("hf_subset")
+            score = 1
+            if subsets and entry_subset in subsets:
+                score = 2
+            elif not subsets and (entry_subset is None or entry_subset == ""):
+                score = 2
+            created_at = float(entry.get("created_at", 0) or 0)
+            candidates.append((score, created_at, yaml_path))
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return candidates[0][2]
+
+
 def main():
     ap = argparse.ArgumentParser(description="进化融合桥接：按 task_id 读取参数并调用 run_vlm_search.py")
     ap.add_argument("--task-id", required=True, help="任务 ID，对应 merges/<task_id>")
@@ -83,6 +131,7 @@ def main():
     ray_num_gpus = int(meta.get("ray_num_gpus", 1))
     eval_mode = meta.get("eval_mode", "text")
     vlm_path = meta.get("vlm_path", "")
+    testset_id = (meta.get("testset_id") or "").strip()
 
     logger.info("=" * 80)
     logger.info("进化融合桥接脚本启动")
@@ -97,6 +146,15 @@ def main():
     logger.info("进度文件: %s", progress_path)
     logger.info("桥接日志: %s", bridge_log_path)
     logger.info("-" * 80)
+
+    default_prompt_yaml = "eval/prompt.yaml" if eval_mode == "vlm" else PROMPT_MMLU
+    resolver = TestsetYamlResolver(getattr(Config, "TESTSET_DATA_PATH", "") or "")
+    resolved_prompt_yaml = resolver.resolve(hf_dataset, hf_subsets, testset_id)
+    prompt_yaml = resolved_prompt_yaml or default_prompt_yaml
+    if resolved_prompt_yaml:
+        logger.info("使用测试集 YAML: %s", resolved_prompt_yaml)
+    else:
+        logger.info("使用默认 YAML: %s", default_prompt_yaml)
 
     # 数据集验证：在启动 run_vlm_search.py 前验证数据集是否可以成功加载
     logger.info("验证数据集加载...")
@@ -159,7 +217,7 @@ def main():
     if hf_subset_group:
         cmd.extend(["--hf-subset-group", hf_subset_group])
     cmd.extend([
-        "--prompt-yaml", PROMPT_MMLU,
+        "--prompt-yaml", prompt_yaml,
         "--pop-size", str(pop_size),
         "--n-iter", str(n_iter),
         "--max-samples", str(max_samples),

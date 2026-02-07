@@ -30,4 +30,25 @@ export LOCAL_MODELS_PATH="${LOCAL_MODELS_PATH:-/home/a/ServiceEndFiles/Models}"
 # 默认端口 5001，可通过环境变量覆盖
 export PORT="${PORT:-5001}"
 echo "--- mergeKit_beta 后端启动 (port=$PORT) ---"
-exec "$PYTHON" app.py
+exec "$PYTHON" - <<'PY'
+import importlib.util
+import os
+import sys
+
+root = os.path.dirname(os.path.abspath(__file__))
+app_dir = os.path.join(root, "app")
+app_init = os.path.join(app_dir, "__init__.py")
+spec = importlib.util.spec_from_file_location("mergekit_app", app_init, submodule_search_locations=[app_dir])
+if spec is None or spec.loader is None:
+    raise SystemExit("无法加载模块化应用入口")
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+app = getattr(mod, "app", None)
+if app is None:
+    raise SystemExit("模块化应用未提供 app 实例")
+port = int(os.environ.get("PORT", "5001"))
+print("--- 使用模块化应用入口 ---")
+print(f"--- mergeKit_beta 后端启动 (port={port}) ---")
+app.run(host="0.0.0.0", debug=True, port=port, use_reloader=False)
+PY
