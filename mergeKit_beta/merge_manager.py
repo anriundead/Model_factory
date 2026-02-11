@@ -9,6 +9,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import re
+import yaml
+import math
+import shlex
 
 from config import Config
 from core.process_manager import ProcessManager
@@ -31,6 +35,38 @@ def _popen_group_kwargs():
     return ProcessManager.create_process_group_kwargs()
 
 
+def _get_conda_activate_cmd(cmd_list):
+    """
+    Wraps a command list in a shell command that activates the mergenetic environment.
+    """
+    # Try to find conda.sh based on MERGENETIC_PYTHON
+    conda_sh = None
+    if MERGENETIC_PYTHON and "envs" in MERGENETIC_PYTHON:
+        # e.g. /home/a/miniconda3/envs/mergenetic/bin/python
+        parts = MERGENETIC_PYTHON.split("/envs/")
+        if len(parts) > 0:
+            base = parts[0]
+            candidate = os.path.join(base, "etc", "profile.d", "conda.sh")
+            if os.path.isfile(candidate):
+                conda_sh = candidate
+    
+    if not conda_sh:
+         # Try standard location
+         conda_sh = "/home/a/miniconda3/etc/profile.d/conda.sh"
+    
+    if not os.path.isfile(conda_sh):
+        _logger.warning("[_get_conda_activate_cmd] 未找到 conda.sh，跳过环境激活。MERGENETIC_PYTHON=%s", MERGENETIC_PYTHON)
+        return cmd_list 
+        
+    # Construct shell command
+    cmd_str = " ".join(shlex.quote(str(x)) for x in cmd_list)
+    # Add debug info to verify environment
+    full_cmd = f"source {shlex.quote(conda_sh)} && conda activate mergenetic && echo '[DEBUG] Python in use:' $(which python) && {cmd_str}"
+    _logger.info("[_get_conda_activate_cmd] 构造的激活命令: %s", full_cmd)
+    
+    return ["bash", "-c", full_cmd]
+
+
 def _get_merge_log_file():
     """当前按天的合并日志文件路径"""
     os.makedirs(LOGS_DIR, exist_ok=True)
@@ -51,6 +87,28 @@ def _setup_logger():
         logger.addHandler(fh)
     logger.info("日志文件位置: %s", os.path.abspath(log_file))
     return logger
+
+
+def _load_prompt_cfg(prompt_yaml: str) -> dict:
+    """从 YAML 文件加载提示模板配置"""
+    try:
+        p = Path(prompt_yaml)
+        if not p.is_absolute():
+            # 尝试相对于 testset_repo/yaml 或项目根目录
+            if (Path(Config.PROJECT_ROOT) / "testset_repo" / "yaml" / p).exists():
+                p = Path(Config.PROJECT_ROOT) / "testset_repo" / "yaml" / p
+            else:
+                p = Path(Config.PROJECT_ROOT) / p
+        
+        if not p.exists():
+            _logger.warning("[_load_prompt_cfg] YAML 文件不存在: %s", p)
+            return {}
+            
+        with open(p, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        _logger.error("[_load_prompt_cfg] 加载 YAML 失败: %s", e)
+        return {}
 
 
 # 模块加载时设置 logger，供 run_merge_task 使用
@@ -166,6 +224,9 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
         "method": method,
         "dtype": dtype,
         "dataset": params.get("dataset", "hellaswag"),
+        "hf_dataset": params.get("hf_dataset"),
+        "hf_subset": params.get("hf_subset"),
+        "hf_split": params.get("hf_split"),
         "status": "pending",
     }
     meta_path = os.path.join(task_dir, "metadata.json")
@@ -173,6 +234,7 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     _logger.info("[run_merge_task] ========== 任务开始 ==========")
+    task_start_time = time.time()
     _logger.info("[run_merge_task] 任务ID: %s", task_id)
     _logger.info("[run_merge_task] 日志文件: %s", _get_merge_log_file())
     _logger.info("[run_merge_task] 参数: %s", json.dumps(params, ensure_ascii=False, indent=2))
@@ -180,6 +242,7 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
     def _write_error_status(err_msg: str):
         metadata["status"] = "error"
         metadata["error"] = err_msg
+        metadata["duration_seconds"] = time.time() - task_start_time
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, ensure_ascii=False, indent=2)
 
@@ -369,6 +432,7 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
             _logger.info("[run_merge_task] 未注册模型仓库（无 model_repo.api.register_merged_model）")
 
         metadata["status"] = "success"
+        metadata["duration_seconds"] = time.time() - task_start_time
         metadata["metrics"] = {
             "output_path": output_dir,
             "accuracy": None,
@@ -532,28 +596,51 @@ def run_recipe_apply_task(task_id, params, update_progress_callback, task_contro
 
         # 若输出在 output/task_id 下，移到 output
         inner = os.path.join(output_dir, task_id)
+        
+        # 确定源目录：优先尝试 inner，其次尝试 out_path，最后检查是否直接在 output_dir
+        source_dir = None
         if os.path.isdir(inner):
-            for name in os.listdir(inner):
-                src = os.path.join(inner, name)
+            source_dir = inner
+        elif out_path and str(out_path) != output_dir and os.path.isdir(str(out_path)):
+            source_dir = str(out_path)
+            
+        if source_dir:
+            _logger.info("[run_merge_task] 准备移动模型文件从 %s 到 %s", source_dir, output_dir)
+            for name in os.listdir(source_dir):
+                src = os.path.join(source_dir, name)
                 dst = os.path.join(output_dir, name)
-                if os.path.isfile(src):
-                    shutil.copy2(src, dst)
-                else:
-                    if os.path.exists(dst):
-                        shutil.rmtree(dst)
-                    shutil.copytree(src, dst)
-            shutil.rmtree(inner)
-        elif str(out_path) != output_dir and os.path.isdir(str(out_path)):
-            for name in os.listdir(str(out_path)):
-                src = os.path.join(str(out_path), name)
-                dst = os.path.join(output_dir, name)
-                if os.path.isfile(src):
-                    shutil.copy2(src, dst)
-                else:
-                    dest = os.path.join(output_dir, name)
-                    if os.path.exists(dest):
-                        shutil.rmtree(dest)
-                    shutil.copytree(src, dest)
+                
+                # 忽略自身目录（如果 source_dir 是 output_dir 的子目录，虽然 logic 上 inner 是子目录）
+                if os.path.abspath(src) == os.path.abspath(output_dir):
+                    continue
+
+                try:
+                    if os.path.islink(src) or os.path.isfile(src):
+                        if os.path.exists(dst):
+                            if os.path.isdir(dst):
+                                shutil.rmtree(dst)
+                            else:
+                                os.remove(dst)
+                        shutil.copy2(src, dst, follow_symlinks=True)
+                    elif os.path.isdir(src):
+                        if os.path.exists(dst):
+                            if os.path.isdir(dst):
+                                shutil.rmtree(dst)
+                            else:
+                                os.remove(dst)
+                        shutil.copytree(src, dst)
+                except Exception as move_err:
+                    _logger.warning("[run_merge_task] 移动文件失败 %s -> %s: %s", src, dst, move_err)
+            
+            # 尝试删除源目录
+            try:
+                shutil.rmtree(source_dir)
+            except Exception as rm_err:
+                _logger.warning("[run_merge_task] 删除源目录失败 %s: %s", source_dir, rm_err)
+                
+            _logger.info("[run_merge_task] ✅ 移动/清理完成")
+        else:
+            _logger.info("[run_merge_task] ✅ 未发现子目录结构，假设文件已在 output_dir")
 
         if not os.path.isdir(output_dir) or not any(
             f.endswith(".safetensors") or f == "config.json"
@@ -612,6 +699,8 @@ def _pick_latest_json(path):
         for root, _, files in os.walk(path):
             for fn in files:
                 if fn.lower().endswith(".json"):
+                    if fn in ("metadata.json", "progress.json"):
+                        continue
                     candidates.append(os.path.join(root, fn))
     if not candidates:
         return None
@@ -625,6 +714,354 @@ HF_DATASET_TO_LM_EVAL_TASK = {
     "cais/mmlu": "mmlu",
     "mmlu": "mmlu",
 }
+
+def _load_testsets_dict():
+    path = getattr(Config, "TESTSET_DATA_PATH", "") or os.path.join(Config.PROJECT_ROOT, "testset_repo", "data", "testsets.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("testsets") if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _resolve_prompt_yaml_for_testset(testset_id, hf_dataset, hf_subset):
+    if not testset_id:
+        return ""
+    testsets = _load_testsets_dict()
+    if not isinstance(testsets, dict):
+        return ""
+    for k, v in testsets.items():
+        tid = (v.get("testset_id") or k or "").strip()
+        if tid == testset_id:
+            p = (v.get("yaml_template_path") or "").strip()
+            return p
+    return ""
+
+def _normalize_answer_text(s):
+    if s is None:
+        return ""
+    t = str(s)
+    t = t.replace(",", " ").replace("\n", " ").replace("\t", " ")
+    t = t.strip()
+    t = t.rstrip(".").rstrip("。")
+    return t
+
+def _extract_gsm8k_predicted_answer(text):
+    if not text:
+        return ""
+    s = str(text)
+    m = re.search(r"final\\s+answer\\s+is\\s*:\\s*(?:\\\\boxed\\{)?([^\\}\\n]+)\\}?", s, flags=re.IGNORECASE)
+    if m:
+        return _normalize_answer_text(m.group(1))
+    m2 = re.search(r"\\boxed\\{([^\\}]+)\\}", s)
+    if m2:
+        return _normalize_answer_text(m2.group(1))
+    # 如果没有 boxed，尝试提取文本中出现的最后一个数字
+    nums = re.findall(r"(-?\d+(?:\.\d+)?)", s)
+    if nums:
+        return _normalize_answer_text(nums[-1])
+    return _normalize_answer_text(s.splitlines()[-1] if s.splitlines() else s)
+
+def run_yaml_eval_stream(
+    model_path,
+    output_path,
+    callback,
+    start_prog,
+    end_prog,
+    task_control=None,
+    hf_dataset=None,
+    hf_subset=None,
+    hf_split=None,
+    prompt_yaml_path=None,
+    limit="0.5",
+):
+    import math
+    _logger.info("[YAML] run_yaml_eval_stream 启动. Python executable: %s", sys.executable)
+    if task_control is None:
+        task_control = {}
+    os.makedirs(output_path, exist_ok=True)
+    try:
+        import yaml as _yaml
+    except Exception:
+        raise RuntimeError("缺少 yaml 解析依赖")
+    try:
+        from datasets import load_dataset as _load_dataset
+    except Exception as e:
+        raise RuntimeError("缺少 datasets 依赖: %s" % e)
+    try:
+        import torch as _torch
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+    except Exception as e:
+        raise RuntimeError("缺少 transformers 依赖: %s" % e)
+    cache_dir = getattr(Config, "HF_DATASETS_CACHE", None) or os.environ.get("HF_DATASETS_CACHE")
+    ds = None
+    if hf_dataset:
+        splits_to_try = [hf_split] if hf_split else ["test", "validation", "train"]
+        error_msgs = []
+        for sp in splits_to_try:
+            if not sp: continue
+            try:
+                if hf_subset:
+                    ds = _load_dataset(hf_dataset, hf_subset, split=sp, trust_remote_code=True, cache_dir=cache_dir)
+                else:
+                    ds = _load_dataset(hf_dataset, split=sp, trust_remote_code=True, cache_dir=cache_dir)
+                if ds:
+                    _logger.info("[YAML] 成功加载数据集 %s (subset=%s, split=%s)", hf_dataset, hf_subset, sp)
+                    break
+            except Exception as e:
+                error_msgs.append(f"{sp}: {e}")
+        
+        if ds is None:
+            raise RuntimeError("加载数据集失败: %s. 尝试splits: %s. Errors: %s" % (hf_dataset, splits_to_try, "; ".join(error_msgs)))
+    n = 0
+    if ds is None:
+        raise RuntimeError("数据集无效")
+    try:
+        n = len(ds)
+    except Exception:
+        try:
+            keys_list = list(ds.keys())
+            if keys_list:
+                n = len(ds[keys_list[0]]) if hasattr(ds[keys_list[0]], "__len__") else 0
+                ds = ds[keys_list[0]]
+        except Exception:
+            pass
+    if n <= 0:
+        raise RuntimeError("数据集样本为空")
+    
+    # Ensure dataset is indexable or convert to list
+    if not hasattr(ds, "__getitem__") or hasattr(ds, "next"): # Check if iterable/streaming
+         try:
+             _logger.info("[YAML] Converting iterable dataset to list for random access...")
+             ds = list(ds)
+         except Exception as e:
+             _logger.warning("[YAML] Failed to convert dataset to list: %s", e)
+
+    limit_val = 1.0
+    try:
+        if isinstance(limit, str) and "." in limit:
+            limit_val = max(0.01, min(1.0, float(limit)))
+        else:
+            ival = int(limit)
+            limit_val = min(1.0, max(0.01, ival / float(max(1, n))))
+    except Exception:
+        limit_val = 1.0
+    target_n = max(1, int(math.ceil(n * limit_val)))
+    try:
+        with open(prompt_yaml_path, "r", encoding="utf-8") as f:
+            prompt_cfg = _yaml.safe_load(f)
+    except Exception as e:
+        raise RuntimeError("读取 YAML 失败: %s" % e)
+    tasks_cfg = prompt_cfg.get("tasks") or []
+    field_spec = {}
+    template_text = ""
+    if tasks_cfg:
+        t0 = tasks_cfg[0]
+        field_spec = t0.get("field_spec") or {}
+        solvers = t0.get("solvers") or []
+        for s in solvers:
+            if (s.get("name") or "").strip() == "prompt_template":
+                args = s.get("args") or {}
+                template_text = (args.get("template") or "").strip()
+                break
+    input_field = (field_spec.get("input") or "question").strip()
+    target_field = (field_spec.get("target") or "answer").strip()
+    if not template_text:
+        template_text = "{prompt}"
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            
+        device = "cuda" if _torch.cuda.is_available() else "cpu"
+        # 针对 Qwen 系列模型，避免使用 float16，改用 bfloat16 或 float32 以防止输出乱码
+        base_name = os.path.basename(str(model_path)).lower()
+        
+        dtype = _torch.float16 if device == "cuda" else _torch.float32
+        if "qwen" in base_name and device == "cuda":
+            # 优先尝试 bfloat16
+            try:
+                if _torch.cuda.is_bf16_supported():
+                    dtype = _torch.bfloat16
+                else:
+                    dtype = _torch.float32
+            except Exception:
+                # 如果 pytorch 版本过低不支持 is_bf16_supported，安全起见使用 float32
+                dtype = _torch.float32
+                
+        _logger.info("[YAML] Loading model %s with dtype=%s, device=%s", base_name, dtype, device)
+            
+        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, device_map=device, torch_dtype=dtype)
+        model.eval()
+    except Exception as e:
+        raise RuntimeError("加载模型失败: %s" % e)
+    start_time = time.time()
+    correct = 0
+    total = 0
+    per_task_acc = {}
+    import math  # Fix for 'name math is not defined'
+    progress_path = os.path.join(output_path, "progress.json")
+    samples_log_path = os.path.join(output_path, "samples_yaml.jsonl")
+    
+    _logger.info("[YAML] 开始评估，目标样本数: %d, 模型: %s", target_n, model_path)
+    
+    # 准备写入 samples 日志
+    f_samples = open(samples_log_path, "w", encoding="utf-8")
+    
+    try:
+        # 检查字段是否存在
+        if target_n > 0:
+            first_ex = None
+            try:
+                first_ex = ds[0]
+            except Exception:
+                pass
+            if first_ex:
+                if input_field not in first_ex:
+                    _logger.warning("[YAML] 警告: 数据集首条样本缺少 input_field '%s'. 现有字段: %s", input_field, list(first_ex.keys()))
+                if target_field not in first_ex:
+                    _logger.warning("[YAML] 警告: 数据集首条样本缺少 target_field '%s'. 现有字段: %s", target_field, list(first_ex.keys()))
+
+        for i in range(target_n):
+            if task_control.get("aborted"):
+                raise RuntimeError("任务已被用户手动终止")
+            try:
+                ex = ds[i]
+            except Exception as e:
+                _logger.warning("[YAML] 获取样本 %d 失败: %s", i, e)
+                continue
+                
+            q = ex.get(input_field)
+            g = ex.get(target_field)
+            inp_text = template_text.replace("{prompt}", str(q))
+            try:
+                ids = tokenizer(inp_text, return_tensors="pt").to(device)
+                with _torch.no_grad():
+                    # 增加 repetition_penalty 和 pad_token_id 以防止死循环输出
+                    out = model.generate(
+                        **ids, 
+                        max_new_tokens=256, 
+                        do_sample=False, 
+                        pad_token_id=tokenizer.pad_token_id,
+                        repetition_penalty=1.1
+                    )
+                pred_text = tokenizer.batch_decode(out, skip_special_tokens=True)[0]
+                # 尝试移除 prompt 部分
+                if pred_text.startswith(inp_text):
+                    pred_text = pred_text[len(inp_text):]
+            except Exception as gen_err:
+                _logger.warning("[YAML] 生成失败: %s", gen_err)
+                pred_text = ""
+            
+            # 根据数据集类型选择解析策略
+            if hf_dataset and "gsm8k" in hf_dataset.lower():
+                pred_norm = _extract_gsm8k_predicted_answer(pred_text)
+                # 针对 GSM8K，移除数值中的空格（原 normalize 将逗号转为空格），以便 "1 000" 能匹配 "1000"
+                if pred_norm:
+                    pred_norm = pred_norm.replace(" ", "")
+                
+                # 提取 Gold Answer (通常在 #### 之后)
+                gold_str = str(g)
+                if "####" in gold_str:
+                    gold_norm = _normalize_answer_text(gold_str.split("####")[-1])
+                else:
+                    gold_norm = _normalize_answer_text(g)
+                if gold_norm:
+                    gold_norm = gold_norm.replace(" ", "")
+            else:
+                # 通用处理：简单的清理
+                pred_norm = _normalize_answer_text(pred_text)
+                # 尝试提取第一个非空行作为答案（针对 MMLU 等）
+                if not pred_norm and pred_text:
+                     lines = [l.strip() for l in pred_text.splitlines() if l.strip()]
+                     if lines:
+                         pred_norm = _normalize_answer_text(lines[0])
+                gold_norm = _normalize_answer_text(g)
+            is_correct = False
+            # 宽松匹配：如果是 MMLU (单个字母)，做大小写不敏感匹配
+            if pred_norm and gold_norm:
+                if pred_norm == gold_norm:
+                    is_correct = True
+                elif len(gold_norm) == 1 and len(pred_norm) == 1 and pred_norm.lower() == gold_norm.lower():
+                    is_correct = True
+                # 尝试包含匹配 (例如 pred="Answer: A", gold="A")
+                elif len(gold_norm) == 1 and gold_norm.lower() in pred_norm.lower().split():
+                     is_correct = True
+            
+            if is_correct:
+                correct += 1
+            total += 1
+            
+            # 记录 sample
+            try:
+                log_entry = {
+                    "i": i,
+                    "input": str(q),
+                    "gold": str(g),
+                    "pred_raw": pred_text,
+                    "pred_norm": pred_norm,
+                    "gold_norm": gold_norm,
+                    "correct": is_correct
+                }
+                f_samples.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+                f_samples.flush()
+            except Exception:
+                pass
+
+            # 更新进度
+            if i % max(1, int(target_n / 50)) == 0 or i == target_n - 1:
+                elapsed = time.time() - start_time
+                eta = (elapsed / (i + 1)) * (target_n - (i + 1))
+                prog_data = {
+                    "current": i + 1,
+                    "total": target_n,
+                    "percent": round((i + 1) / target_n * 100, 1),
+                    "eta_seconds": int(eta),
+                    "status": "running"
+                }
+                try:
+                    with open(progress_path, "w") as f_prog:
+                        json.dump(prog_data, f_prog)
+                except Exception:
+                    pass
+    except Exception as e:
+        _logger.error("[YAML] 评估循环异常: %s", e)
+        raise e
+    finally:
+        f_samples.close()
+
+    if total == 0 and target_n > 0:
+        msg = f"评估失败: 未成功处理任何样本 (target={target_n}, total={total}). 请检查数据集字段是否匹配."
+        _logger.error("[YAML] %s", msg)
+        raise RuntimeError(msg)
+
+    duration = time.time() - start_time
+    throughput = total / duration if duration > 0 else 0.0
+    acc_val = (correct / max(1, total)) if total > 0 else 0.0
+    task_key = "gsm8k" if (hf_dataset and "gsm8k" in hf_dataset.lower()) else (hf_dataset or "task")
+    per_task_acc[task_key] = round(acc_val * 100, 2)
+    context_len = _eval_get_context_length(model_path)
+    try:
+        del model
+    except Exception:
+        pass
+    try:
+        import torch as _torch2
+        if hasattr(_torch2.cuda, "empty_cache"):
+            _torch2.cuda.empty_cache()
+    except Exception:
+        pass
+    return {
+        "acc": round(acc_val * 100, 2),
+        "f1": round(acc_val, 4),
+        "samples": int(total),
+        "time": round(duration, 2),
+        "throughput": round(throughput, 2),
+        "context": int(context_len or 0),
+        "per_task_acc": per_task_acc
+    }
 
 
 def _load_eval_task_mapping():
@@ -942,6 +1379,248 @@ def _auto_discover_lm_eval_task(hf_dataset, hf_subset=None):
     return None
 
 
+def _find_or_download_eval_yaml(hf_dataset, hf_subset):
+    """
+    尝试查找或下载数据集对应的 eval.yaml。
+    查找顺序：
+    1. testset_repo/yaml 下的缓存文件
+    2. ~/.cache/huggingface/hub 下的数据集快照
+    3. 从 HuggingFace Hub 下载
+    返回: YAML 文件绝对路径 或 None
+    """
+    try:
+        # Ensure mirror is used
+        os.environ["HF_ENDPOINT"] = Config.HF_ENDPOINT
+        from huggingface_hub import hf_hub_download, list_repo_files
+    except ImportError:
+        _logger.warning("[eval] huggingface_hub 未安装，无法自动下载 YAML")
+        return None
+
+    # 规范化命名：openai/gsm8k -> openai___gsm8k__main__eval.yaml
+    # 注意：需与 testsets.json 中的命名习惯保持一致或兼容
+    subset_str = hf_subset if hf_subset else "default"
+    safe_base = f"{hf_dataset.replace('/', '___')}__{subset_str.replace('-', '_')}"
+    repo_yaml_dir = Path(Config.PROJECT_ROOT) / "testset_repo" / "yaml"
+    repo_yaml_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 1. 检查 testset_repo 缓存 (支持 yaml, py, md)
+    for ext in ["eval.yaml", ".py", ".md"]:
+        # 构造可能的文件名模式
+        # 1. {safe_base}__eval.yaml / {safe_base}__{filename}
+        # 2. 直接查找以 safe_base 开头的文件
+        candidates = []
+        for f in os.listdir(repo_yaml_dir):
+            if f.startswith(safe_base + "__") and (f.endswith(ext) or (ext == ".py" and f.endswith(".py"))):
+                candidates.append(f)
+        
+        if candidates:
+            # 优先选择匹配度高的
+            # 这里简单返回第一个找到的
+            return str(repo_yaml_dir / candidates[0])
+        
+    # Simplify: Check if we have mapped this dataset before in testsets.json?
+    # No, we are in discover mode.
+    
+    # Let's search directory for matching prefix
+    for f in os.listdir(repo_yaml_dir):
+        if f.startswith(safe_base + "__"):
+             return str(repo_yaml_dir / f)
+
+    # 2. 检查 HuggingFace Hub 缓存 (snapshots)
+    try:
+        dataset_cache_path = Path(Config.EVAL_HF_DATASETS_CACHE) / f"{hf_dataset.replace('/', '___')}"
+        if dataset_cache_path.exists():
+            _logger.info("[eval] 检查 HF 数据集缓存: %s", dataset_cache_path)
+            for snapshot in dataset_cache_path.iterdir():
+                if snapshot.is_dir():
+                    # 查找优先级: eval.yaml > hendrycks_test.py > {dataset}.py > *.py > README.md
+                    candidates = []
+                    
+                    # 1. eval.yaml
+                    if (snapshot / "eval.yaml").exists():
+                        candidates.append(("eval.yaml", 100))
+                    
+                    # 2. .py files
+                    py_files = list(snapshot.glob("*.py"))
+                    for py in py_files:
+                        if py.name == "hendrycks_test.py":
+                            candidates.append((py.name, 90))
+                        elif py.name == f"{hf_dataset.split('/')[-1]}.py":
+                            candidates.append((py.name, 80))
+                        else:
+                            candidates.append((py.name, 50))
+                            
+                    # 3. README.md
+                    if (snapshot / "README.md").exists():
+                        candidates.append(("README.md", 10))
+                    
+                    if candidates:
+                        # Sort by priority
+                        candidates.sort(key=lambda x: x[1], reverse=True)
+                        best_file = candidates[0][0]
+                        source_path = snapshot / best_file
+                        
+                        _logger.info("[eval] 在 HF Cache 找到配置文件: %s", source_path)
+                        
+                        # 复制到 testset_repo/yaml 并重命名
+                        dest_name = f"{safe_base}__{best_file}"
+                        dest_path = repo_yaml_dir / dest_name
+                        shutil.copy2(source_path, dest_path)
+                        return str(dest_path)
+    except Exception as e:
+        _logger.debug("[eval] 检查 HF Cache 失败: %s", e)
+    
+    # 3. 从 HF 下载
+    try:
+        _logger.info("[eval] 正在查询 HF 仓库文件列表: %s", hf_dataset)
+        repo_files = list_repo_files(repo_id=hf_dataset, repo_type="dataset")
+        
+        target_file = None
+        if "eval.yaml" in repo_files:
+            target_file = "eval.yaml"
+        else:
+            # 优先查找 .py (如 hendrycks_test.py)
+            py_files = [f for f in repo_files if f.endswith(".py")]
+            if py_files:
+                # 优先匹配 hendrycks_test.py (MMLU) 或 与数据集同名
+                if "hendrycks_test.py" in py_files:
+                    target_file = "hendrycks_test.py"
+                else:
+                    dataset_name = hf_dataset.split("/")[-1]
+                    if f"{dataset_name}.py" in py_files:
+                        target_file = f"{dataset_name}.py"
+                    else:
+                        target_file = py_files[0]
+            elif "README.md" in repo_files:
+                target_file = "README.md"
+        
+        if target_file:
+            _logger.info("[eval] 发现配置文件: %s", target_file)
+            local_path = hf_hub_download(repo_id=hf_dataset, filename=target_file, repo_type="dataset")
+            
+            # 复制到 testset_repo/yaml 并重命名
+            # 命名格式: {safe_base}__{filename}
+            dest_name = f"{safe_base}__{target_file}"
+            dest_path = repo_yaml_dir / dest_name
+            shutil.copy2(local_path, dest_path)
+            _logger.info("[eval] 已部署配置文件到: %s", dest_path)
+            return str(dest_path)
+            
+    except Exception as e:
+        _logger.warning("[eval] 自动下载失败: %s", e)
+
+    return None
+
+
+def _prepare_custom_eval_task(hf_dataset, hf_subset, hf_split, task_dir):
+    """
+    检查是否有自定义 YAML 模板，若有则生成临时 lm_eval 任务 YAML。
+    返回 (task_name, include_path) 或 (None, None)。
+    """
+    try:
+        testsets_path = Path(Config.PROJECT_ROOT) / "testset_repo" / "data" / "testsets.json"
+        
+        target_entry = None
+        if testsets_path.exists():
+            with open(testsets_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.get("testsets", {}).items():
+                if v.get("hf_dataset") == hf_dataset and v.get("hf_subset") == hf_subset:
+                    target_entry = v
+                    break
+        
+        yaml_path = None
+        if target_entry:
+            yaml_path = target_entry.get("yaml_template_path")
+            
+        # 如果未配置或文件不存在，尝试自动查找/下载
+        if not yaml_path or not os.path.exists(yaml_path):
+             found = _find_or_download_eval_yaml(hf_dataset, hf_subset)
+             if found:
+                 yaml_path = found
+        
+        if not yaml_path:
+            return None, None
+            
+        # 简单检查文件扩展名
+        if yaml_path.endswith(".py"):
+             _logger.info("[eval] 发现 Python 配置文件: %s，将作为 include_path 使用", yaml_path)
+             return None, os.path.dirname(yaml_path)
+
+        if not (yaml_path.endswith(".yaml") or yaml_path.endswith(".yml")):
+             _logger.info("[eval] 发现非 YAML 配置文件: %s，跳过自动任务生成", yaml_path)
+             return None, None
+
+        cfg = _load_prompt_cfg(yaml_path)
+        if not cfg:
+            return None, None
+            
+        # 提取模板
+        solvers = cfg.get("solvers", [])
+        template_str = None
+        for s in solvers:
+            if s.get("name") == "prompt_template":
+                template_str = s.get("args", {}).get("template")
+                break
+        
+        if not template_str:
+            return None, None
+            
+        # 提取字段映射
+        field_spec = cfg.get("field_spec", {})
+        input_field = field_spec.get("input", "question")
+        target_field = field_spec.get("target", "answer")
+        
+        # 构造 doc_to_text
+        # 将 {prompt} 替换为 {{input_field}}
+        # 注意：YAML 中的 {prompt} 可能是 python format 风格，而 lm_eval 使用 Jinja2
+        doc_to_text = template_str.replace("{prompt}", "{{%s}}" % input_field)
+        
+        # 构造任务定义
+        # 我们创建一个继承自 huggingface 自动配置的任务
+        # 或者尽可能复用已有信息
+        safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", f"{hf_dataset}_{hf_subset}")
+        
+        task_def = {
+            "task": safe_name,
+            "dataset_path": hf_dataset,
+            "dataset_name": hf_subset if hf_subset else None,
+            "output_type": "generate_until",
+            "training_split": "train",
+            "test_split": hf_split or "test",
+            "doc_to_text": doc_to_text,
+            "doc_to_target": "{{%s}}" % target_field,
+            # 添加默认的 generation_kwargs
+            "generation_kwargs": {
+                "until": ["\n\n", "Therefore"], # 简单的停止词，防止无限生成
+                "do_sample": False,
+                "temperature": 0.0
+            },
+             # 如果是 math 任务，通常需要 regex 提取
+            "metric_list": [
+                {"metric": "exact_match", "aggregation": "mean", "higher_is_better": True}
+            ]
+        }
+        
+        # 清理 None 值
+        task_def = {k: v for k, v in task_def.items() if v is not None}
+        
+        # 写入临时文件
+        custom_yaml_dir = Path(task_dir) / "custom_tasks"
+        custom_yaml_dir.mkdir(parents=True, exist_ok=True)
+        custom_yaml_path = custom_yaml_dir / f"{safe_name}.yaml"
+        
+        with open(custom_yaml_path, "w", encoding="utf-8") as f:
+            yaml.dump(task_def, f, allow_unicode=True)
+            
+        _logger.info("[eval] 已生成自定义任务 YAML: %s (基于 %s)", custom_yaml_path, yaml_path)
+        return safe_name, str(custom_yaml_dir)
+        
+    except Exception as e:
+        _logger.warning("[eval] 生成自定义任务失败: %s", e)
+        return None, None
+
+
 def run_lm_eval_stream(
     model_path,
     output_path,
@@ -955,6 +1634,7 @@ def run_lm_eval_stream(
     hf_subset=None,
     hf_split=None,
     lm_eval_task=None,
+    custom_include_path=None,
     sampling="sequential",
 ):
     """
@@ -976,7 +1656,13 @@ def run_lm_eval_stream(
     except Exception:
         task_groups_set = set()
     
-    if (lm_eval_task or "").strip():
+    # 尝试生成自定义任务（基于 YAML 模板）
+    custom_task_name, custom_include_path = _prepare_custom_eval_task(hf_dataset, hf_subset, hf_split, output_path)
+    if custom_task_name:
+        task_name = custom_task_name
+        _logger.info("[eval] 使用自定义任务: %s (include_path=%s)", task_name, custom_include_path)
+    
+    if (lm_eval_task or "").strip() and not custom_task_name:
         task_name = (lm_eval_task or "").strip()
     elif (hf_dataset or "").strip():
         # 测试集仓库分支：先查部署用映射文件，再内置映射，最后按 MMLU 规则推断
@@ -1043,7 +1729,8 @@ def run_lm_eval_stream(
             raise ValueError(error_msg + "。请检查测试集配置或添加任务映射到 config/eval_task_mapping.json")
     
     # 最终验证：确保任务名不是任务组（使用之前获取的 task_groups_set）
-    if task_name and task_name.strip():
+    # 如果 task_name 包含逗号，说明是任务列表，跳过验证直接传递给 CLI
+    if task_name and task_name.strip() and "," not in task_name:
         if task_groups_set and task_name in task_groups_set:
             error_msg = f"任务名 '{task_name}' 是任务组而非具体任务，无法使用。请使用具体任务名或添加任务映射。"
             _logger.error("[eval] %s", error_msg)
@@ -1078,9 +1765,13 @@ def run_lm_eval_stream(
         target_tasks_list = [task_name]
         cmd_task_str = task_name
 
+    # 改进：不再依赖当前环境的 torch 判断设备，而是检查系统是否有 GPU (nvidia-smi)
+    # 因为后端环境可能没有 torch，但目标环境 (mergenetic) 有 GPU
     try:
-        device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+        subprocess.check_call("nvidia-smi", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        device = "cuda"
     except Exception:
+        _logger.warning("[eval] 未检测到 GPU (nvidia-smi 失败)，回退到 CPU")
         device = "cpu"
 
     # 注意：当前版本的 lm_eval CLI 可能不支持 --samples 参数
@@ -1099,14 +1790,28 @@ def run_lm_eval_stream(
     model_args = "pretrained=%s,trust_remote_code=True" % model_path
     try:
         base_name = os.path.basename(str(model_path)).lower()
-        if "qwen" in base_name:
-            # 仅对 Qwen 系列显式指定 dtype=float16，避免 bf16 下的异常输出
-            model_args += ",dtype=float16"
+        if "qwen" in base_name and "math" in base_name:
+            # Qwen2.5 Math 在 RTX 4090 (bf16) 上表现正常，强制 float16 反而导致溢出 (!!!!)
+            # 因此移除之前的强制 float16 逻辑，让其使用默认的 bfloat16
+            # model_args += ",dtype=float16"
+            # _logger.info("[eval] 检测到 Qwen Math 模型，强制 dtype=float16 以避免生成异常")
+            pass
     except Exception:
         pass
 
+    # 尝试使用 MERGENETIC_PYTHON 所在环境的 lm_eval
+    lm_eval_bin = "lm_eval"
+    if MERGENETIC_PYTHON and os.path.isabs(MERGENETIC_PYTHON):
+        bin_dir = os.path.dirname(MERGENETIC_PYTHON)
+        candidate = os.path.join(bin_dir, "lm_eval")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            lm_eval_bin = candidate
+            _logger.info("[eval] 使用指定环境的 lm_eval: %s", lm_eval_bin)
+        else:
+            _logger.warning("[eval] 未在 %s 找到 lm_eval，将尝试系统 PATH", bin_dir)
+
     cmd = [
-        "lm_eval", "--model", "hf",
+        lm_eval_bin, "--model", "hf",
         "--model_args", model_args,
         "--tasks", cmd_task_str,
         "--device", device,
@@ -1114,9 +1819,16 @@ def run_lm_eval_stream(
         "--output_path", output_path,
         "--log_samples",
     ]
+    
+    if custom_include_path:
+        cmd.extend(["--include_path", custom_include_path])
+
     # 使用 --limit 参数（顺序采样和随机采样都使用 limit，因为 CLI 不支持 --samples）
     if str(limit) != "1.0":
         cmd.extend(["--limit", str(limit)])
+
+    # Wrap with conda activate
+    cmd = _get_conda_activate_cmd(cmd)
 
     eval_cache = getattr(Config, "EVAL_HF_DATASETS_CACHE", None) or os.path.join(Config.PROJECT_ROOT, "cache", "eval_datasets")
     os.makedirs(eval_cache, exist_ok=True)
@@ -1139,26 +1851,157 @@ def run_lm_eval_stream(
     last_update_time = 0.0
     last_lines = []
     max_tail = 40
+    last_count = 0
+    total_count = 0
+    last_rate = 0.0
+    last_rate_time = 0.0
+    pct = None
+    progress_path = os.path.join(output_path, "progress.json")
+    
+    # 使用字符级读取以处理 \r (tqdm 进度条)
+    buf = []
     while True:
         if task_control.get("aborted"):
             ProcessManager.kill_process_tree(process)
             raise RuntimeError("任务已被用户手动终止")
-        line = process.stdout.readline() if process.stdout else ""
-        if not line and process.poll() is not None:
-            break
-        if line:
-            _logger.info("[eval] %s", line.rstrip())
-            last_lines.append(line.rstrip())
+        
+        char = process.stdout.read(1)
+        if not char:
+            if process.poll() is not None:
+                break
+            continue
+
+        if char != '\n' and char != '\r':
+            buf.append(char)
+            continue
+            
+        # 遇到换行或回车，处理当前缓冲区作为一行
+        line = "".join(buf)
+        buf = []
+        
+        # 即使是空行也继续处理（虽然下面 check 了 line）
+        if True: # 保持缩进结构
+            _logger.info("[eval] %s", line)
+            last_lines.append(line)
             if len(last_lines) > max_tail:
                 last_lines.pop(0)
             now = time.time()
             if now - last_update_time > 0.5:
                 clean = line.strip()[:80]
                 if clean:
-                    callback(start_prog, "[%s] %s" % (cmd_task_str, clean))
+                    prog_val = start_prog
+                    m = re.search(r"(\d+)\s*%\s*\|\s*(\d+)\s*/\s*(\d+)", line)
+                    if m:
+                        try:
+                            pct = int(m.group(1))
+                            span = max(0, int(end_prog) - int(start_prog))
+                            prog_val = int(start_prog) + int((span * pct) / 100)
+                            if prog_val > int(end_prog):
+                                prog_val = int(end_prog)
+                            total_count = int(m.group(3))
+                            last_count = int(m.group(2))
+                        except Exception:
+                            prog_val = start_prog
+                    else:
+                        # Try evolutionary pattern: "Generation 5/10"
+                        m3 = re.search(r"Generation\s+(\d+)\s*/\s*(\d+)", line, re.IGNORECASE)
+                        if m3:
+                            try:
+                                cur = int(m3.group(1))
+                                tot = int(m3.group(2))
+                                pct = int((cur * 100) / max(1, tot))
+                                total_count = tot
+                                last_count = cur
+                            except:
+                                pass
+                                
+                        m2 = re.search(r"(\d+)\s*/\s*(\d+).*?it/s", line)
+                        if m2:
+                            try:
+                                cur = int(m2.group(1))
+                                tot = max(1, int(m2.group(2)))
+                                pct = int((cur * 100) / tot)
+                                span = max(0, int(end_prog) - int(start_prog))
+                                prog_val = int(start_prog) + int((span * pct) / 100)
+                                if prog_val > int(end_prog):
+                                    prog_val = int(end_prog)
+                                total_count = tot
+                                last_count = cur
+                            except Exception:
+                                prog_val = start_prog
+                    r = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*it/s", line)
+                    if r:
+                        try:
+                            last_rate = float(r.group(1))
+                            last_rate_time = now
+                        except Exception:
+                            pass
+                    eta_txt = ""
+                    rate = last_rate
+                    if rate <= 0 and total_count > 0 and last_count > 0:
+                        dt = max(0.1, now - (last_rate_time or (now - 1)))
+                        rate = (last_count / dt) if dt > 0 else 0.0
+                    if rate > 0 and total_count > 0 and last_count >= 0 and total_count >= last_count:
+                        remain = (total_count - last_count) / rate
+                        mins = int(remain // 60)
+                        secs = int(remain % 60)
+                        eta_txt = " ETA %d:%02d" % (mins, secs)
+                    # 始终写入进度快照（即使速率未知），以便前端刷新早期阶段的进度
+                    try:
+                        if total_count > 0:
+                            # Read existing first to preserve custom fields (like best_genotype/current_best)
+                            existing_pd = {}
+                            if os.path.exists(progress_path):
+                                try:
+                                    with open(progress_path, "r", encoding="utf-8") as f:
+                                        existing_pd = json.load(f)
+                                except:
+                                    pass
+
+                            pd = {
+                                "status": "running",
+                                "current": int(last_count),
+                                "total": int(total_count),
+                                "percent": int(max(0, min(100, pct))) if isinstance(pct, int) else (int((last_count * 100) / max(1, total_count)) if total_count > 0 else 0),
+                            }
+                            if rate > 0 and total_count > 0 and last_count >= 0 and total_count >= last_count:
+                                pd["eta_seconds"] = float((total_count - last_count) / rate)
+                            
+                            existing_pd.update(pd)
+                            
+                            with open(progress_path, "w", encoding="utf-8") as f:
+                                json.dump(existing_pd, f, ensure_ascii=False)
+                    except Exception:
+                        pass
+                    callback(prog_val, "[%s] %s%s" % (cmd_task_str, clean, eta_txt))
                 last_update_time = now
     process.wait()
     duration = time.time() - start_time
+
+    # Fix: Ensure progress is marked as completed/failed at the end
+    try:
+        final_status = "completed" if process.returncode == 0 else "failed"
+        final_percent = 100 if process.returncode == 0 else 0
+        
+        # Read existing to preserve evolutionary data
+        existing_data = {}
+        if os.path.exists(progress_path):
+            try:
+                with open(progress_path, "r", encoding="utf-8") as f:
+                    existing_data = json.load(f)
+            except:
+                pass
+        
+        existing_data.update({
+            "status": final_status,
+            "percent": final_percent if final_status == "completed" else existing_data.get("percent", 0),
+            "eta_seconds": 0
+        })
+        
+        with open(progress_path, "w", encoding="utf-8") as f:
+            json.dump(existing_data, f, ensure_ascii=False)
+    except Exception as e:
+        _logger.warning("[eval] Failed to write final progress: %s", e)
 
     def _fail_msg(tip):
         tail = "\n".join(last_lines[-30:]) if last_lines else ""
@@ -1191,8 +2034,10 @@ def run_lm_eval_stream(
         total_samples = 0
         valid_tasks_count = 0
         per_task_acc = {}
+        _logger.info("[eval] DEBUG: target_tasks_list=%s", target_tasks_list)
         for t in target_tasks_list:
             task_res = raw_results.get(t, {})
+            _logger.info("[eval] DEBUG: checking task %s, found in results: %s", t, t in raw_results)
             curr_acc = 0.0
             found = False
             for key in (
@@ -1216,14 +2061,37 @@ def run_lm_eval_stream(
             if "n-samples" in data and t in data["n-samples"]:
                 s = data["n-samples"][t]
                 curr_samples = s.get("effective", 0) if isinstance(s, dict) else int(s)
+                _logger.info("[eval] DEBUG: Found n-samples for %s: %s (effective=%s)", t, s, curr_samples)
             elif "n_samples" in data and t in data.get("n_samples", {}):
                 s = data["n_samples"][t]
                 curr_samples = s.get("effective", 0) if isinstance(s, dict) else int(s)
+                _logger.info("[eval] DEBUG: Found n_samples for %s: %s", t, s)
             elif task_res.get("n_samples") is not None:
                 curr_samples = int(task_res["n_samples"])
+                _logger.info("[eval] DEBUG: Found task_res n_samples for %s: %s", t, curr_samples)
+            else:
+                _logger.warning("[eval] DEBUG: No n-samples found for %s. Keys in data: %s", t, list(data.keys()))
             total_samples += curr_samples
 
         avg_acc = (total_acc / valid_tasks_count) if valid_tasks_count > 0 else 0.0
+        
+        # 尝试从 samples_*.jsonl 文件修正 total_samples
+        if total_samples == 0:
+            try:
+                jsonl_files = [f for f in os.listdir(output_path) if f.startswith("samples_") and f.endswith(".jsonl")]
+                if jsonl_files:
+                    # 取最新的文件
+                    jsonl_files.sort(key=lambda x: os.path.getmtime(os.path.join(output_path, x)), reverse=True)
+                    latest_jsonl = os.path.join(output_path, jsonl_files[0])
+                    with open(latest_jsonl, "r", encoding="utf-8") as jf:
+                        # 计算行数 (排除空行)
+                        line_count = sum(1 for line in jf if line.strip())
+                        if line_count > 0:
+                            total_samples = line_count
+                            _logger.info("[eval] 从 jsonl 文件修正 samples count: %s", total_samples)
+            except Exception as e:
+                _logger.warning("[eval] 尝试从 jsonl 统计样本数失败: %s", e)
+
         if total_samples == 0:
             total_samples = int(data.get("config", {}).get("limit", 0)) * len(target_tasks_list)
         context_len = _eval_get_context_length(model_path)
@@ -1304,44 +2172,106 @@ def run_eval_only_task(task_id, params, update_progress_callback, task_control=N
         display_task = "Standard Benchmark" if (dataset_name == "all" and not hf_dataset) else dataset_name
         update_progress_callback(30, "正在启动评估 (%s)..." % display_task)
 
-        metrics = run_lm_eval_stream(
-            model_path,
-            task_dir,
-            dataset_name,
-            update_progress_callback,
-            30,
-            95,
-            task_control,
-            limit=limit_val,
-            hf_dataset=hf_dataset,
-            hf_subset=hf_subset,
-            hf_split=hf_split,
-            lm_eval_task=(params.get("lm_eval_task") or "").strip() or None,
-            sampling=(params.get("sampling") or "sequential").strip() or "sequential",
-        )
+        prompt_yaml = _resolve_prompt_yaml_for_testset(params.get("testset_id"), hf_dataset, hf_subset)
+        use_yaml = bool(prompt_yaml and os.path.isfile(prompt_yaml) and (prompt_yaml.endswith(".yaml") or prompt_yaml.endswith(".yml")))
+        if use_yaml:
+            metadata["yaml_template"] = prompt_yaml
+            with open(os.path.join(task_dir, "metadata.json"), "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+            
+            # 直接调用 lm_eval，不再使用 eval_worker.py 避免递归死循环
+            # 解析任务名和包含路径
+            custom_task_name = os.path.splitext(os.path.basename(prompt_yaml))[0]
+            custom_include_path = os.path.dirname(prompt_yaml)
+            
+            # 复用 run_lm_eval_stream 的逻辑，但传入 custom_include_path
+            metrics = run_lm_eval_stream(
+                model_path,
+                task_dir,
+                custom_task_name,
+                update_progress_callback,
+                30,
+                95,
+                task_control,
+                limit=limit_val,
+                hf_dataset=hf_dataset,
+                hf_subset=hf_subset,
+                hf_split=hf_split,
+                custom_include_path=custom_include_path, # 传入包含路径
+                sampling=(params.get("sampling") or "sequential").strip() or "sequential",
+            )
+
+
+        else:
+            metrics = run_lm_eval_stream(
+                model_path,
+                task_dir,
+                dataset_name,
+                update_progress_callback,
+                30,
+                95,
+                task_control,
+                limit=limit_val,
+                hf_dataset=hf_dataset,
+                hf_subset=hf_subset,
+                hf_split=hf_split,
+                lm_eval_task=(params.get("lm_eval_task") or "").strip() or None,
+                sampling=(params.get("sampling") or "sequential").strip() or "sequential",
+            )
 
         # 与 mergeKit_alpha 一致：雷达图固定为三维 [Accuracy, Efficiency, Context]
         context_val = metrics.get("context", 0) or 0
         context_score = min(100, (int(context_val) / 1024) * 10) if context_val else 0
-        # Efficiency：基于 samples/time 计算速度，归一化到 1-100（基准速度可配置）
+        # Try to find base model name from config
+        base_model_name = "Baseline"
+        try:
+            cfg_path = os.path.join(model_path, "config.json")
+            if os.path.isfile(cfg_path):
+                with open(cfg_path, "r") as f:
+                    cfg = json.load(f)
+                    nm = cfg.get("_name_or_path")
+                    if nm and isinstance(nm, str):
+                        # 如果是绝对路径且不存在，则忽略（避免显示训练时的临时路径，如 WiNGPT...）
+                        if nm.startswith("/") and not os.path.exists(nm):
+                            pass
+                        # 如果不包含路径分隔符且本地不存在（且不是常用HF模型名格式），也忽略
+                        # 避免显示如 "WiNGPT2-Llama-3-8B-Base" 这样的内部训练名称
+                        elif "/" not in nm and not os.path.exists(nm):
+                            pass
+                        elif "/" in nm:
+                            base_model_name = os.path.basename(nm)
+                        else:
+                             base_model_name = str(nm)
+        except:
+            pass
+
+        # Efficiency：基于 throughput 或 samples/time 计算速度，归一化到 1-100
+        # 默认基准速度设为 10.0 samples/s (生成任务通常较慢)
         eval_time = metrics.get("time", 0) or 0
         eval_samples = metrics.get("samples", 0) or 0
-        base_sps = float(getattr(Config, "EFFICIENCY_BASE_SPS", 10) or 10)
-        base_sps = max(1.0, base_sps)
-        efficiency_score = 50
-        if eval_time > 0 and eval_samples > 0:
+        throughput = metrics.get("throughput", 0)
+
+        base_sps = float(getattr(Config, "EFFICIENCY_BASE_SPS", 10.0) or 10.0)
+        base_sps = max(0.1, base_sps)
+        
+        efficiency_score = 0
+        if throughput > 0:
+             efficiency_score = (throughput / base_sps) * 100
+        elif eval_time > 0 and eval_samples > 0:
             speed = eval_samples / eval_time
             efficiency_score = (speed / base_sps) * 100
-        efficiency_score = min(100, max(1, efficiency_score))
+            
+        efficiency_score = min(100, max(1, efficiency_score)) if efficiency_score > 0 else 0
+
         final_result = {
             "accuracy": metrics["acc"],
             "f1_score": metrics["f1"],
             "test_cases": metrics["samples"],
             "context": str(metrics["context"]) if metrics["context"] else "N/A",
-            "base_name": "Baseline",
+            "base_name": base_model_name,
             "comparison": {
                 "labels": ["Accuracy", "Efficiency", "Context"],
-                "base_data": [50, 50, 50],
+                "base_data": [0, 0, 0], # 0 will be treated as 'No Data' in UI
                 "merged_data": [
                     metrics["acc"],
                     round(efficiency_score, 2),
@@ -1351,6 +2281,15 @@ def run_eval_only_task(task_id, params, update_progress_callback, task_control=N
         }
         update_progress_callback(100, "测试完成")
         _write_meta("success", metrics=final_result)
+        
+        # 再次检查 metrics 是否全为 0，若是则记录警告
+        if final_result["test_cases"] == 0 or final_result["accuracy"] == 0:
+            _logger.warning("[run_eval_only_task] 警告: 评估结果为 0 (samples=%s, acc=%s). 请检查数据集或模型输出.", 
+                            final_result["test_cases"], final_result["accuracy"])
+            # 如果是 run_yaml_eval_stream 返回的 0，可能是读取失败
+            if use_yaml:
+                 _logger.warning("[run_eval_only_task] 使用 YAML 评估，请检查 YAML 文件路径及 dataset 字段是否正确.")
+
         testset_id = params.get("testset_id") or None
         if testset_id:
             _update_leaderboard(testset_id, {
@@ -1362,10 +2301,21 @@ def run_eval_only_task(task_id, params, update_progress_callback, task_control=N
                 "created_at": params.get("created_at", time.time()),
                 "hf_dataset": hf_dataset,
                 "hf_subset": hf_subset,
+                # Add extra metrics for baseline usage
+                "throughput": metrics.get("throughput", 0),
+                "time": metrics.get("time", 0),
+                "context": metrics.get("context", 0),
+                "efficiency_score": round(efficiency_score, 2)
             })
         return {"status": "success", "metrics": final_result}
     except Exception as e:
         _logger.exception("[eval] 异常: %s", e)
+        # Ensure process is killed if running
+        if task_control.get("process"):
+            try:
+                ProcessManager.kill_process_tree(task_control["process"])
+            except:
+                pass
         _write_meta("error", error=str(e))
         if task_control.get("aborted"):
             return {"status": "stopped", "message": "用户已停止"}

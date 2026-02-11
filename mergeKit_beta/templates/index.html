@@ -7,6 +7,7 @@
     <link rel="stylesheet" href="https://font.sec.miui.com/font/css?family=MiSans:200,300,400,500,600,700&display=swap">
     <link rel="stylesheet" href="static/styles.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/misans-webfont/misans-style.css" />
     <link rel="icon" type="image/x-icon" href="static/favicon.ico">
@@ -162,6 +163,9 @@
                         <div id="selected-models" class="selected-models">
                             </div>
                     </div>
+                    <!-- 新增：兼容性检查状态 -->
+                    <div id="standard-compatibility-status" style="margin-top: 12px; padding: 10px; background: #f5f5f7; border-radius: 8px; font-size: 0.85rem; display: none;">
+                    </div>
                 </section>
 
                 <section class="section apple-card">
@@ -250,6 +254,43 @@
 
                         <div id="weights-container" class="weights-container">
                         </div>
+
+                        <!-- 新增：标准融合的数据集选择 -->
+                        <div class="form-group" style="margin-top: 16px; border-top: 1px solid var(--apple-border); padding-top: 16px;">
+                            <label>评估数据集 (Auto-Select)</label>
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger" id="standard-dataset-type-trigger">
+                                    <span class="selected-text">MMLU (LLM)</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options" id="standard-dataset-type-options">
+                                    <li class="ios-option selected" data-value="mmlu">
+                                        <div class="opt-left"><span class="opt-name">MMLU (LLM)</span></div>
+                                        <span class="opt-desc">通用语言理解</span>
+                                    </li>
+                                    <li class="ios-option" data-value="cmmmu">
+                                        <div class="opt-left"><span class="opt-name">CMMMU (VLM)</span></div>
+                                        <span class="opt-desc">多模态理解</span>
+                                    </li>
+                                </ul>
+                            </div>
+                            <input type="hidden" id="standard-dataset-type" value="mmlu">
+                        </div>
+
+                        <div class="form-group" id="standard-subset-wrapper">
+                            <label id="standard-subset-label">MMLU 领域</label>
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger" id="standard-subset-trigger">
+                                    <span class="selected-text">Global (综合)</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options" id="standard-subset-options">
+                                    <!-- JS 填充 -->
+                                </ul>
+                            </div>
+                            <input type="hidden" id="standard-subset-val" value="global">
+                        </div>
+
                         <div class="segmented-control-wrapper">
                             <label class="segmented-label">测试深度 (Limit)</label>
                             <div class="segmented-control" id="merge-limit-control">

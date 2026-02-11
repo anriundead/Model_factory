@@ -2,24 +2,31 @@
 
 ## 项目概述
 
-Mergenetic Pro 是一个基于 Web 的模型融合系统，支持标准融合和进化融合两种模式，使用 TIES-DARE 算法和 CMA-ES 优化器进行模型权重融合。
+Mergenetic Pro (Beta) 是一个基于 Web 的模型融合系统，支持标准融合和进化融合两种模式，使用 TIES-DARE 算法和 CMA-ES 优化器进行模型权重融合。目前正处于从 Beta 向正式版演进的阶段，重点在于增强自动化评估、数据管理和可视化分析能力。
 
-### 核心功能
+### 核心功能 (已实现)
 
 1. **标准融合**：基于用户指定的权重直接融合模型
 2. **进化融合**：使用进化算法自动搜索最优融合权重
 3. **配方管理**：保存和复用融合配方
 4. **模型评估**：支持多种基准测试（MMLU、CMMMU 等）
 5. **历史记录**：追踪所有融合任务和结果
+6. **兼容性检查**：基于 `hidden_size` 和 `num_hidden_layers` 的自动校验
 
 ## 项目结构
 
 ```
 mergeKit_beta/
-├── app.py                      # Flask 后端主应用
+├── app.py                      # Flask 后端主应用入口
 ├── config.py                   # 配置管理
-├── merge_manager.py            # 融合任务执行逻辑
-├── core/                       # 核心模块
+├── merge_manager.py            # 融合与评估任务核心调度逻辑
+├── app/                        # 应用逻辑模块
+│   ├── routes.py              # API 路由定义
+│   ├── services.py            # 业务服务层（模型路径、基准线查找等）
+│   ├── models.py              # 数据库模型定义 (Task等)
+│   ├── extensions.py          # Flask 扩展初始化 (db, migrate, admin)
+│   └── admin.py               # Flask-Admin 后台视图配置
+├── core/                       # 核心底层模块
 │   ├── task_manager.py        # 任务队列管理
 │   └── process_manager.py     # 进程管理
 ├── scripts/                    # 脚本目录
@@ -32,13 +39,12 @@ mergeKit_beta/
 ├── static/                     # 静态资源
 │   ├── app.js                 # 前端主逻辑
 │   └── styles.css             # 样式文件
-├── docs/                       # 文档目录
 ├── merges/                     # 融合结果目录
 ├── recipes/                    # 配方存储目录
 └── logs/                       # 日志目录
 ```
 
-## 核心概念
+## 核心概念与实现机制
 
 ### 1. 模型兼容性检查
 
@@ -47,7 +53,7 @@ mergeKit_beta/
 - **`hidden_size`**：隐藏层维度，必须一致
 - **`num_hidden_layers`**：隐藏层数，必须一致
 
-**实现位置**：`app.py` 中的 `_check_merge_compatible()` 函数
+**实现位置**：`app/services.py` (原 `app.py`) 中的 `ModelCompatibilityMixin` 类。
 
 **注意**：不同来源的模型可能使用不同的 `model_type`（如 `llama`、`llama3`），但只要 `hidden_size` 和 `num_hidden_layers` 一致，即可融合。
 
@@ -78,7 +84,31 @@ mergeKit_beta/
 
 **存储位置**：`recipes/<task_id>.json`
 
-## API 接口
+### 4. 基准线与排行榜 (Leaderboard)
+
+系统动态查找基准线数据以生成雷达图：
+1. **优先**：查找当前测试集 ID 对应的 `leaderboard.json` 数据。
+2. **全局回退**：如果在当前测试集未找到，则扫描所有排行榜数据，匹配模型名称 + 数据集 + 子集。
+3. **硬编码回退**：最后回退到 `Meta-Llama-3-8B-Instruct` 等常用基准。
+
+**实现位置**：`app/services.py` 中的 `status_from_disk` 方法。
+
+### 5. 数据库与管理后台
+
+系统引入了 ORM 层以支持更强大的数据查询与管理能力：
+
+- **技术栈**：Flask-SQLAlchemy (ORM) + Flask-Migrate (迁移) + Flask-Admin (后台)
+- **数据库**：默认使用 SQLite (`app.db`)，可配置为 PostgreSQL。
+- **管理后台**：访问 `/admin` 路径，提供可视化的数据增删改查功能。
+- **数据模型**：`Task` (任务状态与配置)，后续将扩展 `EvaluationResult` 等。
+
+## 未来架构与需求规划 (Future Architecture & Roadmap)
+
+详细的开发需求与演进规划请参考独立文档：[development_requirements.md](../development_requirements.md)。
+
+---
+
+## API 接口参考
 
 ### 模型相关
 
@@ -86,6 +116,7 @@ mergeKit_beta/
 - `GET /api/models_pool` - 获取模型池列表
 - `GET /api/merged_models` - 获取已融合模型列表
 - `GET /api/resolve_model_path` - 解析模型路径
+- `POST /api/models/delete` - 删除模型（支持文件删除）
 
 ### 融合任务
 
@@ -444,6 +475,8 @@ A: 系统会优先从本地已加载的数据集读取真实的 splits 和 confi
 - ✅ 实现自动发现 lm_eval 任务映射功能（支持 MMLU-Pro 等新数据集）
 - ✅ 优化从本地数据集读取真实的 splits 和 configs
 - ✅ 增强任务组过滤和验证机制
+- ✅ 实现资源分割与任务队列设计方案
+- ✅ 定义铁人五项领域特化测试标准
 
 ### v1.0 (2026-02-03)
 

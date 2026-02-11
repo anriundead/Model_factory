@@ -75,7 +75,10 @@ def resolve_hf_subsets(dataset_type: str, subset_group_or_single: str) -> list:
                 return list(g["subsets"])
         if subset_group_or_single in MMLU_SUBSETS:
             return [subset_group_or_single]
-    return [subset_group_or_single] if subset_group_or_single else []
+    
+    # If not a group and not a known subset for the dataset type, return empty or filter
+    # User complained about irrelevant labels, so we should be strict.
+    return []
 
 
 def register_routes(app, state, services, dataset_service):
@@ -130,6 +133,53 @@ def register_routes(app, state, services, dataset_service):
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
 
+    @app.route("/api/models/delete", methods=["POST"])
+    def delete_model():
+        try:
+            data = request.json or {}
+            path = data.get("path")
+            if not path:
+                return jsonify({"status": "error", "message": "缺少 path 参数"}), 400
+            
+            # 安全检查：仅允许删除 configured path 下的目录
+            resolved_path = services.resolve_model_path(path)
+            if not resolved_path:
+                 return jsonify({"status": "error", "message": "模型不存在或路径无效"}), 404
+            
+            allowed_bases = [
+                getattr(state.config, "LOCAL_MODELS_PATH", None),
+                state.model_pool_path,
+            ]
+            
+            is_allowed = False
+            for base in allowed_bases:
+                if not base:
+                    continue
+                abs_base = os.path.abspath(base)
+                abs_resolved = os.path.abspath(resolved_path)
+                
+                # Ensure base path ends with separator for secure prefix check
+                if not abs_base.endswith(os.sep):
+                    abs_base += os.sep
+                
+                # Check if resolved path starts with base path (and ensures it's a subdirectory)
+                # Also allow if it is exactly the base directory (though usually we delete subdirs)
+                if abs_resolved.startswith(abs_base) or abs_resolved == os.path.abspath(base):
+                    is_allowed = True
+                    break
+            
+            if not is_allowed:
+                return jsonify({"status": "error", "message": "禁止删除该路径下的模型: 只能删除本地模型库中的文件"}), 403
+
+            if os.path.isdir(resolved_path):
+                shutil.rmtree(resolved_path)
+            else:
+                os.remove(resolved_path)
+                
+            return jsonify({"status": "success", "message": "模型已删除"})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
     @app.route("/api/models_pool")
     def get_models_pool():
         return get_models()
@@ -161,6 +211,80 @@ def register_routes(app, state, services, dataset_service):
             except Exception:
                 continue
         return jsonify({"status": "success", "models": models})
+
+    @app.route("/api/fusion_3d_data/<task_id>")
+    def get_fusion_3d_data(task_id):
+        merge_dir = os.path.join(state.merge_dir, task_id)
+        # 修正路径：bridge 脚本传递的 results-dir 为 vlm_search_results，文件名默认为 vlm_search.csv
+        csv_path = os.path.join(merge_dir, "vlm_search_results", "vlm_search.csv")
+        
+        if not os.path.exists(csv_path):
+            return jsonify({"status": "error", "message": "数据文件不存在"}), 404
+
+        try:
+            import pandas as pd
+            df = pd.read_csv(csv_path)
+            # 清理列名（去除空格）
+            df.columns = [c.strip() for c in df.columns]
+            # 填充 NaN
+            df = df.where(pd.notnull(df), None)
+            
+            # 构造返回数据
+            # 假设列: Unnamed: 0, objective_1, genotype_1, genotype_2, step
+            records = df.to_dict(orient="records")
+            return jsonify({"status": "success", "data": records})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.route("/api/check_compatibility", methods=["POST"])
+    def api_check_compatibility():
+        data = request.json or {}
+        model_paths = data.get("model_paths") or []
+        items = data.get("items") or []
+        
+        resolved_paths = []
+        
+        # Handle items (recipes or paths)
+        if items:
+            for it in items:
+                if it.get("type") == "recipe":
+                    # Recipes might be complex (multiple models), here we might need to find the base model or output
+                    # For simplicity in compatibility check, we might skip recipes or try to find their output path if executed
+                    # But recipes are usually blueprints.
+                    # If a recipe is passed, we can't easily check compatibility without "resolving" it to a model.
+                    # However, if the user selects a "merged model" (which has a path), it's fine.
+                    # If they select a "recipe card", it's a blueprint. Standard merge usually takes *models*.
+                    # Let's assume for standard merge, users select models (paths).
+                    pass
+                elif it.get("path"):
+                    p = services.resolve_model_path(it.get("path"))
+                    if p:
+                        resolved_paths.append(p)
+        
+        # Handle direct paths
+        for p in model_paths:
+            path = services.resolve_model_path(p)
+            if path:
+                resolved_paths.append(path)
+                
+        # Deduplicate
+        resolved_paths = list(set(resolved_paths))
+                
+        compatible, msg, types = services.check_merge_compatible(resolved_paths)
+        return jsonify({
+            "status": "success" if compatible else "error",
+            "compatible": compatible,
+            "message": msg,
+            "types": types
+        })
+
+    @app.route("/api/mmlu_subset_groups")
+    def api_mmlu_subset_groups():
+        return jsonify({"status": "success", "groups": MMLU_SUBSET_GROUPS})
+
+    @app.route("/api/cmmmu_subset_groups")
+    def api_cmmmu_subset_groups():
+        return jsonify({"status": "success", "groups": CMMMU_SUBSET_GROUPS})
 
     @app.route("/api/merge", methods=["POST"])
     def start_merge():
@@ -203,13 +327,39 @@ def register_routes(app, state, services, dataset_service):
             data["model_paths"] = None
         else:
             return jsonify({"status": "error", "message": "请提供 model_paths、models 或 items"}), 400
+        
+        # 传递标准融合的数据集参数
+        dataset_type = data.get("dataset_type")
+        dataset_subset_group = data.get("dataset_subset")
+        
+        if dataset_type:
+            # 自动映射数据集名称
+            if dataset_type.lower() == "cmmmu":
+                data["hf_dataset"] = "CMMMU/CMMMU"
+            elif dataset_type.lower() == "mmlu":
+                data["hf_dataset"] = "cais/mmlu"
+        
+        if dataset_subset_group:
+            # 解析领域/子集
+            subsets = resolve_hf_subsets(dataset_type, dataset_subset_group)
+            if subsets:
+                data["hf_subsets"] = subsets
+                data["hf_subset"] = subsets[0] # 默认取第一个
+                data["hf_subset_group"] = dataset_subset_group
+            else:
+                # 假如解析失败，直接存
+                data["hf_subset"] = dataset_subset_group
+
+        if data.get("hf_dataset"):
+            data["dataset"] = data.get("hf_dataset") # 兼容旧逻辑
+            
         task_id = str(uuid.uuid4())[:8]
         created_at = time.time()
         data["created_at"] = created_at
         data["type"] = "merge"
         state.logger.info(
-            "[API] 提交标准融合 task_id=%s custom_name=%s model_paths=%s method=%s",
-            task_id, custom_name, data.get("model_paths") or data.get("models"), data.get("method"),
+            "[API] 提交标准融合 task_id=%s custom_name=%s model_paths=%s method=%s dataset=%s",
+            task_id, custom_name, data.get("model_paths") or data.get("models"), data.get("method"), data.get("hf_dataset"),
         )
         with state.scheduler_lock:
             if state.running_task_info["id"] and priority_score < (state.running_task_info["priority"] or 99):
@@ -320,7 +470,8 @@ def register_routes(app, state, services, dataset_service):
         dataset = data.get("dataset", "hellaswag")
         testset_id = (data.get("testset_id") or "").strip()
         hf_dataset = (data.get("hf_dataset") or "").strip() or None
-        hf_subset = (data.get("hf_subset") or "").strip() or None
+        hf_subset_raw = (data.get("hf_subset") or "").strip()
+        hf_subset = None if (not hf_subset_raw or hf_subset_raw.lower() == "all") else hf_subset_raw
         hf_split = (data.get("hf_split") or "").strip() or "test"
         lm_eval_task = ""
         if testset_id:
@@ -332,7 +483,10 @@ def register_routes(app, state, services, dataset_service):
             if testset:
                 dataset = testset.get("hf_dataset") or dataset
                 hf_dataset = hf_dataset or testset.get("hf_dataset")
-                hf_subset = (hf_subset or "").strip() or testset.get("hf_subset") or None
+                subset_from_testset = (testset.get("hf_subset") or "").strip()
+                if subset_from_testset.lower() == "all":
+                    subset_from_testset = ""
+                hf_subset = (hf_subset or "").strip() or (subset_from_testset or None)
                 hf_split = (hf_split or testset.get("hf_split") or "test").strip() or "test"
                 lm_eval_task = (testset.get("lm_eval_task") or "").strip()
                 if not lm_eval_task:
@@ -446,6 +600,10 @@ def register_routes(app, state, services, dataset_service):
                     resp["evolution_progress"] = evo
                 od = task.get("original_data") or {}
                 resp["original_data"] = {"n_iter": od.get("n_iter"), "pop_size": od.get("pop_size")}
+            if task.get("type") == "eval_only" or (task.get("original_data") or {}).get("type") == "eval_only":
+                ep = services.read_eval_progress(task_id)
+                if ep is not None:
+                    resp["eval_progress"] = ep
             return jsonify(resp)
         disk = services.status_from_disk(task_id)
         if disk is not None:
@@ -540,6 +698,121 @@ def register_routes(app, state, services, dataset_service):
         refresh = request.args.get("refresh", "0") in ("1", "true", "yes")
         return jsonify({"status": "success", "testsets": services.testset_list(refresh=refresh)})
 
+    @app.route("/api/testset/<testset_id>")
+    def api_testset_detail(testset_id):
+        refresh = request.args.get("refresh", "0") in ("1", "true", "yes")
+        testsets = services.testset_list(refresh=refresh)
+        target = None
+        for t in testsets:
+            if t.get("testset_id") == testset_id:
+                target = t
+                break
+        if not target:
+             return jsonify({"status": "error", "message": "Testset not found"}), 404
+        
+        # 尝试查找 leaderboard (简单扫描 evaluation 历史)
+        leaderboard = []
+        try:
+            eval_history = services.get_all_eval_history()
+            
+            # 预处理目标匹配条件
+            target_dataset = (target.get("hf_dataset") or "").strip().lower()
+            target_subset = (target.get("hf_subset") or "").strip().lower()
+            if target_subset in ("default", "none"):
+                target_subset = ""
+                
+            for h in eval_history:
+                # 仅显示成功的任务
+                if h.get("status") not in ("success", "completed"):
+                    continue
+
+                is_match = False
+                
+                # 1. 优先匹配 testset_id
+                h_tid = h.get("testset_id")
+                if h_tid and h_tid == testset_id:
+                    is_match = True
+                
+                # 2. 回退匹配：数据集名称 + 子集
+                elif target_dataset:
+                    h_dataset = (h.get("hf_dataset") or "").strip().lower()
+                    h_subset = (h.get("hf_subset") or "").strip().lower()
+                    if h_subset in ("default", "none"):
+                        h_subset = ""
+                    
+                    if h_dataset == target_dataset:
+                        if not target_subset:
+                             # 目标无子集：匹配无子集或 default
+                             if not h_subset:
+                                 is_match = True
+                        else:
+                             # 目标有子集：必须精确匹配
+                             if h_subset == target_subset:
+                                 is_match = True
+                
+                if not is_match:
+                    continue
+
+                # 获取 metrics
+                # metadata.json 中 metrics 可能在顶层，也可能在 result.metrics 中
+                metrics = h.get("metrics") or (h.get("result") or {}).get("metrics") or {}
+                
+                # 尝试寻找常用指标 (acc, exact_match, etc.)
+                score = None
+                metric_name = "accuracy"
+                
+                # 优先级：exact_match > acc_norm > acc > accuracy > f1
+                candidate_keys = ["exact_match", "acc_norm", "acc", "accuracy", "f1", "map", "recall"]
+                
+                # 某些 metrics 可能是 nested dict，例如 "gsm8k": {"acc": 0.5}
+                # 但通常 lm-eval 扁平化输出或按 group。
+                # 这里的 metrics 是从 result.metrics 获取的，通常是扁平的 key-value 或 group-key-value。
+                
+                for key in candidate_keys:
+                    # 1. 直接匹配 key
+                    if key in metrics:
+                        score = metrics[key]
+                        metric_name = key
+                        break
+                    # 2. 匹配 key,none (lm-eval v0.4+ 格式)
+                    if f"{key},none" in metrics:
+                        score = metrics[f"{key},none"]
+                        metric_name = key
+                        break
+                
+                if score is not None:
+                    try:
+                        # 处理 score 可能是 list 或 string
+                        if isinstance(score, list):
+                            score = score[0]
+                        val = float(score)
+                        
+                        # 归一化到 0-100
+                        # 启发式：如果 <= 1.0 且不是 map/recall 等通常小数指标？其实大部分指标 0-1
+                        # 统一转百分比显示
+                        if val <= 1.0: 
+                             val *= 100
+                        
+                        leaderboard.append({
+                            "model_name": h.get("model_name") or h.get("custom_name") or "Unknown",
+                            "accuracy": val,
+                            "metric": metric_name,
+                            "date": h.get("created_at")
+                        })
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        
+        # 排序：按分数降序
+        leaderboard.sort(key=lambda x: x["accuracy"], reverse=True)
+
+        return jsonify({
+            "status": "success",
+            "testset": target,
+            "leaderboard": leaderboard
+        })
+
     @app.route("/api/testset/search")
     def api_testset_search():
         q = (request.args.get("q") or "").strip().lower()
@@ -631,7 +904,7 @@ def register_routes(app, state, services, dataset_service):
         if not name:
             name = hf_dataset
         hf_subset_raw = (data.get("hf_subset") or "").strip()
-        hf_subset = hf_subset_raw if hf_subset_raw else None
+        hf_subset = None if (not hf_subset_raw or hf_subset_raw.lower() == "all") else hf_subset_raw
         hf_split_raw = (data.get("hf_split") or "").strip()
         hf_split = hf_split_raw if hf_split_raw else None
         cache_dir = getattr(state.config, "HF_DATASETS_CACHE", None) or os.environ.get("HF_DATASETS_CACHE")
@@ -822,17 +1095,9 @@ def register_routes(app, state, services, dataset_service):
     def api_mmlu_subsets():
         return jsonify({"status": "success", "subsets": MMLU_SUBSETS})
 
-    @app.route("/api/mmlu_subset_groups")
-    def api_mmlu_subset_groups():
-        return jsonify({"status": "success", "groups": MMLU_SUBSET_GROUPS})
-
     @app.route("/api/cmmmu_subsets")
     def api_cmmmu_subsets():
         return jsonify({"status": "success", "subsets": CMMMU_SUBSETS})
-
-    @app.route("/api/cmmmu_subset_groups")
-    def api_cmmmu_subset_groups():
-        return jsonify({"status": "success", "groups": CMMMU_SUBSET_GROUPS})
 
     @app.route("/api/model_is_vlm")
     def api_model_is_vlm():
@@ -1096,6 +1361,53 @@ def register_routes(app, state, services, dataset_service):
 
         history.sort(key=lambda x: x.get("created_at", 0), reverse=True)
         return jsonify({"status": "success", "history": history})
+
+    @app.route("/api/fusion_3d_data/<task_id>", methods=["GET"])
+    def api_fusion_3d_data(task_id):
+        task_dir = os.path.join(state.merge_dir, task_id)
+        if not os.path.isdir(task_dir):
+            return jsonify({"status": "error", "message": "Task not found"})
+        
+        data_points = []
+        
+        # 1. Check vlm_search.csv (VLM)
+        csv_path = os.path.join(task_dir, "vlm_search_results", "vlm_search.csv")
+        if os.path.isfile(csv_path):
+            try:
+                import csv
+                with open(csv_path, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        point = {}
+                        for k, v in row.items():
+                            try:
+                                point[k] = float(v)
+                            except:
+                                point[k] = v
+                        data_points.append(point)
+            except Exception as e:
+                state.logger.warning("Failed to parse vlm_search.csv: %s", e)
+
+        # 2. Check search_results.csv (generic)
+        if not data_points:
+            csv_path = os.path.join(task_dir, "search_results.csv")
+            if os.path.isfile(csv_path):
+                 try:
+                    import csv
+                    with open(csv_path, "r", encoding="utf-8") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            point = {}
+                            for k, v in row.items():
+                                try:
+                                    point[k] = float(v)
+                                except:
+                                    point[k] = v
+                            data_points.append(point)
+                 except Exception:
+                     pass
+        
+        return jsonify({"status": "success", "data": data_points})
 
     @app.route("/fusion_history")
     def fusion_history_page():

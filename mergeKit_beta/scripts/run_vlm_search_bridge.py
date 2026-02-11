@@ -216,6 +216,8 @@ def main():
     hf_subset_group = meta.get("hf_subset_group", "").strip()
     if hf_subset_group:
         cmd.extend(["--hf-subset-group", hf_subset_group])
+    # 指定结果目录到 merge_dir 下，以便前端读取
+    results_dir = os.path.join(merge_dir, "vlm_search_results")
     cmd.extend([
         "--prompt-yaml", prompt_yaml,
         "--pop-size", str(pop_size),
@@ -225,6 +227,7 @@ def main():
         "--device", "cuda",
         "--final-vlm-output", final_vlm_output,
         "--progress-file", progress_path,
+        "--results-dir", results_dir,
     ])
     # 双 split：若指定了最终评测 split，传参给 run_vlm_search（脚本需支持 --hf-split-final 与 --final-acc-file）
     final_acc_file = os.path.join(merge_dir, "final_test_acc.json")
@@ -258,7 +261,13 @@ def main():
         # 用于解析进度信息和计算 ETA
         import re
         import time as time_module
-        eval_times = []  # 记录每次评估的耗时
+        
+        # 计时相关状态
+        step_start_times = {} # step -> start_time
+        gen_start_times = {}  # gen -> start_time
+        gen_durations = {}    # gen -> duration
+        step_durations = []   # list of (step, duration)
+        
         last_step = 0
         start_time = time_module.time()
         
@@ -284,20 +293,60 @@ def main():
                     if "[eval]" in line or "[main]" in line or "step=" in line or "ERROR" in line.upper() or "WARNING" in line.upper():
                         logger.info("子进程: %s", line.rstrip())
                 
-                # 解析评估日志：提取 step 和耗时信息
-                # 格式示例: "[eval] step=1 acc=0.1250 best_acc=0.1250 genotype=[...]"
-                # 或: "[eval-print] step=1 pid=12345 cuda_visible=0,1 genotype=[...]"
+                # 1. 捕获 Step 开始: [eval-print] step=1 ...
+                start_match = re.search(r'\[eval-print\]\s+step=(\d+)', line)
+                if start_match:
+                    s_step = int(start_match.group(1))
+                    step_start_times[s_step] = time_module.time()
+                    
+                    # 判定是否为新的一代开始 (step 1, pop_size+1, ...)
+                    # generation 从 1 开始
+                    # (1-1)//pop + 1 = 1
+                    # (pop+1 - 1)//pop + 1 = 2
+                    if (s_step - 1) % pop_size == 0:
+                        gen_idx = (s_step - 1) // pop_size + 1
+                        gen_start_times[gen_idx] = time_module.time()
+                        logger.info("Generation %d 开始 (Step %d)", gen_idx, s_step)
+
+                # 2. 捕获 Step 结束: [eval] step=1 ...
                 eval_match = re.search(r'\[eval\]\s+step=(\d+).*?acc=([\d.]+)', line)
                 if eval_match:
                     current_step = int(eval_match.group(1))
-                    if current_step > last_step:
-                        # 计算本次评估的耗时（基于时间差）
-                        current_time = time_module.time()
-                        if last_step > 0:
-                            elapsed = current_time - start_time
-                            avg_time_per_step = elapsed / current_step if current_step > 0 else 0
-                            eval_times.append(avg_time_per_step)
-                        last_step = current_step
+                    if current_step in step_start_times:
+                        duration = time_module.time() - step_start_times[current_step]
+                        step_durations.append((current_step, duration))
+                        
+                        # 判定是否为一代结束
+                        if current_step % pop_size == 0:
+                            gen_idx = (current_step - 1) // pop_size + 1
+                            if gen_idx in gen_start_times:
+                                g_duration = time_module.time() - gen_start_times[gen_idx]
+                                gen_durations[gen_idx] = g_duration
+                                logger.info("Generation %d 结束 (耗时: %.2fs)", gen_idx, g_duration)
+                                
+                                # 更新 progress.json
+                                try:
+                                    with open(progress_path, "r", encoding="utf-8") as pf:
+                                        prog = json.load(pf)
+                                    prog["gen_durations"] = gen_durations
+                                    # 记录详细的每一步耗时 (step -> duration)
+                                    prog["step_durations"] = {str(s): d for s, d in step_durations}
+                                    
+                                    # 保留 first_gen_time 兼容旧字段
+                                    if 1 in gen_durations:
+                                        prog["first_gen_time"] = gen_durations[1]
+                                    
+                                    # 计算平均 step 耗时
+                                    if step_durations:
+                                        avg_step = sum(d for s, d in step_durations) / len(step_durations)
+                                        prog["avg_step_time"] = avg_step
+                                        
+                                    with open(progress_path, "w", encoding="utf-8") as pf:
+                                        json.dump(prog, pf, ensure_ascii=False, indent=2)
+                                except Exception:
+                                    pass
+
+                    last_step = current_step
                 
                 # 尝试解析 ETA 信息（如果 run_vlm_search.py 输出）
                 eta_match = re.search(r'eta[=:]?\s*([\d.]+)\s*(s|sec|second)', line, re.IGNORECASE)
@@ -339,6 +388,26 @@ def main():
             logger.info("子进程输出已保存到: %s", subprocess_log_path)
         
         proc.wait()
+
+        # 任务结束，强制更新最后一次进度
+        try:
+            if proc.returncode == 0:
+                with open(progress_path, "r", encoding="utf-8") as pf:
+                    prog = json.load(pf)
+                # 确保进度显示为完成
+                prog["current_step"] = max(last_step, prog.get("current_step", 0))
+                # 如果 last_step 远小于 total，可能是解析漏了，强制修正为 total
+                total_steps = pop_size * n_iter
+                if total_steps > 0 and prog["current_step"] < total_steps:
+                    prog["current_step"] = total_steps
+                
+                prog["eta_seconds"] = 0
+                prog["estimated_completion"] = time_module.time()
+                prog["total_task_time"] = time_module.time() - start_time
+                with open(progress_path, "w", encoding="utf-8") as pf:
+                    json.dump(prog, pf, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("更新最终进度失败: %s", e)
         
         # 任务完成后，记录子进程输出的统计信息
         if out_lines:
@@ -358,6 +427,33 @@ def main():
                 pass
             logger.error("run_vlm_search 执行失败（返回码: %s）", proc.returncode)
             sys.exit(1)
+
+        # 外部最终评测 (如果需要)
+        if proc.returncode == 0 and hf_split_final and hf_split_final != hf_split:
+            logger.info("执行外部最终评测 (eval_final.py)...")
+            # 确保 prompt_yaml 是绝对路径，或者相对于 VLM_SEARCH_DIR
+            # prompt_yaml 是 resolve 出来的，可能是绝对路径
+            
+            eval_cmd = [
+                python_cmd,
+                os.path.join(VLM_SEARCH_DIR, "eval_final.py"),
+                "--model-path", final_vlm_output,
+                "--hf-dataset", hf_dataset,
+                "--hf-split", hf_split_final,
+                "--max-samples", str(max_samples),
+                "--output-file", final_acc_file,
+                "--prompt-yaml", prompt_yaml
+            ]
+            if hf_subsets:
+                eval_cmd.extend(["--hf-subset", *hf_subsets])
+            if hf_subset_group:
+                eval_cmd.extend(["--hf-subset-group", hf_subset_group])
+            
+            try:
+                logger.info("Final Eval Command: %s", " ".join(eval_cmd))
+                subprocess.run(eval_cmd, check=True, cwd=VLM_SEARCH_DIR, env=env)
+            except subprocess.CalledProcessError as e:
+                logger.error("最终评测失败: %s", e)
 
         # 完全融合成功：输出命名为「父模型1_父模型2_结束时间戳」，写入详细信息，并保留 output 以兼容
         output_dir = os.path.join(merge_dir, "output")
@@ -390,6 +486,7 @@ def main():
                 pass
             # 双 split：若 run_vlm_search 写入了最终 test 准确率，读入并写入配方
             final_test_acc = None
+            final_test_duration = None
             if hf_split_final and hf_split_final != hf_split:
                 acc_path = os.path.join(merge_dir, "final_test_acc.json")
                 if os.path.isfile(acc_path):
@@ -397,6 +494,7 @@ def main():
                         with open(acc_path, "r", encoding="utf-8") as af:
                             acc_data = json.load(af)
                         final_test_acc = acc_data.get("final_test_acc") or acc_data.get("accuracy")
+                        final_test_duration = acc_data.get("duration")
                     except Exception:
                         pass
             fusion_info = {
@@ -422,6 +520,7 @@ def main():
                 "completed_at": completed_at,
                 "current_best_acc": current_best_acc,
                 "final_test_acc": final_test_acc,
+                "final_test_duration": final_test_duration,
             }
             with open(os.path.join(named_dir, "fusion_info.json"), "w", encoding="utf-8") as f:
                 json.dump(fusion_info, f, ensure_ascii=False, indent=2)
@@ -437,6 +536,7 @@ def main():
                 f"- **best_genotype**: {best_genotype}",
                 f"- **验证准确率 (current_best)**: {current_best_acc}",
                 f"- **最终 test 准确率 (final_test_acc)**: {fusion_info.get('final_test_acc')}",
+                f"- **最终评测耗时**: {fusion_info.get('final_test_duration')}s" if fusion_info.get('final_test_duration') else "",
                 "",
                 "## 参数",
                 f"- 数据集: {meta.get('hf_dataset', '')}",

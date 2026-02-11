@@ -66,13 +66,151 @@
             </div>
         </div>
     </div>
+    
+    <style>
+        /* Testset Card Styles */
+        .testset-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 24px;
+            padding: 4px;
+        }
+        
+        .testset-card {
+            background: rgba(255,255,255,0.8);
+            backdrop-filter: blur(20px);
+            border-radius: 20px;
+            padding: 24px;
+            display: flex;
+            align-items: center;
+            gap: 18px;
+            cursor: pointer;
+            transition: all 0.4s cubic-bezier(0.25, 1, 0.5, 1);
+            border: 1px solid rgba(0,0,0,0.04);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.02);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .testset-card:hover {
+            transform: translateY(-6px) scale(1.02);
+            box-shadow: 0 20px 40px rgba(0,0,0,0.08);
+            border-color: rgba(0,113,227,0.1);
+            background: #fff;
+            z-index: 1;
+        }
+        
+        .testset-card:active {
+            transform: scale(0.96);
+        }
+        
+        .testset-icon {
+            width: 56px;
+            height: 56px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, #f5f5f7 0%, #eef1f5 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #0071e3;
+            font-size: 1.8rem;
+            flex-shrink: 0;
+            box-shadow: inset 0 1px 2px rgba(255,255,255,0.8);
+            transition: transform 0.4s ease;
+        }
+
+        .testset-card:hover .testset-icon {
+            transform: scale(1.1) rotate(-5deg);
+            background: linear-gradient(135deg, #e0eafc 0%, #cfdef3 100%);
+        }
+        
+        .testset-info {
+            flex: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        
+        .testset-name {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #1d1d1f;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            letter-spacing: -0.01em;
+        }
+        
+        .testset-meta {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85rem;
+            color: #86868b;
+        }
+        
+        .meta-tag {
+            background: rgba(0,0,0,0.04);
+            padding: 3px 10px;
+            border-radius: 8px;
+            max-width: 140px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-weight: 500;
+            color: #666;
+            font-size: 0.8rem;
+        }
+        
+        .meta-count {
+            color: #86868b;
+            font-family: 'Misans ExtraLight';
+        }
+        
+        .testset-arrow {
+            color: #d2d2d7;
+            font-size: 1.4rem;
+            opacity: 0;
+            transform: translateX(-10px);
+            transition: all 0.3s ease;
+        }
+        
+        .testset-card:hover .testset-arrow {
+            transform: translateX(0);
+            opacity: 1;
+            color: #0071e3;
+        }
+        
+        /* Animation */
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .fade-in {
+            animation: fadeInUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            opacity: 0; /* ensure invisible before animation */
+        }
+
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+        .spinning { animation: spin 1s linear infinite; }
+    </style>
+
     <script>
         document.getElementById('menu-btn').onclick = () => { document.getElementById('history-sidebar').classList.add('open'); document.getElementById('sidebar-overlay').classList.add('show'); };
         document.getElementById('close-sidebar').onclick = () => { document.getElementById('history-sidebar').classList.remove('open'); document.getElementById('sidebar-overlay').classList.remove('show'); };
         document.getElementById('sidebar-overlay').onclick = () => { document.getElementById('history-sidebar').classList.remove('open'); document.getElementById('sidebar-overlay').classList.remove('show'); };
 
+        document.getElementById('testsets-refresh').onclick = function() {
+            const icon = this.querySelector('i');
+            icon.classList.add('spinning');
+            loadTestsets(true);
+            setTimeout(() => icon.classList.remove('spinning'), 1000);
+        };
+
         var testsetsData = [];
-        const TESTSETS_CACHE_KEY = 'testsets_cache_v1';
+        const TESTSETS_CACHE_KEY = 'testsets_cache_v2';
         function saveTestsetsCache(list) {
             try { sessionStorage.setItem(TESTSETS_CACHE_KEY, JSON.stringify(list || [])); } catch (e) {}
         }
@@ -86,10 +224,38 @@
         }
         function renderTestsets(list) {
             const el = document.getElementById('testsets-list');
-            if (!list || list.length === 0) { el.innerHTML = '<p class="limit-desc">暂无测试集</p>'; return; }
+            // Change container class to grid (override existing models-grid if needed, or just use it)
+            el.className = 'testset-grid';
+            
+            if (!list || list.length === 0) { 
+                el.innerHTML = '<p class="limit-desc" style="grid-column: 1/-1;">暂无测试集</p>'; 
+                return; 
+            }
             testsetsData = list;
-            el.innerHTML = list.map((t, i) => '<div class="model-card" data-testset-index="' + i + '" style="cursor:pointer;"><div class="model-name">' + (t.name||t.hf_dataset||t.testset_id) + '</div><div class="limit-desc">' + (t.hf_dataset||'') + ' · ' + (t.sample_count||0) + ' 条</div></div>').join('');
-            el.querySelectorAll('.model-card').forEach(card => {
+            
+            el.innerHTML = list.map((t, i) => {
+                const name = t.name || t.hf_dataset || t.testset_id;
+                const hf = t.hf_dataset || 'Local';
+                const count = (t.sample_count !== undefined && t.sample_count !== null) ? t.sample_count : 0;
+                const delay = Math.min(i * 0.05, 0.5) + 's';
+                
+                return `
+                    <div class="testset-card fade-in" data-testset-index="${i}" style="animation-delay: ${delay}">
+                        <div class="testset-icon"><i class="ri-database-2-line"></i></div>
+                        <div class="testset-info">
+                            <div class="testset-name" title="${name}">${name}</div>
+                            <div class="testset-meta">
+                                <span class="meta-tag" title="${hf}">${hf}</span>
+                                <span class="meta-dot">•</span>
+                                <span class="meta-count">${count} 条数据</span>
+                            </div>
+                        </div>
+                        <div class="testset-arrow"><i class="ri-arrow-right-s-line"></i></div>
+                    </div>
+                `;
+            }).join('');
+            
+            el.querySelectorAll('.testset-card').forEach(card => {
                 card.onclick = function() {
                     const idx = parseInt(card.getAttribute('data-testset-index'), 10);
                     if (testsetsData[idx] && testsetsData[idx].testset_id) showTestsetDetail(testsetsData[idx].testset_id);
@@ -100,7 +266,8 @@
             const cached = !forceRefresh ? loadTestsetsCache() : null;
             if (cached && cached.length) {
                 renderTestsets(cached);
-                if (cached.some(t => !t.sample_count || Number(t.sample_count) <= 0)) {
+                // Only auto-refresh if non-local items have missing sample counts
+                if (cached.some(t => !t.is_local && (!t.sample_count || Number(t.sample_count) <= 0))) {
                     setTimeout(() => loadTestsets(true), 0);
                 }
                 return;
@@ -137,15 +304,42 @@
                 if (lb.length === 0) {
                     html += '<p style="color: #999; font-size: 0.9rem;">暂无模型在此测试集上进行过测评</p>';
                 } else {
-                    html += '<div style="max-height: 240px; overflow-y: auto;">';
-                    html += '<table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">';
-                    html += '<thead><tr style="background: #f5f5f7;"><th style="padding: 10px; text-align: left; border-radius: 8px 0 0 0;">排名</th><th style="padding: 10px; text-align: left;">模型</th><th style="padding: 10px; text-align: right; border-radius: 0 8px 0 0;">准确率</th></tr></thead>';
+                    html += '<div style="max-height: 300px; overflow-y: auto; padding-right: 4px;">';
+                    html += '<table style="width: 100%; border-collapse: separate; border-spacing: 0 8px; font-size: 0.9rem;">';
+                    html += '<thead><tr style="color: #86868b; font-size: 0.8rem; letter-spacing: 0.5px;"><th style="padding: 0 10px; text-align: center; width: 40px;">#</th><th style="padding: 0 10px; text-align: left;">模型</th><th style="padding: 0 10px; text-align: right;">分数</th></tr></thead>';
                     html += '<tbody>';
                     lb.forEach((item, idx) => {
-                        const medal = idx === 0 ? '🥇' : (idx === 1 ? '🥈' : (idx === 2 ? '🥉' : (idx + 1)));
+                        let rankDisplay = `<span style="display:inline-block; width:24px; height:24px; line-height:24px; text-align:center; border-radius:50%; background:#f5f5f7; color:#666; font-size:0.8rem; font-weight:600;">${idx + 1}</span>`;
+                        if (idx === 0) rankDisplay = '🥇';
+                        if (idx === 1) rankDisplay = '🥈';
+                        if (idx === 2) rankDisplay = '🥉';
+                        
                         const accVal = item.accuracy != null ? Number(item.accuracy) : null;
-                        const acc = accVal == null || Number.isNaN(accVal) ? '--' : accVal.toFixed(2) + '%';
-                        html += '<tr style="border-bottom: 1px solid #f0f0f0;"><td style="padding: 10px;">' + medal + '</td><td style="padding: 10px;">' + (item.model_name || '-') + '</td><td style="padding: 10px; text-align: right; font-weight: 600; color: #0071e3;">' + acc + '</td></tr>';
+                        const accStr = accVal == null || Number.isNaN(accVal) ? '--' : accVal.toFixed(2);
+                        const metricName = item.metric || 'Accuracy';
+                        
+                        // Score bar width
+                        const barWidth = accVal ? Math.min(Math.max(accVal, 0), 100) : 0;
+                        const barColor = idx === 0 ? '#ffb340' : (idx === 1 ? '#999' : (idx === 2 ? '#c68e17' : '#0071e3'));
+                        
+                        html += `
+                        <tr class="fade-in" style="animation-delay: ${idx * 0.05}s; background: rgba(255,255,255,0.6); box-shadow: 0 1px 4px rgba(0,0,0,0.02);">
+                            <td style="padding: 12px 10px; text-align: center; border-radius: 12px 0 0 12px;">${rankDisplay}</td>
+                            <td style="padding: 12px 10px;">
+                                <div style="font-weight: 500; color: #1d1d1f;">${item.model_name || 'Unknown'}</div>
+                                <div style="font-size: 0.75rem; color: #86868b; margin-top: 2px;">${new Date((item.date || 0) * 1000).toLocaleDateString()}</div>
+                            </td>
+                            <td style="padding: 12px 10px; text-align: right; border-radius: 0 12px 12px 0;">
+                                <div style="display: flex; flex-direction: column; align-items: flex-end;">
+                                    <div style="font-size: 1.1rem; font-weight: 700; color: #1d1d1f; font-family: 'MiSans', sans-serif;">${accStr}<span style="font-size:0.8rem; font-weight:400; color:#86868b; margin-left:2px;">%</span></div>
+                                    <div style="font-size: 0.7rem; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px;">${metricName}</div>
+                                </div>
+                                <div style="height: 4px; width: 80px; background: #eee; border-radius: 2px; margin-top: 6px; margin-left: auto; overflow: hidden;">
+                                    <div style="height: 100%; width: ${barWidth}%; background: ${barColor}; border-radius: 2px;"></div>
+                                </div>
+                            </td>
+                        </tr>
+                        `;
                     });
                     html += '</tbody></table></div>';
                 }

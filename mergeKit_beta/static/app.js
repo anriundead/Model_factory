@@ -209,6 +209,32 @@ function loadHistoryDetail(item) {
     // 克隆按钮以移除旧的监听器
     const newDlBtn = dlBtn.cloneNode(true);
     dlBtn.parentNode.replaceChild(newDlBtn, dlBtn);
+
+    // --- 新增：详情按钮 (Restore Details Button) ---
+    // 检查是否已存在详情按钮，避免重复添加
+    let detailBtn = document.getElementById('btn-show-details');
+    if (!detailBtn) {
+        detailBtn = document.createElement('button');
+        detailBtn.id = 'btn-show-details';
+        detailBtn.className = 'btn-secondary'; // 使用次级按钮样式
+        detailBtn.style.marginLeft = '10px';
+        detailBtn.innerHTML = '<i class="ri-file-list-3-line"></i> 详细报告';
+        newDlBtn.parentNode.insertBefore(detailBtn, newDlBtn.nextSibling);
+    }
+    // 绑定点击事件
+    const newDetailBtn = detailBtn.cloneNode(true);
+    detailBtn.parentNode.replaceChild(newDetailBtn, detailBtn);
+    
+    newDetailBtn.onclick = () => {
+        // 构造 evoProgress 数据 (从 item 获取)
+        const evoData = item.evolution_progress || {};
+        // 补充缺失的 step/total 信息 (如果 item 中有)
+        if (item.step) evoData.step = item.step;
+        if (item.n_iter && item.pop_size) evoData.total_expected_steps = item.n_iter * item.pop_size; // 估算
+
+        showTaskCompletionModal(item.id, { status: 'success' }, evoData);
+    };
+    // ------------------------------------------
     
     // 绑定点击事件
     newDlBtn.addEventListener('click', async (e) => {
@@ -389,7 +415,12 @@ async function executeMergeTask() {
     // 收集参数
     const method = document.getElementById('merge-method').value;
     const dtype = document.getElementById('dtype').value;
-    const limit = document.getElementById('merge-limit').value; // <--- 【新增】获取 limit
+    const limit = document.getElementById('merge-limit').value; 
+    
+    // 获取数据集参数
+    const datasetType = document.getElementById('standard-dataset-type').value; // mmlu / cmmmu
+    const datasetSubset = document.getElementById('standard-subset-val').value; // global / ...
+
     const weights = [];
     document.querySelectorAll('.weight-slider').forEach(input => {
         weights.push(parseFloat(input.value));
@@ -397,13 +428,19 @@ async function executeMergeTask() {
 
     const modelPaths = state.selectedModels.map(m => (typeof m === 'string' ? null : m.path)).filter(Boolean);
     const modelNames = state.selectedModels.map(m => (typeof m === 'string' ? m : (m && m.name))).filter(Boolean);
+    
     const payload = {
-                weights: weights,
-                method: method,
-                dtype: dtype,
-                priority: currentPriority,
+        weights: weights,
+        method: method,
+        dtype: dtype,
+        priority: currentPriority,
         custom_name: customName,
-        limit: limit
+        limit: limit,
+        // 添加数据集参数
+        dataset: datasetType, 
+        hf_dataset: datasetType, // 兼容后端逻辑
+        hf_subset: datasetSubset,
+        hf_split: 'test' // 默认使用 test split
     };
     if (modelPaths.length === state.selectedModels.length) {
         payload.model_paths = modelPaths;
@@ -539,6 +576,225 @@ function setupModalListeners() {
 
     // 取消按钮
     cancelBtn.addEventListener('click', closeModal);
+    
+    // --- 新增：初始化标准融合的数据集选择 ---
+    setupStandardDatasetUI();
+}
+
+// --- 新增：标准融合数据集 UI 初始化 ---
+function setupStandardDatasetUI() {
+    // 1. 数据集类型切换 (MMLU/CMMMU)
+    const typeTrigger = document.getElementById('standard-dataset-type-trigger');
+    const typeOptions = document.getElementById('standard-dataset-type-options');
+    const typeHidden = document.getElementById('standard-dataset-type');
+    
+    if (typeTrigger && typeOptions && typeHidden) {
+        // 切换显示
+        typeTrigger.addEventListener('click', (e) => {
+            e.stopPropagation();
+            typeOptions.classList.toggle('open');
+        });
+        
+        // 选项点击
+        typeOptions.querySelectorAll('.ios-option').forEach(opt => {
+            opt.addEventListener('click', () => {
+                // UI 更新
+                typeOptions.querySelectorAll('.ios-option').forEach(o => o.classList.remove('selected'));
+                opt.classList.add('selected');
+                
+                const val = opt.dataset.value;
+                const name = opt.querySelector('.opt-name').innerText;
+                typeTrigger.querySelector('.selected-text').innerText = name;
+                typeHidden.value = val;
+                
+                // 关闭菜单
+                typeOptions.classList.remove('open');
+                
+                // 加载对应子集
+                loadStandardSubsets(val);
+            });
+        });
+        
+        // 点击外部关闭
+        document.addEventListener('click', (e) => {
+            if (!typeTrigger.contains(e.target) && !typeOptions.contains(e.target)) {
+                typeOptions.classList.remove('open');
+            }
+        });
+    }
+    
+    // 2. 子集切换
+    const subsetTrigger = document.getElementById('standard-subset-trigger');
+    const subsetOptions = document.getElementById('standard-subset-options');
+    const subsetHidden = document.getElementById('standard-subset-val');
+    
+    if (subsetTrigger && subsetOptions && subsetHidden) {
+        subsetTrigger.addEventListener('click', (e) => {
+            e.stopPropagation();
+            subsetOptions.classList.toggle('open');
+        });
+        
+        // 初始加载 (默认为 MMLU)
+        loadStandardSubsets('mmlu');
+        
+        // 点击外部关闭
+        document.addEventListener('click', (e) => {
+            if (!subsetTrigger.contains(e.target) && !subsetOptions.contains(e.target)) {
+                subsetOptions.classList.remove('open');
+            }
+        });
+    }
+}
+
+// --- 新增：加载标准融合子集 ---
+function loadStandardSubsets(datasetType) {
+    const optionsUl = document.getElementById('standard-subset-options');
+    const trigger = document.getElementById('standard-subset-trigger');
+    const hidden = document.getElementById('standard-subset-val');
+    const label = document.getElementById('standard-subset-label');
+    
+    if (!optionsUl || !hidden) return;
+    
+    const isMmlu = (datasetType || '').toLowerCase() === 'mmlu';
+    const apiUrl = isMmlu ? '/api/mmlu_subset_groups' : '/api/cmmmu_subset_groups';
+    
+    if (label) label.innerText = isMmlu ? 'MMLU 领域' : 'CMMMU 领域';
+    
+    // 显示加载中
+    optionsUl.innerHTML = '<li class="ios-option"><span class="opt-name">加载中...</span></li>';
+    
+    fetch(apiUrl)
+        .then(r => r.json())
+        .then(data => {
+            const groups = data.groups || [];
+            optionsUl.innerHTML = '';
+            
+            if (groups.length === 0) {
+                optionsUl.innerHTML = '<li class="ios-option"><span class="opt-name">无可用子集</span></li>';
+                return;
+            }
+            
+            // 填充选项
+            groups.forEach((g, idx) => {
+                const li = document.createElement('li');
+                li.className = 'ios-option' + (idx === 0 ? ' selected' : '');
+                li.dataset.value = g.id;
+                
+                li.innerHTML = `
+                    <div class="opt-left">
+                        <span class="opt-name">${g.label || g.id}</span>
+                    </div>
+                `;
+                if (g.subsets && g.subsets.length) {
+                     li.title = g.subsets.join(', ');
+                }
+                
+                li.addEventListener('click', () => {
+                    optionsUl.querySelectorAll('.ios-option').forEach(o => o.classList.remove('selected'));
+                    li.classList.add('selected');
+                    
+                    if (trigger) trigger.querySelector('.selected-text').innerText = g.label || g.id;
+                    if (hidden) hidden.value = g.id;
+                    
+                    optionsUl.classList.remove('open');
+                });
+                
+                optionsUl.appendChild(li);
+            });
+            
+            // 默认选中第一个
+            if (groups.length > 0) {
+                const first = groups[0];
+                if (trigger) trigger.querySelector('.selected-text').innerText = first.label || first.id;
+                if (hidden) hidden.value = first.id;
+            }
+        })
+        .catch(e => {
+            console.error(e);
+            optionsUl.innerHTML = '<li class="ios-option">加载失败</li>';
+        });
+}
+
+// --- 新增：检查标准融合兼容性 & VLM检测 ---
+async function checkStandardCompatibilityAndVlm() {
+    const statusDiv = document.getElementById('standard-compatibility-status');
+    const modelPaths = state.selectedModels.map(m => (typeof m === 'string' ? null : m.path)).filter(Boolean);
+    
+    // 1. 隐藏状态栏 (如果模型不足2个)
+    if (modelPaths.length < 2) {
+        if (statusDiv) statusDiv.style.display = 'none';
+        return;
+    }
+    
+    // 2. VLM 检测与自动切换
+    let hasVlm = false;
+    // 优先检查 state 中的 is_vlm 标记
+    hasVlm = state.selectedModels.some(m => m.is_vlm);
+    
+    // 如果没有标记，尝试从名称推断 (fallback)
+    if (!hasVlm) {
+        hasVlm = state.selectedModels.some(m => {
+             const name = m.name || (typeof m === 'string' ? m : '');
+             return /vl|vision|vlm|llava|qwen2\.?5?\s*vl|qwen2-vl|cogvlm|minicpm-v/i.test(name);
+        });
+    }
+    
+    // 执行切换
+    const typeHidden = document.getElementById('standard-dataset-type');
+    const typeTrigger = document.getElementById('standard-dataset-type-trigger');
+    const targetType = hasVlm ? 'cmmmu' : 'mmlu';
+    
+    if (typeHidden && typeHidden.value !== targetType) {
+        typeHidden.value = targetType;
+        // 更新 UI
+        if (typeTrigger) {
+            const options = document.getElementById('standard-dataset-type-options');
+            const targetOpt = options ? options.querySelector(`.ios-option[data-value="${targetType}"]`) : null;
+            const targetText = targetOpt ? targetOpt.querySelector('.opt-name').innerText : (hasVlm ? 'CMMMU (VLM)' : 'MMLU (LLM)');
+            typeTrigger.querySelector('.selected-text').innerText = targetText;
+            
+            // 更新选中态
+            if (options) {
+                options.querySelectorAll('.ios-option').forEach(o => o.classList.remove('selected'));
+                if (targetOpt) targetOpt.classList.add('selected');
+            }
+        }
+        // 重新加载子集
+        loadStandardSubsets(targetType);
+    }
+
+    // 3. 架构兼容性检查 (调用后端)
+    if (statusDiv) {
+        statusDiv.style.display = 'block';
+        statusDiv.innerHTML = '<i class="ri-loader-4-line ri-spin"></i> 正在检查架构兼容性...';
+        statusDiv.style.background = '#f5f5f7';
+        statusDiv.style.color = '#1d1d1f';
+        
+        try {
+            const res = await fetch('/api/check_compatibility', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_paths: modelPaths })
+            });
+            const data = await res.json();
+            
+            if (data.status === 'success') {
+                if (data.compatible) {
+                    statusDiv.innerHTML = `<i class="ri-checkbox-circle-fill" style="color: var(--success);"></i> 架构兼容 (${data.types[0] || 'Unknown'})`;
+                    statusDiv.style.background = 'rgba(52, 199, 89, 0.1)';
+                    statusDiv.style.color = 'var(--success)';
+                } else {
+                    statusDiv.innerHTML = `<i class="ri-error-warning-fill" style="color: var(--error);"></i> 架构不兼容: ${data.message}`;
+                    statusDiv.style.background = 'rgba(255, 59, 48, 0.1)';
+                    statusDiv.style.color = 'var(--error)';
+                }
+            } else {
+                statusDiv.innerHTML = `<i class="ri-question-fill"></i> 无法验证: ${data.message}`;
+            }
+        } catch (e) {
+            statusDiv.innerHTML = `<i class="ri-wifi-off-line"></i> 检查失败`;
+        }
+    }
 }
 
 // 【新增】生成 SHA-256 哈希并构建默认名称
@@ -1570,6 +1826,149 @@ function renderSelectedModels() {
     hint.style.display = state.selectedModels.length > 0 ? 'none' : 'block';
 
     updateWeightSliders();
+    checkStandardCompatibilityAndDataset();
+}
+
+// [新增] 标准融合：检查架构兼容性 & 自动切换数据集类型
+async function checkStandardCompatibilityAndDataset() {
+    const statusEl = document.getElementById('standard-compatibility-status');
+    const typeHidden = document.getElementById('standard-dataset-type');
+    const typeTrigger = document.getElementById('standard-dataset-type-trigger');
+
+    if (state.selectedModels.length === 0) {
+        if (statusEl) statusEl.style.display = 'none';
+        return;
+    }
+
+    const modelPaths = state.selectedModels.map(m => (typeof m === 'string' ? null : m.path)).filter(Boolean);
+    if (modelPaths.length === 0) return;
+
+    // 1. 检查是否包含 VLM -> 自动切换数据集
+    try {
+        const results = await Promise.all(
+            modelPaths.map(p => fetch('/api/model_is_vlm?path=' + encodeURIComponent(p)).then(r => r.json()).catch(() => ({})))
+        );
+        const anyVlm = results.some(r => r.status === 'success' && r.is_vlm === true);
+        
+        // 如果是 VLM 但当前选的是 MMLU，自动切到 CMMMU
+        if (anyVlm && typeHidden && typeHidden.value !== 'cmmmu') {
+            typeHidden.value = 'cmmmu';
+            if (typeTrigger) {
+                const opt = document.querySelector('#standard-dataset-type-options .ios-option[data-value="cmmmu"]');
+                if (opt) typeTrigger.querySelector('.selected-text').innerText = (opt.querySelector('.opt-name') || opt).innerText;
+                // 更新选中样式
+                document.querySelectorAll('#standard-dataset-type-options .ios-option').forEach(o => o.classList.remove('selected'));
+                if(opt) opt.classList.add('selected');
+            }
+            loadStandardSubsets('cmmmu');
+        } else if (!anyVlm && typeHidden && typeHidden.value === 'cmmmu') {
+             // 如果全是 LLM 但当前是 CMMMU，切回 MMLU
+             typeHidden.value = 'mmlu';
+             if (typeTrigger) {
+                const opt = document.querySelector('#standard-dataset-type-options .ios-option[data-value="mmlu"]');
+                if (opt) typeTrigger.querySelector('.selected-text').innerText = (opt.querySelector('.opt-name') || opt).innerText;
+                document.querySelectorAll('#standard-dataset-type-options .ios-option').forEach(o => o.classList.remove('selected'));
+                if(opt) opt.classList.add('selected');
+             }
+             loadStandardSubsets('mmlu');
+        } else {
+            // 类型没变，但可能还没加载子集（初次）
+            const currentType = typeHidden ? typeHidden.value : 'mmlu';
+            // 检查子集列表是否为空，若空则加载
+            const opts = document.getElementById('standard-subset-options');
+            if (opts && opts.children.length === 0) {
+                loadStandardSubsets(currentType);
+            }
+        }
+    } catch (e) {
+        console.error("checkStandardCompatibilityAndDataset error:", e);
+    }
+
+    // 2. 检查架构兼容性
+    try {
+        const res = await fetch('/api/check_compatibility', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model_paths: modelPaths })
+        });
+        const data = await res.json();
+        
+        if (statusEl) {
+            statusEl.style.display = 'block';
+            if (data.compatible) {
+                statusEl.innerHTML = `<i class="ri-checkbox-circle-fill" style="color: var(--success);"></i> <strong>架构兼容</strong> <span style="color: #86868b; margin-left:8px;">${data.message || ''}</span>`;
+                statusEl.style.background = '#f2fcf5';
+                statusEl.style.border = '1px solid rgba(52, 199, 89, 0.2)';
+            } else {
+                statusEl.innerHTML = `<i class="ri-close-circle-fill" style="color: var(--error);"></i> <strong>架构不兼容</strong> <span style="color: #86868b; margin-left:8px;">${data.message || ''}</span>`;
+                statusEl.style.background = '#fff2f2';
+                statusEl.style.border = '1px solid rgba(255, 59, 48, 0.2)';
+            }
+        }
+    } catch (e) {
+        console.error("check compatibility error:", e);
+    }
+}
+
+// [新增] 加载标准融合的子集
+function loadStandardSubsets(datasetType) {
+    const labelEl = document.getElementById('standard-subset-label');
+    const triggerText = document.getElementById('standard-subset-trigger');
+    const hiddenInput = document.getElementById('standard-subset-val');
+    const optionsUl = document.getElementById('standard-subset-options');
+
+    if (!optionsUl || !hiddenInput) return;
+
+    const isMmlu = (datasetType || '').toLowerCase() === 'mmlu';
+    const apiUrl = isMmlu ? '/api/mmlu_subset_groups' : '/api/cmmmu_subset_groups';
+    const defaultId = isMmlu ? 'biology_medicine' : 'health_medicine'; // 默认选中一个
+
+    if (labelEl) labelEl.textContent = isMmlu ? 'MMLU 领域' : 'CMMMU 领域';
+
+    // 先清空
+    optionsUl.innerHTML = '<li class="ios-option">加载中...</li>';
+
+    fetch(apiUrl).then(r => r.json()).then(data => {
+        const groups = data.groups || [];
+        optionsUl.innerHTML = '';
+        
+        if (groups.length === 0) {
+            optionsUl.innerHTML = '<li class="ios-option">无数据</li>';
+            return;
+        }
+
+        groups.forEach((g) => {
+            const li = document.createElement('li');
+            li.className = 'ios-option' + (g.id === defaultId ? ' selected' : '');
+            li.dataset.value = g.id;
+            li.innerHTML = '<span class="opt-name">' + (g.label || g.id) + '</span>';
+            if (g.subsets && g.subsets.length) li.title = g.subsets.join(', '); // hover显示包含的子集
+            
+            // 绑定点击事件
+            li.onclick = () => {
+                 // UI 更新
+                 optionsUl.querySelectorAll('.ios-option').forEach(o => o.classList.remove('selected'));
+                 li.classList.add('selected');
+                 if (triggerText) triggerText.querySelector('.selected-text').innerText = (g.label || g.id);
+                 hiddenInput.value = g.id;
+                 // 关闭下拉
+                 optionsUl.parentElement.classList.remove('open');
+            };
+            
+            optionsUl.appendChild(li);
+        });
+        
+        // 设置默认值
+        hiddenInput.value = defaultId;
+        const defaultGroup = groups.find(g => g.id === defaultId) || groups[0];
+        if (triggerText && defaultGroup) {
+            triggerText.querySelector('.selected-text').innerText = (defaultGroup.label || defaultGroup.id);
+        }
+        
+    }).catch(e => {
+        console.error(e);
+        if (optionsUl) optionsUl.innerHTML = '<li class="ios-option">加载失败</li>';
+    });
 }
 
 window.removeModel = function (index) {
@@ -1711,7 +2110,22 @@ async function startMergeTask() {
     });
 
     const hasRecipe = state.selectedModels.some(m => m && m.type === 'recipe');
-    const payload = { weights: weights, method: method, dtype: dtype, custom_name: customName };
+    // const customNameInput = document.getElementById('model-name-input');
+    // const customName = customNameInput ? customNameInput.value.trim() : '';
+
+    const payload = { 
+        weights: weights, 
+        method: method, 
+        dtype: dtype, 
+        custom_name: customName 
+    };
+
+    // 获取标准融合的数据集参数
+    const stdDatasetType = document.getElementById('standard-dataset-type');
+    const stdDatasetSubset = document.getElementById('standard-subset-val');
+    if (stdDatasetType) payload.dataset_type = stdDatasetType.value;
+    if (stdDatasetSubset) payload.dataset_subset = stdDatasetSubset.value;
+
     if (hasRecipe) {
         payload.items = state.selectedModels.map(m => {
             if (m.type === 'recipe') return { type: 'recipe', recipe_id: m.recipe_id };
@@ -2139,8 +2553,121 @@ async function showTaskCompletionModal(taskId, statusData, evoProgress) {
         if (evoProgress.global_best != null) {
             metricsHtml += '<div style="margin-bottom: 6px;">全局最优准确率: <strong>' + Number(evoProgress.global_best).toFixed(4) + '</strong></div>';
         }
+        
+        // --- 新增：显示迭代信息、基因权重、数据集 ---
+        if (evoProgress.current_step != null || evoProgress.step != null) {
+            const step = evoProgress.current_step || evoProgress.step;
+            const total = evoProgress.total_expected_steps || '?';
+            metricsHtml += `<div style="margin-bottom: 6px;">迭代进度: <strong>${step} / ${total}</strong></div>`;
+        }
+
+        if (evoProgress.best_genotype) {
+            let geneStr = '';
+            if (Array.isArray(evoProgress.best_genotype)) {
+                geneStr = evoProgress.best_genotype.map(v => Number(v).toFixed(4)).join(', ');
+            } else {
+                geneStr = String(evoProgress.best_genotype);
+            }
+            metricsHtml += `<div style="margin-bottom: 6px;">最佳基因权重: <strong>[${geneStr}]</strong></div>`;
+        }
+
+        // 尝试从 detailData 获取数据集信息 (如果 fetch 成功)
+        try {
+            const detailRes = await fetch(`/api/history/${taskId}`);
+            const detailData = await detailRes.json();
+            if (detailData.status === 'success' && detailData.data) {
+                if (detailData.data.hf_dataset) {
+                     metricsHtml += `<div style="margin-bottom: 6px;">数据集: <strong>${detailData.data.hf_dataset}</strong></div>`;
+                }
+                if (detailData.data.hf_subsets && detailData.data.hf_subsets.length > 0) {
+                     // 仅显示前3个子集，避免太长
+                     const subStr = detailData.data.hf_subsets.slice(0, 3).join(', ') + (detailData.data.hf_subsets.length > 3 ? '...' : '');
+                     metricsHtml += `<div style="margin-bottom: 6px; font-size: 0.85rem; color: #666;">子集: ${subStr}</div>`;
+                }
+            }
+        } catch(e) { console.error("Fetch dataset info failed", e); }
+        // ------------------------------------------
+
         metricsEl.innerHTML = metricsHtml;
         metricsEl.style.display = 'block';
+
+        // ================== 3D 可视化图表 ==================
+        // 检查/创建图表容器
+        let plotContainer = document.getElementById('completion-3d-plot');
+        if (!plotContainer) {
+            plotContainer = document.createElement('div');
+            plotContainer.id = 'completion-3d-plot';
+            plotContainer.style.width = '100%';
+            plotContainer.style.height = '400px';
+            plotContainer.style.marginTop = '15px';
+            metricsEl.parentElement.appendChild(plotContainer);
+        } else {
+            plotContainer.innerHTML = ''; // 清空旧图表
+            plotContainer.style.display = 'block';
+        }
+
+        try {
+            const plotRes = await fetch(`/api/fusion_3d_data/${taskId}`);
+            const plotData = await plotRes.json();
+            
+            if (plotData.status === 'success' && plotData.data && plotData.data.length > 0) {
+                const x = [], y = [], z = [], c = [];
+                plotData.data.forEach(row => {
+                    // 假设 CSV 列名: genotype_1, genotype_2, objective_1
+                    // 实际列名可能略有不同，做一些容错处理
+                    const g1 = row.genotype_1 !== undefined ? row.genotype_1 : row['genotype_1'];
+                    const g2 = row.genotype_2 !== undefined ? row.genotype_2 : row['genotype_2'];
+                    const obj = row.objective_1 !== undefined ? row.objective_1 : row['objective_1'];
+                    
+                    if (g1 != null && g2 != null && obj != null) {
+                        x.push(parseFloat(g1));
+                        y.push(parseFloat(g2));
+                        z.push(parseFloat(obj));
+                        c.push(parseFloat(obj));
+                    }
+                });
+
+                if (x.length > 0) {
+                    const trace = {
+                        x: x,
+                        y: y,
+                        z: z,
+                        mode: 'markers',
+                        marker: {
+                            size: 5,
+                            color: c,
+                            colorscale: 'Viridis',
+                            opacity: 0.8,
+                            showscale: true,
+                            colorbar: { title: 'Accuracy' }
+                        },
+                        type: 'scatter3d',
+                        hovertemplate: 'G1: %{x:.4f}<br>G2: %{y:.4f}<br>Acc: %{z:.4f}<extra></extra>'
+                    };
+
+                    const layout = {
+                        title: '参数搜索空间 (Fitness Landscape)',
+                        margin: { l: 0, r: 0, b: 0, t: 30 },
+                        scene: {
+                            xaxis: { title: 'Genotype 1' },
+                            yaxis: { title: 'Genotype 2' },
+                            zaxis: { title: 'Accuracy' }
+                        }
+                    };
+
+                    Plotly.newPlot('completion-3d-plot', [trace], layout);
+                } else {
+                    plotContainer.innerHTML = '<p style="color:#999;font-size:0.9rem;">无有效 3D 数据点</p>';
+                }
+            } else {
+                plotContainer.style.display = 'none'; // 无数据时不显示容器
+            }
+        } catch (e) {
+            console.error("Load 3D data failed", e);
+            plotContainer.innerHTML = '<p style="color:#999;font-size:0.9rem;">加载 3D 数据失败</p>';
+        }
+        // ================================================
+
     } else {
         metricsEl.style.display = 'none';
     }

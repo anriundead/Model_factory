@@ -1,0 +1,36 @@
+{
+  "task_id": "c758e73e",
+  "output_dir_name": "Qwen2.5-VL-7B-Instruct_HuatuoGPT-Vision-7B-Qwen2.5VL_20260210-114144",
+  "custom_name": "Fusion-0.94",
+  "model_paths": [
+    "/home/a/ServiceEndFiles/Models/Qwen2.5-VL-7B-Instruct",
+    "/home/a/ServiceEndFiles/Models/HuatuoGPT-Vision-7B-Qwen2.5VL"
+  ],
+  "parent_names": [
+    "Qwen2.5-VL-7B-Instruct",
+    "HuatuoGPT-Vision-7B-Qwen2.5VL"
+  ],
+  "best_genotype": [
+    0.436288498763315,
+    0.4623111250420733
+  ],
+  "hf_dataset": "m-a-p/CMMMU",
+  "hf_subsets": [
+    "science",
+    "technology_and_engineering"
+  ],
+  "hf_subset_group": "stem",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 12,
+  "n_iter": 8,
+  "max_samples": 20,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 2,
+  "eval_mode": "text",
+  "completed_at": "2026-02-10T11:41:50.742857",
+  "current_best_acc": 0.2,
+  "final_test_acc": null
+}

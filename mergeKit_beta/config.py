@@ -54,10 +54,16 @@ class Config:
     NUMEXPR_MAX_THREADS = 64
     HF_ENDPOINT = "https://hf-mirror.com"
     # HuggingFace 数据集缓存目录（已下载的数据集优先从此读取，不设则使用 datasets 默认缓存）
-    HF_DATASETS_CACHE = os.environ.get("HF_DATASETS_CACHE", "").strip() or None
+    _hf_cache_env = os.environ.get("HF_DATASETS_CACHE", "").strip()
+    HF_DATASETS_CACHE = os.path.abspath(_hf_cache_env) if _hf_cache_env else os.path.join(PROJECT_ROOT, "cache", "datasets")
 
     # ==================== 融合库配置 ====================
     MERGE_LIBRARY = "mergenetic"
+
+    # ==================== 数据库配置 ====================
+    # 默认使用 SQLite，文件存储在项目根目录下
+    SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL") or "sqlite:///" + os.path.join(PROJECT_ROOT, "app.db")
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
 
     # ==================== Mergenetic 使用的 Python 环境（可选） ====================
     # 优先使用环境变量，否则尝试 mergenetic conda 环境，最后回退到 python
@@ -77,3 +83,5 @@ class Config:
         if not os.path.isdir(cls.MODEL_POOL_PATH):
             os.makedirs(cls.MODEL_POOL_PATH, exist_ok=True)
         os.makedirs(cls.EVAL_HF_DATASETS_CACHE, exist_ok=True)
+        if cls.HF_DATASETS_CACHE:
+            os.makedirs(cls.HF_DATASETS_CACHE, exist_ok=True)

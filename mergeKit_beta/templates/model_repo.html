@@ -100,15 +100,15 @@
         document.getElementById('close-sidebar').onclick = function() { document.getElementById('history-sidebar').classList.remove('open'); document.getElementById('sidebar-overlay').classList.remove('show'); };
         document.getElementById('sidebar-overlay').onclick = function() { document.getElementById('history-sidebar').classList.remove('open'); document.getElementById('sidebar-overlay').classList.remove('show'); };
 
-        var deleteModelPendingId = null;
-        function confirmDeleteModel(modelId) {
-            if (!modelId) return;
-            deleteModelPendingId = modelId;
+        var deleteModelPendingPath = null;
+        function confirmDeleteModel(path) {
+            if (!path) return;
+            deleteModelPendingPath = path;
             var overlay = document.getElementById('delete-model-overlay');
             if (overlay) { overlay.style.display = 'flex'; overlay.style.opacity = '1'; overlay.classList.add('show'); }
         }
         document.getElementById('delete-model-cancel').onclick = function() {
-            deleteModelPendingId = null;
+            deleteModelPendingPath = null;
             var overlay = document.getElementById('delete-model-overlay');
             if (overlay) { overlay.style.display = 'none'; overlay.classList.remove('show'); }
         };
@@ -117,9 +117,20 @@
         function renderMergedList(mergedEl, baseEl, d) {
             if (!d || d.status !== 'success') return;
             if (!d.base_models || d.base_models.length === 0) baseEl.innerHTML = '<p class="limit-desc">暂无基座模型</p>';
-            else baseEl.innerHTML = d.base_models.map(function(m) {
-                return '<div class="model-card"><div class="model-name">' + (m.name||'') + '</div><div class="limit-desc" style="font-size:0.8rem;">' + (pathTail(m.path) || '基座') + '</div></div>';
-            }).join('');
+            else {
+                baseEl.innerHTML = d.base_models.map(function(m) {
+                    return '<div class="model-card" style="position:relative;">' +
+                        '<button type="button" class="model-repo-delete-btn" data-path="' + (m.path || '') + '" title="删除模型" style="position:absolute; top:6px; right:6px; width:24px; height:24px; border:none; border-radius:50%; background:rgba(255,59,48,0.1); color:var(--error); cursor:pointer; font-size:1.1rem; line-height:1; display:flex; align-items:center; justify-content:center; z-index:10; transition:all 0.2s;">×</button>' +
+                        '<div class="model-name" style="padding-right:30px;">' + (m.name||'') + '</div>' +
+                        '<div class="limit-desc" style="font-size:0.8rem;">' + (pathTail(m.path) || '基座') + '</div></div>';
+                }).join('');
+                baseEl.querySelectorAll('.model-repo-delete-btn').forEach(function(btn) {
+                    btn.onmouseover = function() { this.style.background = 'rgba(255,59,48,0.2)'; this.style.transform = 'scale(1.1)'; };
+                    btn.onmouseout = function() { this.style.background = 'rgba(255,59,48,0.1)'; this.style.transform = 'scale(1)'; };
+                    btn.onclick = function(e) { e.stopPropagation(); var p = btn.getAttribute('data-path'); if (p) confirmDeleteModel(p); };
+                });
+            }
+
             if (!d.merged_models || d.merged_models.length === 0) mergedEl.innerHTML = '<p class="limit-desc">暂无已注册融合模型</p>';
             else {
                 mergedModelsData = d.merged_models;
@@ -127,8 +138,8 @@
                     var parentCount = (m.parent_models && m.parent_models.length) ? m.parent_models.length : 0;
                     var hint = parentCount ? parentCount + ' 个父代 · 点击查看详情' : '点击查看详情';
                     return '<div class="model-card model-card-clickable" data-merged-index="' + i + '" data-model-id="' + (m.model_id || '') + '" style="cursor:pointer; position:relative;">' +
-                        '<button type="button" class="model-repo-delete-btn" data-model-id="' + (m.model_id || '') + '" title="删除模型" style="position:absolute; top:8px; right:8px; width:28px; height:28px; border:none; border-radius:6px; background:rgba(255,59,48,0.15); color:var(--error); cursor:pointer; font-size:1rem; line-height:1;">×</button>' +
-                        '<div class="model-name">' + (m.name||m.model_id) + '</div>' +
+                        '<button type="button" class="model-repo-delete-btn" data-path="' + (m.path || '') + '" title="删除模型" style="position:absolute; top:6px; right:6px; width:24px; height:24px; border:none; border-radius:50%; background:rgba(255,59,48,0.1); color:var(--error); cursor:pointer; font-size:1.1rem; line-height:1; display:flex; align-items:center; justify-content:center; transition:all 0.2s;">×</button>' +
+                        '<div class="model-name" style="padding-right:30px;">' + (m.name||m.model_id) + '</div>' +
                         '<div class="limit-desc" style="font-size:0.8rem; margin-top:4px;">' + hint + '</div></div>';
                 }).join('');
                 mergedEl.querySelectorAll('.model-card-clickable').forEach(function(card) {
@@ -138,47 +149,69 @@
                     };
                 });
                 mergedEl.querySelectorAll('.model-repo-delete-btn').forEach(function(btn) {
-                    btn.onclick = function(e) { e.stopPropagation(); var id = btn.getAttribute('data-model-id'); if (id) confirmDeleteModel(id); };
+                    btn.onmouseover = function() { this.style.background = 'rgba(255,59,48,0.2)'; this.style.transform = 'scale(1.1)'; };
+                    btn.onmouseout = function() { this.style.background = 'rgba(255,59,48,0.1)'; this.style.transform = 'scale(1)'; };
+                    btn.onclick = function(e) { e.stopPropagation(); var p = btn.getAttribute('data-path'); if (p) confirmDeleteModel(p); };
                 });
             }
         }
         function refreshRepoListThen(callback) {
-            fetch('/api/model_repo/list').then(function(r) { return r.json(); }).then(function(d) {
-                var mergedEl = document.getElementById('model-repo-merged');
-                var baseEl = document.getElementById('model-repo-base');
-                if (mergedEl && baseEl) renderMergedList(mergedEl, baseEl, d);
+            var mergedEl = document.getElementById('model-repo-merged');
+            var baseEl = document.getElementById('model-repo-base');
+            
+            Promise.all([
+                fetch('/api/models').then(function(r) { return r.json(); }),
+                fetch('/api/merged_models').then(function(r) { return r.json(); })
+            ]).then(function(results) {
+                var baseData = results[0];
+                var mergedData = results[1];
+                var combined = {
+                    status: 'success',
+                    base_models: baseData.models || [],
+                    merged_models: mergedData.models || []
+                };
+                if (mergedEl && baseEl) renderMergedList(mergedEl, baseEl, combined);
                 if (callback) callback();
             }).catch(function() { if (callback) callback(); });
         }
 
         document.getElementById('delete-model-confirm').onclick = function() {
-            if (!deleteModelPendingId) return;
-            var id = String(deleteModelPendingId).trim();
-            if (!id) return;
+            if (!deleteModelPendingPath) return;
+            var path = String(deleteModelPendingPath).trim();
+            if (!path) return;
             var overlay = document.getElementById('delete-model-overlay');
             var confirmBtn = document.getElementById('delete-model-confirm');
             confirmBtn.disabled = true;
             confirmBtn.textContent = '删除中...';
-            fetch('/api/model_repo/' + encodeURIComponent(id), { method: 'DELETE' })
+            
+            fetch('/api/models/delete', { 
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: path })
+            })
                 .then(function(r) {
                     var contentType = r.headers.get('content-type') || '';
                     if (contentType.indexOf('application/json') !== -1) return r.json();
                     return r.text().then(function(t) { return { status: 'error', message: r.status ? (r.status + ' ' + (t || r.statusText)) : '请求失败' }; });
                 })
                 .then(function(data) {
+                    // 无论成功失败，都刷新列表
                     refreshRepoListThen(function() {
                         confirmBtn.disabled = false;
                         confirmBtn.textContent = '确认删除';
-                        deleteModelPendingId = null;
+                        deleteModelPendingPath = null;
                         if (overlay) { overlay.style.display = 'none'; overlay.classList.remove('show'); }
-                        if (data && data.status === 'success') alert('已删除');
-                        else alert((data && data.message) ? data.message : '删除失败');
+                        if (data && data.status === 'success') {
+                            // alert('已删除'); // 成功可以不弹窗，直接刷新消失更流畅，或者用 toast
+                        } else {
+                            alert((data && data.message) ? data.message : '删除失败');
+                        }
                     });
                 })
                 .catch(function(err) {
                     confirmBtn.disabled = false;
                     confirmBtn.textContent = '确认删除';
-                    deleteModelPendingId = null;
+                    deleteModelPendingPath = null;
                     if (overlay) { overlay.style.display = 'none'; overlay.classList.remove('show'); }
                     refreshRepoListThen(function() {});
                     alert('请求失败：' + (err && err.message ? err.message : '网络或服务器错误'));

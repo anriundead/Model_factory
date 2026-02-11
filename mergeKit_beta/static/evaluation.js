@@ -11,6 +11,7 @@ let evalState = {
 let currentTaskId = null;
 let pollTimer = null;
 let deleteTargetId = null; // 用于删除功能
+const STORAGE_ACTIVE_EVAL = 'mergekit_eval_active_task';
 
 function initEval() {
     loadAllModels();
@@ -20,6 +21,27 @@ function initEval() {
     setupDeleteModal();
     initSegmentedControls();
     setupTestsetRefresh();
+    const tid = sessionStorage.getItem(STORAGE_ACTIVE_EVAL);
+    if (tid) {
+        currentTaskId = tid;
+        pollStatus(currentTaskId);
+    } else {
+        // 无会话ID时，回退到历史记录中查找运行中的评估任务
+        try {
+            fetch('/api/test_history')
+                .then(r => r.json())
+                .then(d => {
+                    const list = (d.history || []).filter(it => (it && it.type === 'eval_only'));
+                    const running = list.find(it => it && (it.status === 'running' || it.status === 'queued'));
+                    if (running && running.id) {
+                        currentTaskId = running.id;
+                        try { sessionStorage.setItem(STORAGE_ACTIVE_EVAL, currentTaskId); } catch (e) {}
+                        pollStatus(currentTaskId);
+                    }
+                })
+                .catch(() => {});
+        } catch (e) {}
+    }
 }
 
 function initSegmentedControls() {
@@ -49,7 +71,7 @@ function onDatasetSourceChange(value) {
 
 let testsetsList = [];
 let activeRepoFetchKey = null;
-const TESTSETS_CACHE_KEY = 'testsets_cache_v1';
+const TESTSETS_CACHE_KEY = 'testsets_cache_v3';
 function loadTestsetsCache() {
     try {
         const raw = sessionStorage.getItem(TESTSETS_CACHE_KEY);
@@ -161,12 +183,14 @@ function fillSubsetSplitFromTestset(t) {
             .then(r => r.json())
             .then(d => {
                 clearTimeout(timeoutId);
-                if (activeRepoFetchKey !== fetchKey) return;
-                if ((document.getElementById('eval-testset-id').value || '') !== (t.testset_id || '')) return;
-                if ((document.getElementById('eval-hf-dataset').value || '') !== (t.hf_dataset || '')) return;
-                // 移除加载状态
                 subsetWrapper.classList.remove('loading');
                 splitWrapper.classList.remove('loading');
+                if (activeRepoFetchKey !== fetchKey ||
+                    (document.getElementById('eval-testset-id').value || '') !== (t.testset_id || '') ||
+                    (document.getElementById('eval-hf-dataset').value || '') !== (t.hf_dataset || '')) {
+                    setDefaultSubsetSplit(subsetVal, splitVal);
+                    return;
+                }
                 
                 if (d.status === 'success') {
                     // 更新子集下拉框
@@ -176,18 +200,16 @@ function fillSubsetSplitFromTestset(t) {
                         if (subsetVal && !configsSet.has(subsetVal)) {
                             configs.unshift(subsetVal);
                         }
-                        const nextSubset = subsetVal || (configs[0] || '');
-                        subsetUl.innerHTML = '<li class="ios-option' + (nextSubset ? '' : ' selected') + '" data-value="">— 无</li>' + configs.map(c => '<li class="ios-option' + (c === nextSubset ? ' selected' : '') + '" data-value="' + c + '">' + c + '</li>').join('');
-                        subsetTrigger.querySelector('.selected-text').textContent = nextSubset || '— 无';
+                        const nextSubset = subsetVal || (configs[0] || 'all');
+                        subsetUl.innerHTML = configs.map(c => '<li class="ios-option' + (c === nextSubset ? ' selected' : '') + '" data-value="' + c + '">' + c + '</li>').join('');
+                        subsetTrigger.querySelector('.selected-text').textContent = nextSubset || 'all';
                         document.getElementById('eval-subset').value = nextSubset;
                     } else {
                         // 没有 configs 时设置默认值
-                        subsetUl.innerHTML = '<li class="ios-option' + (subsetVal ? '' : ' selected') + '" data-value="">— 无</li>';
-                        if (subsetVal) {
-                            subsetUl.innerHTML += '<li class="ios-option selected" data-value="' + subsetVal + '">' + subsetVal + '</li>';
-                        }
-                        subsetTrigger.querySelector('.selected-text').textContent = subsetVal || '— 无';
-                        document.getElementById('eval-subset').value = subsetVal;
+                        const nextSubset = subsetVal || 'all';
+                        subsetUl.innerHTML = '<li class="ios-option' + (nextSubset === 'all' ? ' selected' : '') + '" data-value="all">all</li>' + (subsetVal && subsetVal !== 'all' ? '<li class="ios-option selected" data-value="' + subsetVal + '">' + subsetVal + '</li>' : '');
+                        subsetTrigger.querySelector('.selected-text').textContent = nextSubset;
+                        document.getElementById('eval-subset').value = nextSubset;
                     }
                     // 更新 split 下拉框
                     if (d.splits && d.splits.length) {
@@ -204,12 +226,16 @@ function fillSubsetSplitFromTestset(t) {
                         document.getElementById('eval-split').value = nextSplit;
                     } else {
                         // 默认 splits
-                        splitUl.innerHTML = '<li class="ios-option' + (splitVal === 'train' ? ' selected' : '') + '" data-value="train">train</li><li class="ios-option' + (splitVal === 'validation' ? ' selected' : '') + '" data-value="validation">validation</li><li class="ios-option' + (splitVal === 'test' ? ' selected' : '') + '" data-value="test">test</li>';
-                        if (splitVal && !['train', 'validation', 'test'].includes(splitVal)) {
+                        let defaultSplitsHtml = '<li class="ios-option' + (splitVal === 'all' ? ' selected' : '') + '" data-value="all">all</li>';
+                        defaultSplitsHtml += '<li class="ios-option' + (splitVal === 'train' ? ' selected' : '') + '" data-value="train">train</li>';
+                        defaultSplitsHtml += '<li class="ios-option' + (splitVal === 'validation' ? ' selected' : '') + '" data-value="validation">validation</li>';
+                        defaultSplitsHtml += '<li class="ios-option' + (splitVal === 'test' ? ' selected' : '') + '" data-value="test">test</li>';
+                        splitUl.innerHTML = defaultSplitsHtml;
+                        if (splitVal && !['all', 'train', 'validation', 'test'].includes(splitVal)) {
                             splitUl.innerHTML = '<li class="ios-option selected" data-value="' + splitVal + '">' + splitVal + '</li>' + splitUl.innerHTML;
                         }
-                        splitTrigger.querySelector('.selected-text').textContent = splitVal;
-                        document.getElementById('eval-split').value = splitVal;
+                        splitTrigger.querySelector('.selected-text').textContent = splitVal || 'all';
+                        document.getElementById('eval-split').value = splitVal || 'all';
                     }
                 } else {
                     // API 返回失败，使用默认值
@@ -230,21 +256,22 @@ function fillSubsetSplitFromTestset(t) {
     }
     
     function setDefaultSubsetSplit(subsetVal, splitVal) {
-        subsetUl.innerHTML = '<li class="ios-option' + (subsetVal ? '' : ' selected') + '" data-value="">— 无</li>';
-        splitUl.innerHTML = '<li class="ios-option' + (splitVal === 'train' ? ' selected' : '') + '" data-value="train">train</li><li class="ios-option' + (splitVal === 'validation' ? ' selected' : '') + '" data-value="validation">validation</li><li class="ios-option' + (splitVal === 'test' ? ' selected' : '') + '" data-value="test">test</li>';
-        subsetTrigger.querySelector('.selected-text').textContent = subsetVal || '— 无';
-        splitTrigger.querySelector('.selected-text').textContent = splitVal;
-        document.getElementById('eval-subset').value = subsetVal;
-        document.getElementById('eval-split').value = splitVal;
+        const nextSubset = subsetVal || 'all';
+        subsetUl.innerHTML = '<li class="ios-option' + (nextSubset === 'all' ? ' selected' : '') + '" data-value="all">all</li>';
+        splitUl.innerHTML = '<li class="ios-option' + (splitVal === 'all' ? ' selected' : '') + '" data-value="all">all</li><li class="ios-option' + (splitVal === 'train' ? ' selected' : '') + '" data-value="train">train</li><li class="ios-option' + (splitVal === 'validation' ? ' selected' : '') + '" data-value="validation">validation</li><li class="ios-option' + (splitVal === 'test' ? ' selected' : '') + '" data-value="test">test</li>';
+        subsetTrigger.querySelector('.selected-text').textContent = nextSubset;
+        splitTrigger.querySelector('.selected-text').textContent = splitVal || 'all';
+        document.getElementById('eval-subset').value = nextSubset;
+        document.getElementById('eval-split').value = splitVal || 'all';
         if (subsetVal) {
             const li = document.createElement('li');
             li.className = 'ios-option selected';
             li.dataset.value = subsetVal;
             li.textContent = subsetVal;
             subsetUl.appendChild(li);
-            subsetUl.querySelector('[data-value=""]').classList.remove('selected');
+            subsetUl.querySelector('[data-value="all"]').classList.remove('selected');
         }
-        if (splitVal && !['train', 'validation', 'test'].includes(splitVal)) {
+        if (splitVal && !['all', 'train', 'validation', 'test'].includes(splitVal)) {
             const li = document.createElement('li');
             li.className = 'ios-option selected';
             li.dataset.value = splitVal;
@@ -306,11 +333,13 @@ async function selectCustomHfDataset(hfId) {
             customSplits = data.splits || ['train', 'validation', 'test'];
             const subUl = document.getElementById('eval-custom-subset-options');
             const splitUl = document.getElementById('eval-custom-split-options');
-            subUl.innerHTML = '<li class="ios-option selected" data-value="">— 无</li>' + (customConfigs.map(c => '<li class="ios-option" data-value="' + c + '">' + c + '</li>').join(''));
-            splitUl.innerHTML = customSplits.map(s => '<li class="ios-option' + (s === 'test' ? ' selected' : '') + '" data-value="' + s + '">' + s + '</li>').join('');
-            document.getElementById('eval-custom-subset-trigger').querySelector('.selected-text').textContent = '— 无';
+            const initialSubset = customConfigs.length ? customConfigs[0] : 'all';
+            subUl.innerHTML = (customConfigs.length ? '' : '<li class="ios-option selected" data-value="all">all</li>') + (customConfigs.map(c => '<li class="ios-option' + (c === initialSubset ? ' selected' : '') + '" data-value="' + c + '">' + c + '</li>').join(''));
+            const baseSplits = customSplits.length ? customSplits : ['all', 'train', 'validation', 'test'];
+            splitUl.innerHTML = baseSplits.map(s => '<li class="ios-option' + (s === 'test' ? ' selected' : '') + '" data-value="' + s + '">' + s + '</li>').join('');
+            document.getElementById('eval-custom-subset-trigger').querySelector('.selected-text').textContent = initialSubset;
             document.getElementById('eval-custom-split-trigger').querySelector('.selected-text').textContent = 'test';
-            document.getElementById('eval-custom-subset').value = '';
+            document.getElementById('eval-custom-subset').value = initialSubset;
             document.getElementById('eval-custom-split').value = 'test';
         }
     } catch (e) { }
@@ -637,6 +666,11 @@ function setupEvalUI() {
             document.getElementById('start-eval').innerText = "开始测试";
             document.getElementById('start-eval').disabled = true; // 因为 clearSelection 会清空模型
             
+            // 重置状态显示
+            document.querySelector('.status-message').innerText = "准备就绪";
+            const progressContainer = document.querySelector('.progress-container');
+            if (progressContainer) progressContainer.style.display = 'none';
+
             // 如果是从历史记录重置回来的，需要刷新一下列表状态
             loadHistoryList(); 
         }
@@ -700,6 +734,7 @@ async function startEvaluation() {
         const data = await response.json();
         if (data.status === 'success') {
             currentTaskId = data.task_id;
+            try { sessionStorage.setItem(STORAGE_ACTIVE_EVAL, currentTaskId); } catch (e) {}
             pollStatus(currentTaskId);
             // 刷新历史列表，显示新任务
             loadHistoryList(); 
@@ -719,6 +754,8 @@ async function stopEvalTask() {
     if(!confirm("确定停止测试？")) return;
     
     await fetch(`/api/stop/${currentTaskId}`, { method: 'POST' });
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    try { sessionStorage.removeItem(STORAGE_ACTIVE_EVAL); } catch (e) {}
     resetUI();
     setStatusUI("测试已停止", 0, false, '#86868b');
 }
@@ -740,11 +777,32 @@ function pollStatus(taskId) {
             const data = await res.json();
             
             if (data.status === 'running' || data.status === 'queued') {
-                const msg = data.status === 'queued' ? `排队中 (${data.queue_position || 0})` : normalizeEvalStatusMessage(data.message, data.status);
+                // 确保进度条容器可见（用于刷新页面后的恢复）
+                const progressContainer = document.querySelector('.progress-container');
+                if (progressContainer && progressContainer.style.display === 'none') {
+                    progressContainer.style.display = 'block';
+                }
+
+                let msg = data.status === 'queued' ? `排队中 (${data.queue_position || 0})` : normalizeEvalStatusMessage(data.message, data.status);
                 let prog = data.status === 'queued' ? 100 : (data.progress || 0);
                 const stripe = data.status === 'queued';
                 if (data.status === 'running' && (!data.progress || data.progress <= 0)) {
                     prog = Math.min(5, Math.floor(pollCount / 6) + 1);
+                }
+                const ep = data.eval_progress || null;
+                if (ep && typeof ep.current === 'number' && typeof ep.total === 'number') {
+                    const eta = typeof ep.eta_seconds === 'number' ? ep.eta_seconds : null;
+                    if (eta !== null && isFinite(eta) && eta > 0) {
+                        const m = Math.floor(eta / 60);
+                        const s = Math.floor(eta % 60);
+                        msg = `${msg} (${ep.current}/${ep.total}) ETA ${m}:${s.toString().padStart(2,'0')}`;
+                    } else {
+                        msg = `${msg} (${ep.current}/${ep.total})`;
+                    }
+                    if (!data.progress && typeof ep.percent === 'number') {
+                        const pct = Math.max(0, Math.min(100, ep.percent));
+                        prog = Math.floor(30 + (65 * pct / 100));
+                    }
                 }
                 
                 setStatusUI(msg, prog, stripe);
@@ -753,6 +811,7 @@ function pollStatus(taskId) {
             else if (['completed', 'error', 'stopped'].includes(data.status)) {
                 clearInterval(pollTimer);
                 currentTaskId = null;
+                 try { sessionStorage.removeItem(STORAGE_ACTIVE_EVAL); } catch (e) {}
                 resetUI();
                 
                 if (data.status === 'completed') {
@@ -767,7 +826,8 @@ function pollStatus(taskId) {
                     }
                     
                 } else {
-                    setStatusUI(data.message || "任务失败", 0, false, '#ff3b30');
+                    const isStopped = data.status === 'stopped';
+                    setStatusUI(data.message || (isStopped ? "测试已停止" : "任务失败"), 0, false, isStopped ? '#86868b' : '#ff3b30');
                 }
             }
         } catch(e) { console.error(e); }
@@ -781,6 +841,8 @@ function resetUI() {
     startBtn.disabled = false;
     startBtn.innerText = "开始测试";
     clearBtn.innerText = "重置";
+    const progressContainer = document.querySelector('.progress-container');
+    if (progressContainer) progressContainer.style.display = 'none';
 }
 
 function setStatusUI(msg, progress, stripe, color) {
@@ -904,10 +966,10 @@ function drawChart(compData, baseName) {
                         label: function(context) {
                             const idx = context.dataIndex;
                             if (context.datasetIndex === 0) {
-                                if (baseAllZero) return baseName + ': 0（无数据占位）';
+                                if (baseAllZero) return baseName + ': (暂无数据)';
                                 return baseName + ': ' + displayBase[idx];
                             }
-                            if (mergedAllZero) return 'Target Model: 0（无数据占位）';
+                            if (mergedAllZero) return 'Target Model: (暂无数据)';
                             return 'Target Model: ' + displayMerged[idx];
                         }
                     }

@@ -1199,6 +1199,11 @@ def _testset_repo_path():
 def _resolve_dataset_sample_count(hf_dataset, hf_subset, hf_split, cache_dir):
     if not (hf_dataset or "").strip():
         return 0, None, None
+
+    # [Patch] Handle MMLU custom domain subsets by using a proxy subset to get splits
+    if hf_dataset == "cais/mmlu" and hf_subset in ["stem", "biology", "law", "society", "humanities", "other"]:
+        hf_subset = "abstract_algebra"
+
     try:
         from datasets import load_dataset_builder, get_dataset_config_names
         subset_candidates = []
@@ -1465,50 +1470,7 @@ def api_testset_create():
     return jsonify({"status": "success", "testset_id": testset_id, "testset": entry})
 
 
-def _load_leaderboard():
-    """加载 leaderboard 数据。"""
-    lb_path = os.path.join(Config.PROJECT_ROOT, "testset_repo", "data", "leaderboard.json")
-    if not os.path.isfile(lb_path):
-        return {}
-    try:
-        with open(lb_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("leaderboards", {})
-    except Exception:
-        return {}
 
-
-@app.route("/api/testset/<testset_id>")
-def api_testset_get(testset_id):
-    """获取测试集详情，包含 leaderboard（在该测试集上测评过的模型+分数）。"""
-    refresh = request.args.get("refresh", "0") in ("1", "true", "yes")
-    testset = _get_testset_by_id(testset_id, refresh=refresh)
-    if not testset:
-        return jsonify({"status": "error", "message": "Not found"}), 404
-    # 获取该测试集的 leaderboard
-    leaderboards = _load_leaderboard()
-    lb = leaderboards.get(testset_id, [])
-    lb_norm = []
-    for item in lb:
-        acc = item.get("accuracy", None)
-        acc_val = None
-        try:
-            if acc is not None:
-                acc_val = float(acc)
-        except Exception:
-            acc_val = None
-        if acc_val is not None and acc_val <= 1:
-            acc_val = acc_val * 100
-        new_item = dict(item)
-        if acc_val is not None:
-            new_item["accuracy"] = round(acc_val, 4)
-        lb_norm.append(new_item)
-    lb_sorted = sorted(lb_norm, key=lambda x: x.get("accuracy", 0) or 0, reverse=True)
-    return jsonify({
-        "status": "success",
-        "testset": testset,
-        "leaderboard": lb_sorted,
-    })
 
 
 @app.route("/api/test_history")

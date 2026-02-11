@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="static/styles.css">
     <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/misans-webfont/misans-style.css" />
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <link rel="icon" type="image/x-icon" href="static/favicon.ico">
 </head>
 <body>
@@ -74,6 +75,76 @@
         </div>
     </div>
 
+    <!-- 融合结果详情弹窗 -->
+    <div id="fusion-detail-overlay" class="modal-overlay" style="display:none; opacity:0;">
+        <div class="ios-modal" style="max-width: 900px; max-height: 90vh; overflow-y: auto;" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3 id="fusion-detail-title">融合任务详情</h3>
+                <p id="fusion-detail-subtitle" class="limit-desc" style="margin-top: 8px;"></p>
+            </div>
+            <div id="fusion-detail-body" style="padding: 0 20px 20px;">
+                <!-- 基本信息卡片 -->
+                <div class="detail-card">
+                    <h4>基本参数</h4>
+                    <div id="fusion-basic-info" class="info-grid"></div>
+                </div>
+                
+                <!-- 3D 可视化图表 -->
+                <div class="detail-card" id="fusion-3d-container" style="display:none; margin-top: 16px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                        <h4>参数搜索空间 (3D)</h4>
+                        <span class="badge" style="background:#e3f2fd; color:#007aff;">Interactive</span>
+                    </div>
+                    <div id="plotly-3d-chart" style="width:100%; height:500px; border-radius:12px; border:1px solid #eee;"></div>
+                </div>
+
+                <!-- 进化过程数据 -->
+                <div class="detail-card" id="fusion-evo-container" style="display:none; margin-top: 16px;">
+                    <h4>进化过程</h4>
+                    <div id="fusion-evo-info" class="info-grid"></div>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button id="fusion-detail-close" class="ios-btn ios-btn-confirm">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <style>
+        .detail-card {
+            background: #f9f9f9;
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+        .detail-card h4 {
+            margin: 0 0 12px 0;
+            font-size: 0.95rem;
+            color: #1d1d1f;
+            font-weight: 600;
+        }
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 12px;
+        }
+        .info-item {
+            display: flex;
+            flex-direction: column;
+        }
+        .info-label {
+            font-size: 0.8rem;
+            color: #86868b;
+            margin-bottom: 4px;
+        }
+        .info-value {
+            font-size: 0.9rem;
+            color: #1d1d1f;
+            font-weight: 500;
+            word-break: break-all;
+        }
+    </style>
+
     <script>
         document.addEventListener('DOMContentLoaded', () => {
             loadFusionHistory();
@@ -91,6 +162,8 @@
                     return;
                 }
                 const history = data.history || [];
+                window.fusionHistoryData = history; // Cache for detail view
+                
                 if (history.length === 0) {
                     container.innerHTML = '<p class="limit-desc">暂无融合历史记录</p>';
                     return;
@@ -106,33 +179,44 @@
                     const step = evo.step || 0;
                     const currentStep = evo.current_step || step;
                     const totalExpectedSteps = evo.total_expected_steps;
-                    // 计算迭代次数：step / pop_size（向上取整）
+                    
+                    // 修复迭代次数计算: 确保 pop_size 存在且 > 0
                     const popSize = task.pop_size || 20;
                     const nIter = task.n_iter || 15;
-                    const completedIterations = popSize > 0 ? Math.ceil(currentStep / popSize) : 0;
+                    
+                    let displayStep = currentStep;
+                    // 如果任务成功完成，强制显示为满迭代 (修复旧任务进度记录不全的问题)
+                    if (status === 'success' && popSize > 0 && nIter > 0) {
+                        const totalSteps = popSize * nIter;
+                        if (displayStep < totalSteps) displayStep = totalSteps;
+                    }
+                    
+                    const completedIterations = popSize > 0 ? Math.ceil(displayStep / popSize) : 0;
                     const expectedIterations = nIter;
-                    // 显示格式：如果知道总步数，显示 "评估次数/总评估次数 (迭代次数/总迭代次数)"
+                    
                     let stepDisplay = '';
                     if (currentStep > 0) {
-                        if (totalExpectedSteps && totalExpectedSteps > 0) {
-                            stepDisplay = `${currentStep}/${totalExpectedSteps} 次评估`;
-                            if (completedIterations > 0 && expectedIterations > 0) {
-                                stepDisplay += ` (${completedIterations}/${expectedIterations} 迭代)`;
-                            }
+                        // 优先展示更有意义的迭代信息 (Generation)
+                        if (expectedIterations > 0 && popSize > 0) {
+                            stepDisplay = `Gen: ${completedIterations} / ${expectedIterations}`;
+                        } else if (totalExpectedSteps > 0) {
+                            // 非进化算法或未知迭代数，显示百分比
+                            const pct = Math.floor((currentStep / totalExpectedSteps) * 100);
+                            stepDisplay = `${pct}% (${currentStep}/${totalExpectedSteps})`;
                         } else {
-                            stepDisplay = `${currentStep} 次评估`;
-                            if (completedIterations > 0 && expectedIterations > 0) {
-                                stepDisplay += ` (${completedIterations}/${expectedIterations} 迭代)`;
-                            } else if (completedIterations > 0) {
-                                stepDisplay += ` (${completedIterations} 迭代)`;
-                            }
+                            stepDisplay = `Step: ${currentStep}`;
                         }
                     } else {
-                        stepDisplay = '—';
+                        stepDisplay = 'Waiting';
                     }
+                    
                     const hasRecipe = task.has_recipe ? '✓' : '✗';
+                    
+                    // 将 task 对象转为 JSON 字符串，以便点击时传递 (需要转义引号)
+                    const taskJson = JSON.stringify(task).replace(/"/g, '&quot;');
+                    
                     return `
-                        <div class="history-item" style="padding: 20px; border-bottom: 1px solid var(--apple-border);">
+                        <div class="history-item" onclick="showFusionDetail(${taskJson})" style="padding: 20px; border-bottom: 1px solid var(--apple-border); cursor: pointer; transition: background 0.2s;" onmouseover="this.style.background='#f5f5f7'" onmouseout="this.style.background='transparent'">
                             <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 12px;">
                                 <div>
                                     <h4 style="margin: 0 0 4px 0; font-size: 1.1rem;">${customName}</h4>
@@ -152,7 +236,7 @@
                                     <div style="font-size: 1.2rem; font-weight: 600;">${globalBest}</div>
                                 </div>
                                 <div>
-                                    <div style="font-size: 0.85rem; color: var(--apple-gray); margin-bottom: 4px;">完成步骤</div>
+                                    <div style="font-size: 0.85rem; color: var(--apple-gray); margin-bottom: 4px;">进度 (Eval/Iter)</div>
                                     <div style="font-size: 1rem; font-weight: 600; line-height: 1.4;">${stepDisplay}</div>
                                 </div>
                                 <div>
@@ -173,6 +257,157 @@
                 container.innerHTML = '<p class="limit-desc">加载失败: ' + e.message + '</p>';
             }
         }
+        
+        // 显示融合详情弹窗
+        function showFusionDetail(task) {
+            const overlay = document.getElementById('fusion-detail-overlay');
+            const title = document.getElementById('fusion-detail-title');
+            const subtitle = document.getElementById('fusion-detail-subtitle');
+            const basicInfo = document.getElementById('fusion-basic-info');
+            const evoInfo = document.getElementById('fusion-evo-info');
+            const evoContainer = document.getElementById('fusion-evo-container');
+            
+            title.innerText = task.custom_name || '融合任务详情';
+            subtitle.innerText = `ID: ${task.task_id || 'Unknown'} · ${task.created_at ? new Date(task.created_at * 1000).toLocaleString('zh-CN') : ''}`;
+            
+            // 填充基本信息
+            const methodDisplay = task.method || (task.evolution_progress ? 'Evolutionary (Ties-Dare)' : 'Unknown');
+            basicInfo.innerHTML = `
+                <div class="info-item"><span class="info-label">状态</span><span class="info-value">${task.status || 'unknown'}</span></div>
+                <div class="info-item"><span class="info-label">融合方法</span><span class="info-value">${methodDisplay}</span></div>
+                <div class="info-item"><span class="info-label">模型数量</span><span class="info-value">${(task.model_paths || []).length}</span></div>
+                <div class="info-item"><span class="info-label">Pop Size</span><span class="info-value">${task.pop_size || '-'}</span></div>
+                <div class="info-item"><span class="info-label">Target Iters</span><span class="info-value">${task.n_iter || '-'}</span></div>
+            `;
+            
+            // 填充进化过程
+            const evo = task.evolution_progress || {};
+            if (Object.keys(evo).length > 0) {
+                evoContainer.style.display = 'block';
+                
+                // Calculate iteration
+                const popSize = task.pop_size || 20;
+                let currentStep = evo.current_step || evo.step || 0;
+                
+                // 如果任务成功完成，强制显示为满迭代
+                if (task.status === 'success' && popSize > 0 && task.n_iter > 0) {
+                     const totalSteps = popSize * task.n_iter;
+                     if (currentStep < totalSteps) currentStep = totalSteps;
+                }
+                
+                const currentIter = popSize > 0 ? Math.ceil(currentStep / popSize) : 0;
+
+                evoInfo.innerHTML = `
+                    <div class="info-item"><span class="info-label">当前最优</span><span class="info-value">${evo.current_best != null ? Number(evo.current_best).toFixed(4) : '-'}</span></div>
+                    <div class="info-item"><span class="info-label">全局最优</span><span class="info-value">${evo.global_best != null ? Number(evo.global_best).toFixed(4) : '-'}</span></div>
+                    <div class="info-item"><span class="info-label">当前迭代 (Iter)</span><span class="info-value">${currentIter} / ${task.n_iter || '-'}</span></div>
+                `;
+            } else {
+                evoContainer.style.display = 'none';
+            }
+            
+            // 加载 3D 图表
+            fetchAndRender3D(task.task_id);
+            
+            // 显示弹窗
+            overlay.style.display = 'flex';
+            requestAnimationFrame(() => overlay.style.opacity = '1');
+        }
+        
+        // 加载并渲染 3D 图表
+        async function fetchAndRender3D(taskId) {
+            const container = document.getElementById('fusion-3d-container');
+            const chartDiv = document.getElementById('plotly-3d-chart');
+            container.style.display = 'none';
+            
+            if (!taskId) return;
+            
+            try {
+                const res = await fetch('/api/fusion_3d_data/' + taskId);
+                const data = await res.json();
+                
+                if (data.status === 'success' && data.data && data.data.length > 0) {
+                    container.style.display = 'block';
+                    
+                    const points = data.data;
+                    const keys = Object.keys(points[0]);
+                    
+                    // Heuristic to find Z (accuracy) and X/Y (params)
+                    // Z is likely "acc", "accuracy", "score", "f1"
+                    let zKey = keys.find(k => /acc|score|f1|result/i.test(k));
+                    if (!zKey) zKey = keys[keys.length - 1]; // Fallback to last column
+                    
+                    // X/Y are the other numeric columns
+                    const paramKeys = keys.filter(k => k !== zKey && !isNaN(parseFloat(points[0][k])));
+                    
+                    if (paramKeys.length < 1) {
+                         console.warn("Not enough parameters for 3D plot");
+                         return;
+                    }
+                    
+                    const xKey = paramKeys[0];
+                    const yKey = paramKeys.length > 1 ? paramKeys[1] : xKey; // If 1D, use same for Y or 0
+                    
+                    const x = points.map(p => parseFloat(p[xKey]));
+                    const y = points.map(p => parseFloat(p[yKey]));
+                    const z = points.map(p => parseFloat(p[zKey]));
+                    const text = points.map(p => {
+                        let t = '';
+                        keys.forEach(k => t += `${k}: ${p[k]}<br>`);
+                        return t;
+                    });
+                    
+                    const trace = {
+                        x: x,
+                        y: y,
+                        z: z,
+                        mode: 'markers',
+                        marker: {
+                            size: 5,
+                            color: z,
+                            colorscale: 'Viridis',
+                            showscale: true,
+                            opacity: 0.8
+                        },
+                        type: 'scatter3d',
+                        text: text,
+                        hoverinfo: 'text'
+                    };
+                    
+                    const layout = {
+                        margin: { l: 0, r: 0, b: 0, t: 0 },
+                        scene: {
+                            xaxis: { title: xKey },
+                            yaxis: { title: yKey },
+                            zaxis: { title: zKey }
+                        },
+                        height: 500,
+                        paper_bgcolor: 'rgba(0,0,0,0)',
+                        plot_bgcolor: 'rgba(0,0,0,0)'
+                    };
+                    
+                    Plotly.newPlot(chartDiv, [trace], layout, {responsive: true});
+                } else {
+                     container.style.display = 'none';
+                }
+            } catch (e) {
+                console.error("Failed to load 3D data", e);
+            }
+        }
+        
+        // 关闭弹窗
+        document.getElementById('fusion-detail-close').onclick = () => {
+            const overlay = document.getElementById('fusion-detail-overlay');
+            overlay.style.opacity = '0';
+            setTimeout(() => overlay.style.display = 'none', 300);
+        };
+        
+        // 点击遮罩关闭
+        document.getElementById('fusion-detail-overlay').onclick = (e) => {
+            if (e.target === document.getElementById('fusion-detail-overlay')) {
+                document.getElementById('fusion-detail-close').click();
+            }
+        };
 
         function setupSearch() {
             const input = document.getElementById('search-input');
