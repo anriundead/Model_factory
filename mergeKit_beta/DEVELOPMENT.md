@@ -131,12 +131,12 @@
 - **目标**：在不改变现有开发方式的前提下，提供一套基于 Docker 的「整仓 + GPU」运行环境，用于新服务器迁移与按需复现，且容器内环境与本机 `mergenetic` conda 环境保持一致。
 - **环境标准**：以旧机导出的 `environment.yml` 为唯一环境真相；Docker 镜像与新服务器宿主机都通过这份文件创建/更新 `mergenetic` 环境，避免因依赖差异导致无法运行。
 - **Dockerfile 位置与构建**：
-  - 文件在 `Workspaces/mergeKit_beta/Dockerfile`，**构建上下文为仓库根 `ServiceEndFiles`**（与 Git 仅跟踪 `mergeKit_beta` 不矛盾）。
-  - 命令：`cd ServiceEndFiles && docker build -f Workspaces/mergeKit_beta/Dockerfile -t mergekit-beta .`
-  - 可选：`docker compose build`（使用仓库根 `docker-compose.yml`）。
+  - 文件在 `mergeKit_beta/Dockerfile`，**构建上下文为仓库根 `Workspaces`**（可直接纳入当前 Git 仓库）。
+  - 命令：`cd Workspaces && docker build -f mergeKit_beta/Dockerfile -t mergekit-beta .`
+  - 可选：`docker compose build`（使用 `Workspaces/docker-compose.yml`）。
   - 基础镜像：`nvidia/cuda:12.4.1-runtime-ubuntu22.04`；镜像内安装 Miniconda，用本目录 `environment.yml` 执行 `conda env create -n mergenetic`（Dockerfile 内已含 `conda tos accept`，以通过新版 Conda 对 `defaults` 频道的服务条款校验）。
   - **Docker 与裸机差异**：`conda env create` 会严格解析 pip 依赖，无法复现「本机已手动升级 lm-eval/transformers 后与 mergenetic 元数据冲突但仍可跑」的状态；Dockerfile 在创建环境前会从副本里**去掉**若干与 ray/mergenetic 冲突的显式钉版本（如 `lm-eval`、`transformers`、`huggingface-hub`、`tokenizers`、`virtualenv`），创建成功后再 `pip install` 升级到与上文「评测依赖版本」一致的栈；`pip` 可能对 `mergenetic` 报版本不兼容警告，与裸机说明一致，可忽略除非重装 mergenetic。
-  - 镜像内路径：`WORKDIR=/app/ServiceEndFiles/Workspaces/mergeKit_beta`；`Packages/` 复制到 `/app/ServiceEndFiles/Packages/`；`modelmerge_visual` 若本机不存在则仅创建空目录，**进化融合**需挂载含 `run_vlm_search.py` 的树或设置 `VLM_SEARCH_DIR`。
+  - 镜像内路径：`WORKDIR=/app/ServiceEndFiles/Workspaces/mergeKit_beta`；`Packages/` 改为运行时挂载到 `/app/ServiceEndFiles/Packages/`（默认 `../Packages`）；`modelmerge_visual` 若本机不存在则仅创建空目录，**进化融合**需挂载含 `run_vlm_search.py` 的树或设置 `VLM_SEARCH_DIR`。
   - 启动：`CMD ./start_app.sh`（与宿主机一致）；通过环境变量与卷传入 `LOCAL_MODELS_PATH`、`MERGEKIT_MODEL_POOL`、`DATABASE_URL`、`PORT`、`VLM_SEARCH_DIR`、模型与 merges 等。
 - **.dockerignore 建议**：
   - 排除 `Models/`、`Models-local_dir/`、`mergeKit/models_pool/` 等大模型目录，以及 `Datasets/`（若体量较大）。
@@ -144,7 +144,7 @@
   - 保证 `Workspaces/mergeKit_beta/`、`Workspaces/modelmerge_visual/`（含 VLM_merge_total/VLM_merge）、`Packages/` 等代码被打包入镜像。
 - **运行与迁移流程（Docker 视角）**：
   - **建议先在当前开发机**完成 `environment.yml` 导出、`Dockerfile` / `.dockerignore`（及可选 compose）编写，并在本机 `docker build` 做一次冒烟，再迁到新服务器；详见 Cursor 计划「Docker 整仓迁移方案」§0（当前设备先行与 Git）。
-  - 在新机安装 Docker 与 nvidia-container-toolkit，在 `ServiceEndFiles` 根目录构建：`docker build -f Workspaces/mergeKit_beta/Dockerfile -t mergekit-beta .` 或 `docker compose build`。
+  - 在新机安装 Docker 与 nvidia-container-toolkit，在 `Workspaces` 根目录构建：`docker build -f mergeKit_beta/Dockerfile -t mergekit-beta .` 或 `docker compose build`。
   - 同步 `Models/`、`merges/`、`app.db`、`testset_repo/`、`recipes/` 至新机指定路径，通过 `-v` 或 docker-compose `volumes` 挂载到容器内。
   - 使用 `docker run --gpus all -p 5000:5000 ... mergekit-beta` 或 `docker compose up` 启动，验证 Web 与融合/评估任务是否正常。
   - 日常开发仍按照上文「新服务器迁移与部署」在宿主机激活 `mergenetic` 环境并运行 `./start_app.sh`；需要对比或复现时，使用基于同一 `environment.yml` 构建的 Docker 镜像启动服务。
@@ -175,5 +175,5 @@ curl -s http://127.0.0.1:5000/api/history
 | 2025-03-04 | 新增「应用启动与外网访问」「可追踪与日志」「开发步骤细化（参考）」「单机双 worker 与双集群」「新服务器迁移与部署」「Docker 构建与迁移到新服务器」；风险控制中增加扩展边界（不在 app.py 扩展）；迁移与 Docker 章节强调以 environment.yml 作为统一环境标准。 |
 | 2025-03-10 | 目标新服务器内存更正为 128GB；Docker 小节补充目标机硬件摘要；双 worker 场景下 eval 并发建议改为按负载与内存观察调整。 |
 | 2025-03-10 | Docker 小节补充：建议当前设备先行构建冒烟、Git 与 `.gitignore` 约定；与 Docker 整仓迁移方案 §0 对齐。 |
-| 2025-03-10 | Docker：实际 `Dockerfile` 位于 `mergeKit_beta/`，构建上下文为 `ServiceEndFiles`；仓库根增加 `.dockerignore`；`modelmerge_visual` 缺失时镜像内仅占位目录，进化融合需挂载或 `VLM_SEARCH_DIR`。 |
+| 2025-03-10 | Docker：`Dockerfile` 位于 `mergeKit_beta/`，构建上下文切为 `Workspaces`；仓库根增加 `docker-compose.yml` 与 `.dockerignore`；`Packages` 改为运行时挂载；`modelmerge_visual` 缺失时镜像内仅占位目录，进化融合需挂载或 `VLM_SEARCH_DIR`。 |
 | 此前       | 端口统一 5000；文档收敛为 README/DEVELOPMENT/ROADMAP；lm_eval 0.4.11 + transformers 5.3.0 升级与适配。 |

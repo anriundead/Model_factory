@@ -1,0 +1,58 @@
+# Git 与编辑器
+.git/
+.cursor/
+**/.idea/
+
+# 体量较大的目录（按需挂载，勿打进镜像）
+Models/
+Models-local_dir/
+Datasets/
+mergeKit/models_pool/
+
+# 运行时与本地数据（挂载即可）
+**/merges/
+**/logs/
+**/cache/
+**/testset_repo/data/
+**/*.db
+**/.env
+**/.env.*
+
+# Python 垃圾
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+
+# 杂项
+*.log
+qwen3_32b.log
+# Git 与编辑器
+.git/
+.cursor/
+**/.idea/
+
+# 体量极大的目录（按需挂载，勿打进镜像）
+../Models/
+../Models-local_dir/
+../Datasets/
+../mergeKit/models_pool/
+
+# 运行时与本地数据（挂载即可）
+**/merges/
+**/logs/
+**/cache/
+**/testset_repo/data/
+**/*.db
+**/.env
+**/.env.*
+
+# Python 垃圾
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+
+# 杂项
+*.log
+qwen3_32b.log

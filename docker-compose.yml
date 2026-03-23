@@ -1,0 +1,24 @@
+# 用法（在 Workspaces 目录）: docker compose build && docker compose up
+services:
+  mergekit-beta:
+    build:
+      context: .
+      dockerfile: mergeKit_beta/Dockerfile
+    image: mergekit-beta:latest
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - LOCAL_MODELS_PATH=/data/Models
+      - MERGEKIT_MODEL_POOL=/data/models_pool
+      - DATABASE_URL=${DATABASE_URL:-}
+      - VLM_SEARCH_DIR=${VLM_SEARCH_DIR:-}
+      - HF_DATASETS_CACHE=/data/hf_datasets
+      - MERGEKIT_EVAL_HF_CACHE=/data/eval_datasets
+    volumes:
+      - ${HOST_MODELS:-../Models}:/data/Models:ro
+      - ${HOST_MODEL_POOL:-../mergeKit/models_pool}:/data/models_pool
+      - ${HOST_PACKAGES:-../Packages}:/app/ServiceEndFiles/Packages:ro
+      - ${HOST_MERGES:-./mergeKit_beta/merges}:/app/ServiceEndFiles/Workspaces/mergeKit_beta/merges
+      - ${HOST_APP_DB:-./mergeKit_beta/app.db}:/app/ServiceEndFiles/Workspaces/mergeKit_beta/app.db
+    gpus: all
