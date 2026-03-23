@@ -146,6 +146,7 @@
   - **建议先在当前开发机**完成 `environment.yml` 导出、`Dockerfile` / `.dockerignore`（及可选 compose）编写，并在本机 `docker build` 做一次冒烟，再迁到新服务器；详见 Cursor 计划「Docker 整仓迁移方案」§0（当前设备先行与 Git）。
   - 在新机安装 Docker 与 nvidia-container-toolkit，在 `Workspaces` 根目录构建：`docker build -f mergeKit_beta/Dockerfile -t mergekit-beta .` 或 `docker compose build`。
   - 同步 `Models/`、`merges/`、`app.db`、`testset_repo/`、`recipes/` 至新机指定路径，通过 `-v` 或 docker-compose `volumes` 挂载到容器内。
+  - **`app.db` 挂载注意**：`HOST_APP_DB` 对应宿主机路径必须是「文件」，不能是目录；若文件不存在，先执行 `touch ./mergeKit_beta/app.db`。若历史上误挂载成目录（如 `./mergeKit_beta/app.db/`），需先 `docker compose down`，再 `rm -rf ./mergeKit_beta/app.db && touch ./mergeKit_beta/app.db`，否则容器内 SQLite 会报 `unable to open database file` 或 `no such table`。
   - 使用 `docker run --gpus all -p 5000:5000 ... mergekit-beta` 或 `docker compose up` 启动，验证 Web 与融合/评估任务是否正常。
   - 日常开发仍按照上文「新服务器迁移与部署」在宿主机激活 `mergenetic` 环境并运行 `./start_app.sh`；需要对比或复现时，使用基于同一 `environment.yml` 构建的 Docker 镜像启动服务。
 - **Git 版本管理**：强烈建议将代码与 `environment.yml`、Docker 相关文件纳入 Git，大目录（Models、大体量 Datasets、日志、缓存、`.env` 等）用 `.gitignore` 排除；便于新机 `git clone` 与回滚。Docker 构建不依赖 Git，但迁移与协作强烈依赖版本管理。
