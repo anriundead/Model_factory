@@ -803,6 +803,33 @@ h3 {
     padding: 16px 18px;
     min-height: 72px;
     text-align: left;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+}
+.evolutionary-left .model-card .model-name {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    word-break: break-word;
+    line-height: 1.35;
+    font-size: 0.95rem;
+    font-weight: 500;
+    margin-bottom: 8px;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+.evolutionary-left .model-card .limit-desc {
+    flex-shrink: 0;
+    margin-top: 0;
+    margin-bottom: 0;
+    font-size: 0.8rem;
+    line-height: 1.4;
 }
 .evolutionary-left .model-card h4 {
     font-size: 0.95rem;
@@ -826,6 +853,45 @@ h3 {
     min-height: 120px;
 }
 
+/* 模型仓库 / 融合配方卡片：防止文字溢出、统一悬停动画 */
+#model-repo-base .model-card,
+#model-repo-merged .model-card,
+#model-repo-recipes .model-card {
+    overflow: hidden;
+    min-height: 90px;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    text-align: left;
+}
+
+#model-repo-base .model-card .model-name,
+#model-repo-merged .model-card .model-name,
+#model-repo-recipes .model-card .model-name {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    word-break: break-word;
+    min-height: 2.5em;
+    line-height: 1.35;
+    font-size: 0.95rem;
+    padding-right: 30px; /* 为删除按钮留空 */
+}
+
+#model-repo-base .model-card .limit-desc,
+#model-repo-merged .model-card .limit-desc,
+#model-repo-recipes .model-card .limit-desc {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 6px;
+    flex-shrink: 0;
+    padding-right: 4px;
+}
+
 .model-card {
     background: var(--apple-light-gray);
     border-radius: 18px;
@@ -840,8 +906,8 @@ h3 {
 
 .model-card:hover {
     background: #fff;
-    box-shadow: 0 8px 16px rgba(0,0,0,0.06);
-    transform: scale(1.02);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+    transform: scale(1.02) translateY(-2px);
 }
 
 .model-card.selected {

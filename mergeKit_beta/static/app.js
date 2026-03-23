@@ -52,8 +52,12 @@ function setupHistoryUI() {
     const openSidebar = () => {
         if (sidebar) sidebar.classList.add('open');
         if (overlay) overlay.classList.add('show');
-        loadHistoryList(); // 刷新列表
+        loadHistoryList(); // 打开侧栏时刷新列表
     };
+    // 页面重新可见时刷新历史列表，避免多 tab 或 bfcache 后侧栏数据陈旧
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') loadHistoryList();
+    });
 
     // 2. 绑定菜单按钮点击事件 (打开)
     if (menuBtn) {
@@ -1179,7 +1183,8 @@ function loadEvolutionaryModels() {
             card.dataset.type = type || 'path';
             card.dataset.recipeId = (type === 'recipe' && m.recipe_id) ? m.recipe_id : '';
             card.dataset.isVlm = isVlm ? '1' : '0';
-            card.innerHTML = '<div class="model-name">' + name + '</div><div class="limit-desc">' + tagsHtml + '</div>';
+            card.title = name || ''; /* 悬停显示完整名称，避免长名被截断后无法查看 */
+            card.innerHTML = '<div class="model-name">' + (name || '').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div><div class="limit-desc">' + tagsHtml + '</div>';
             card.addEventListener('click', async () => {
                 const key = type === 'recipe' ? (m.recipe_id || m.task_id) : path;
                 const idx = evolutionarySelectedList.findIndex(x => (x.type === 'recipe' ? (x.recipe_id === key) : (x.path === key)));
@@ -1509,12 +1514,15 @@ function setupEvolutionaryMerge() {
                 if (progStage) progStage.style.display = 'block';
             }
             let pollCount = 0;
+            let maxStepSeen = 0;
+            let maxPctSeen = 0;
             const poll = async () => {
                 const s = await fetch('/api/status/' + data.task_id).then(r => r.json()).catch(() => ({}));
                 const statusDiv = document.getElementById('task-status');
                 const fillEl = document.getElementById('task-progress-fill');
                 const pctEl = document.getElementById('task-progress-pct');
                 const stageEl = document.getElementById('task-progress-stage');
+                const evo = s.evolution_progress || {};
                 if (s.status === 'completed' || s.status === 'success') {
                     btn.disabled = false;
                     btn.textContent = '开始完全融合';
@@ -1523,7 +1531,6 @@ function setupEvolutionaryMerge() {
                     if (pctEl) pctEl.textContent = '100%';
                     if (stageEl) stageEl.textContent = '';
                     loadHistoryList();
-                    // 显示完成弹窗
                     showTaskCompletionModal(data.task_id, s, evo);
                     return;
                 }
@@ -1534,38 +1541,31 @@ function setupEvolutionaryMerge() {
                     return;
                 }
                 if (statusDiv && s.message) statusDiv.querySelector('.status-message').textContent = (s.message || '').slice(0, 120);
-                const evo = s.evolution_progress || {};
-                const step = evo.step || 0;
-                const currentStep = evo.current_step || step;  // 使用 current_step 如果可用
+                const rawStep = evo.current_step || evo.step || 0;
+                maxStepSeen = Math.max(maxStepSeen, rawStep);
                 const totalExpectedSteps = evo.total_expected_steps;
                 const od = s.original_data || {};
                 const nIter = od.n_iter || 15;
                 const popSize = od.pop_size || 20;
-                
-                // 计算总步数：优先使用 total_expected_steps，否则估算
-                let totalSteps = totalExpectedSteps;
-                if (!totalSteps) {
-                    // 估算：n_iter * pop_size（每次迭代评估 pop_size 个个体）
-                    totalSteps = Math.max(1, nIter * popSize);
+                let totalSteps = totalExpectedSteps || Math.max(1, nIter * popSize);
+                if (maxStepSeen > 0 && totalSteps > 0) {
+                    totalSteps = Math.max(totalSteps, maxStepSeen);
                 }
-                
-                // 进度条更新：优先使用 current_step，否则使用 step
-                let pct = 0;
-                const effectiveStep = currentStep > 0 ? currentStep : step;
-                if (effectiveStep > 0 && totalSteps > 0) {
-                    pct = Math.min(100, Math.round((effectiveStep / totalSteps) * 100));
-                } else if (s.status === 'running' || s.status === 'queued') {
-                    // 任务运行中但step未更新：使用轮询次数估算最小进度（避免一直0%）
-                    const minProgress = Math.min(5, Math.floor(pollCount / 10)); // 每10次轮询+1%，最多5%
-                    pct = minProgress;
+
+                let pct = evo.percent || 0;
+                if (maxStepSeen > 0 && totalSteps > 0) {
+                    pct = Math.max(pct, Math.min(99, Math.round((maxStepSeen / totalSteps) * 100)));
                 }
-                if (fillEl) fillEl.style.width = pct + '%';
-                if (pctEl) pctEl.textContent = pct + '%';
-                
-                // 构建步骤文本：显示实际步数和总步数
+                if (pct === 0 && (s.status === 'running' || s.status === 'queued')) {
+                    pct = Math.min(5, Math.floor(pollCount / 10));
+                }
+                maxPctSeen = Math.max(maxPctSeen, pct);
+                if (fillEl) fillEl.style.width = maxPctSeen + '%';
+                if (pctEl) pctEl.textContent = maxPctSeen + '%';
+
                 let stepText = '';
-                if (effectiveStep > 0 && totalSteps > 0) {
-                    stepText = `步骤 ${effectiveStep} / ${totalSteps}`;
+                if (maxStepSeen > 0 && totalSteps > 0) {
+                    stepText = `步骤 ${maxStepSeen} / ${totalSteps}`;
                 } else if (s.status === 'running') {
                     stepText = '运行中...';
                 } else if (s.status === 'queued') {
@@ -1573,24 +1573,21 @@ function setupEvolutionaryMerge() {
                 } else {
                     stepText = '准备中...';
                 }
-                
-                // 添加 ETA 信息
+
                 let etaText = '';
                 if (evo.eta_seconds && evo.eta_seconds > 0) {
                     const etaSeconds = Math.round(evo.eta_seconds);
                     if (etaSeconds < 60) {
                         etaText = ` · 预计剩余 ${etaSeconds}秒`;
                     } else if (etaSeconds < 3600) {
-                        const minutes = Math.round(etaSeconds / 60);
-                        etaText = ` · 预计剩余 ${minutes}分钟`;
+                        etaText = ` · 预计剩余 ${Math.round(etaSeconds / 60)}分钟`;
                     } else {
-                        const hours = Math.round(etaSeconds / 3600 * 10) / 10;
-                        etaText = ` · 预计剩余 ${hours}小时`;
+                        etaText = ` · 预计剩余 ${(Math.round(etaSeconds / 3600 * 10) / 10)}小时`;
                     }
                 }
-                
-                // 添加准确率信息
-                const accText = evo.current_best != null ? ' · 当前最优 acc: ' + Number(evo.current_best).toFixed(4) : '';
+
+                const accText = evo.current_best != null && evo.current_best > 0
+                    ? ' · 当前最优 acc: ' + Number(evo.current_best).toFixed(4) : '';
                 if (stageEl) stageEl.textContent = stepText + etaText + accText;
                 pollCount++;
                 if (pollCount < 3600) setTimeout(poll, 1000);
@@ -2557,7 +2554,10 @@ async function showTaskCompletionModal(taskId, statusData, evoProgress) {
         // --- 新增：显示迭代信息、基因权重、数据集 ---
         if (evoProgress.current_step != null || evoProgress.step != null) {
             const step = evoProgress.current_step || evoProgress.step;
-            const total = evoProgress.total_expected_steps || '?';
+            const totalRaw = evoProgress.total_expected_steps;
+            const total = (step != null && totalRaw != null)
+                ? Math.max(Number(step) || 0, Number(totalRaw) || 0)
+                : (totalRaw || '?');
             metricsHtml += `<div style="margin-bottom: 6px;">迭代进度: <strong>${step} / ${total}</strong></div>`;
         }
 

@@ -4,4 +4,4 @@ from flask_admin import Admin
 
 db = SQLAlchemy()
 migrate = Migrate()
-admin = Admin(name='MergeKit Admin', template_mode='bootstrap3')
+admin = Admin(name="MergeKit Admin")

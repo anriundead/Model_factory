@@ -35,9 +35,12 @@
     <div id="sidebar-overlay" class="sidebar-overlay"></div>
     <div id="main-app" class="container active-view">
         <main>
-            <div class="page-header">
-                <h2>模型仓库</h2>
-                <p class="page-subtitle">基座模型与已注册融合模型</p>
+            <div class="page-header" style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
+                <div>
+                    <h2>模型仓库</h2>
+                    <p class="page-subtitle">基座模型与已注册融合模型</p>
+                </div>
+                <button type="button" id="model-repo-refresh" class="icon-btn" title="刷新列表" style="font-size:1rem;"><i class="ri-refresh-line"></i></button>
             </div>
             <section class="section apple-card">
                 <div class="section-header"><h3>基座模型</h3> <span class="helper-text">Base Models</span></div>
@@ -119,10 +122,12 @@
             if (!d.base_models || d.base_models.length === 0) baseEl.innerHTML = '<p class="limit-desc">暂无基座模型</p>';
             else {
                 baseEl.innerHTML = d.base_models.map(function(m) {
+                    var name = (m.name || '');
+                    var pathTailStr = pathTail(m.path) || '基座';
                     return '<div class="model-card" style="position:relative;">' +
-                        '<button type="button" class="model-repo-delete-btn" data-path="' + (m.path || '') + '" title="删除模型" style="position:absolute; top:6px; right:6px; width:24px; height:24px; border:none; border-radius:50%; background:rgba(255,59,48,0.1); color:var(--error); cursor:pointer; font-size:1.1rem; line-height:1; display:flex; align-items:center; justify-content:center; z-index:10; transition:all 0.2s;">×</button>' +
-                        '<div class="model-name" style="padding-right:30px;">' + (m.name||'') + '</div>' +
-                        '<div class="limit-desc" style="font-size:0.8rem;">' + (pathTail(m.path) || '基座') + '</div></div>';
+                        '<button type="button" class="model-repo-delete-btn" data-path="' + (m.path || '') + '" title="删除模型" style="position:absolute; top:6px; right:6px; width:24px; height:24px; border:none; border-radius:50%; background:rgba(255,59,48,0.1); color:var(--error); cursor:pointer; font-size:1.1rem; line-height:1; display:flex; align-items:center; justify-content:center; z-index:10; transition:transform 0.25s ease, background 0.2s;">×</button>' +
+                        '<div class="model-name" title="' + (name.replace(/"/g, '&quot;')) + '">' + name + '</div>' +
+                        '<div class="limit-desc" style="font-size:0.8rem;" title="' + (pathTailStr.replace(/"/g, '&quot;')) + '">' + pathTailStr + '</div></div>';
                 }).join('');
                 baseEl.querySelectorAll('.model-repo-delete-btn').forEach(function(btn) {
                     btn.onmouseover = function() { this.style.background = 'rgba(255,59,48,0.2)'; this.style.transform = 'scale(1.1)'; };
@@ -137,10 +142,16 @@
                 mergedEl.innerHTML = d.merged_models.map(function(m, i) {
                     var parentCount = (m.parent_models && m.parent_models.length) ? m.parent_models.length : 0;
                     var hint = parentCount ? parentCount + ' 个父代 · 点击查看详情' : '点击查看详情';
+                    var tags = (m.tag_names || []);
+                    var tagBadges = [];
+                    if (tags.indexOf('Keep') !== -1) tagBadges.push('<span style="font-size:0.7rem; padding:2px 6px; border-radius:6px; background:rgba(52,199,89,0.2); color:#34c759;">Keep</span>');
+                    if (tags.indexOf('Discard') !== -1) tagBadges.push('<span style="font-size:0.7rem; padding:2px 6px; border-radius:6px; background:rgba(255,59,48,0.15); color:#ff3b30;">Discard</span>');
+                    var tagHtml = tagBadges.length ? ' <span style="margin-left:4px;">' + tagBadges.join(' ') + '</span>' : '';
+                    var displayName = (m.name || m.model_id || '');
                     return '<div class="model-card model-card-clickable" data-merged-index="' + i + '" data-model-id="' + (m.model_id || '') + '" style="cursor:pointer; position:relative;">' +
-                        '<button type="button" class="model-repo-delete-btn" data-path="' + (m.path || '') + '" title="删除模型" style="position:absolute; top:6px; right:6px; width:24px; height:24px; border:none; border-radius:50%; background:rgba(255,59,48,0.1); color:var(--error); cursor:pointer; font-size:1.1rem; line-height:1; display:flex; align-items:center; justify-content:center; transition:all 0.2s;">×</button>' +
-                        '<div class="model-name" style="padding-right:30px;">' + (m.name||m.model_id) + '</div>' +
-                        '<div class="limit-desc" style="font-size:0.8rem; margin-top:4px;">' + hint + '</div></div>';
+                        '<button type="button" class="model-repo-delete-btn" data-path="' + (m.path || '') + '" title="删除模型" style="position:absolute; top:6px; right:6px; width:24px; height:24px; border:none; border-radius:50%; background:rgba(255,59,48,0.1); color:var(--error); cursor:pointer; font-size:1.1rem; line-height:1; display:flex; align-items:center; justify-content:center; transition:transform 0.25s ease, background 0.2s;">×</button>' +
+                        '<div class="model-name" title="' + (displayName.replace(/"/g, '&quot;')) + '">' + displayName + '</div>' +
+                        '<div class="limit-desc" style="font-size:0.8rem; margin-top:4px;" title="' + (hint.replace(/"/g, '&quot;')) + '">' + hint + tagHtml + '</div></div>';
                 }).join('');
                 mergedEl.querySelectorAll('.model-card-clickable').forEach(function(card) {
                     card.onclick = function(e) {
@@ -290,9 +301,12 @@
                     html += '<p style="margin: 0 0 16px; font-family: monospace;">[' + r.best_genotype.map(function(x) { return Number(x).toFixed(6); }).join(', ') + ']</p>';
                 }
                 if (r.current_best_acc != null || r.final_test_acc != null) {
-                    html += '<p style="margin: 0 0 4px; color: #86868b; font-weight: 500;">准确率</p>';
-                    var acc = r.final_test_acc != null ? r.final_test_acc : r.current_best_acc;
+                    html += '<p style="margin: 0 0 4px; color: #86868b; font-weight: 500;">准确率（与融合历史一致：验证集最优）</p>';
+                    var acc = r.current_best_acc != null ? r.current_best_acc : r.final_test_acc;
                     html += '<p style="margin: 0 0 16px; font-size: 1.1rem; font-weight: 600;">' + Number(acc).toFixed(4) + '</p>';
+                    if (r.final_test_acc != null && r.current_best_acc != null && r.final_test_acc !== r.current_best_acc) {
+                        html += '<p style="margin: 0 0 16px; font-size: 0.9rem; color: #86868b;">测试集准确率: ' + Number(r.final_test_acc).toFixed(4) + '</p>';
+                    }
                 }
                 if (r.hf_dataset) {
                     html += '<p style="margin: 0 0 4px; color: #86868b; font-weight: 500;">数据集</p>';
@@ -334,38 +348,47 @@
             if (e.target === this) hideRecipeDetail();
         };
 
-        fetch('/api/model_repo/list').then(r=>r.json()).then(d=>{
+        function loadModelRepo() {
             var baseEl = document.getElementById('model-repo-base');
             var mergedEl = document.getElementById('model-repo-merged');
             var recipesEl = document.getElementById('model-repo-recipes');
-            if (baseEl && mergedEl) renderMergedList(mergedEl, baseEl, d);
-            // 加载配方列表
-            fetch('/api/recipes').then(r=>r.json()).then(d=>{
-                if (d.status !== 'success' || !d.recipes || d.recipes.length === 0) {
-                    recipesEl.innerHTML = '<p class="limit-desc">暂无配方</p>';
+            if (baseEl) baseEl.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>加载中...</p></div>';
+            if (mergedEl) mergedEl.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>加载中...</p></div>';
+            if (recipesEl) recipesEl.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>加载中...</p></div>';
+            fetch('/api/model_repo/list').then(r=>r.json()).then(d=>{
+                if (baseEl && mergedEl) renderMergedList(mergedEl, baseEl, d);
+                return fetch('/api/recipes').then(r=>r.json());
+            }).then(function(d) {
+                if (!d || d.status !== 'success' || !d.recipes || d.recipes.length === 0) {
+                    if (recipesEl) recipesEl.innerHTML = '<p class="limit-desc">暂无配方</p>';
                     return;
                 }
                 recipesData = d.recipes;
                 recipesEl.innerHTML = d.recipes.map(function(r, i) {
-                    var name = (r.custom_name || r.recipe_id || '未命名').toString().slice(0, 30);
+                    var fullName = (r.custom_name || r.recipe_id || '未命名').toString();
+                    var name = fullName.slice(0, 30);
                     var parents = (r.parent_names || []).map(function(p) { return typeof p === 'string' ? p.split(/[/\\]/).pop() : ''; }).join(' + ');
                     var hint = parents ? parents.slice(0, 40) : '点击查看详情';
-                    return '<div class="model-card model-card-clickable" data-recipe-id="' + (r.recipe_id || r.task_id || '') + '" style="cursor:pointer;">' +
-                        '<div class="model-name">' + name + '</div>' +
-                        '<div class="limit-desc" style="font-size:0.8rem; margin-top:4px;">' + hint + '</div>' +
+                    return '<div class="model-card model-card-clickable" data-recipe-id="' + (r.recipe_id || r.task_id || '') + '" style="cursor:pointer;" title="' + (fullName.replace(/"/g, '&quot;')) + '">' +
+                        '<div class="model-name" title="' + (fullName.replace(/"/g, '&quot;')) + '">' + name + '</div>' +
+                        '<div class="limit-desc" style="font-size:0.8rem; margin-top:4px;" title="' + (parents.replace(/"/g, '&quot;') || '') + '">' + hint + '</div>' +
                         '</div>';
                 }).join('');
                 recipesEl.querySelectorAll('.model-card-clickable').forEach(function(card) {
                     card.onclick = function() { showRecipeDetail(card.getAttribute('data-recipe-id')); };
                 });
             }).catch(function() {
-                recipesEl.innerHTML = '<p class="limit-desc">加载配方失败</p>';
+                if (recipesEl) recipesEl.innerHTML = '<p class="limit-desc">加载配方失败</p>';
             });
         }).catch(function() {
-            document.getElementById('model-repo-base').innerHTML = '<p class="limit-desc">加载失败</p>';
-            document.getElementById('model-repo-merged').innerHTML = '<p class="limit-desc">加载失败</p>';
-            document.getElementById('model-repo-recipes').innerHTML = '<p class="limit-desc">加载失败</p>';
+            if (baseEl) baseEl.innerHTML = '<p class="limit-desc">加载失败</p>';
+            if (mergedEl) mergedEl.innerHTML = '<p class="limit-desc">加载失败</p>';
+            if (recipesEl) recipesEl.innerHTML = '<p class="limit-desc">加载失败</p>';
         });
+        }
+        document.getElementById('model-repo-refresh').onclick = function() { loadModelRepo(); };
+        document.addEventListener('visibilitychange', function() { if (document.visibilityState === 'visible') loadModelRepo(); });
+        loadModelRepo();
     </script>
 </body>
 </html>

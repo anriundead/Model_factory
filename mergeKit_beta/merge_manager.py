@@ -31,6 +31,59 @@ os.makedirs(MERGE_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 
+# ---------------------------------------------------------------------------
+# 统一 metadata 写入 + 可选 DB 同步
+# ---------------------------------------------------------------------------
+
+def _sync_metadata_to_db(task_id, data):
+    """将 metadata 关键字段同步到 DB Task 表（需 Flask app context）。"""
+    try:
+        from flask import current_app
+        if not current_app:
+            return
+    except (ImportError, RuntimeError):
+        return
+    try:
+        from app.extensions import db
+        from app.models import Task
+        task = db.session.get(Task, task_id)
+        if task is None:
+            return
+        status_map = {"success": "completed", "error": "failed"}
+        raw_status = data.get("status")
+        mapped = status_map.get(raw_status, raw_status)
+        if mapped:
+            task.status = mapped
+        for attr in ("custom_name", "error", "duration_seconds", "model_path"):
+            if attr in data:
+                setattr(task, attr, data[attr])
+        cfg = task.config or {}
+        for k in ("models", "weights", "method", "dtype", "hf_dataset",
+                   "hf_subset", "hf_split", "dataset", "output_path",
+                   "metrics", "base_name", "recipe_id", "testset_id"):
+            if k in data:
+                cfg[k] = data[k]
+        task.config = cfg
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(task, "config")
+        from datetime import datetime as _dt
+        task.updated_at = _dt.utcnow()
+        if mapped == "completed" and not task.finished_at:
+            task.finished_at = _dt.utcnow()
+        db.session.commit()
+    except Exception as exc:
+        _logger.debug("[_sync_metadata_to_db] %s", exc)
+
+
+def _write_metadata(task_id, output_path, data, sync_db=True):
+    """统一写 metadata.json，可选同步 DB。"""
+    meta_path = os.path.join(output_path, "metadata.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    if sync_db:
+        _sync_metadata_to_db(task_id, data)
+
+
 def _popen_group_kwargs():
     return ProcessManager.create_process_group_kwargs()
 
@@ -230,8 +283,7 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
         "status": "pending",
     }
     meta_path = os.path.join(task_dir, "metadata.json")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    _write_metadata(task_id, task_dir, metadata)
 
     _logger.info("[run_merge_task] ========== 任务开始 ==========")
     task_start_time = time.time()
@@ -243,8 +295,7 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
         metadata["status"] = "error"
         metadata["error"] = err_msg
         metadata["duration_seconds"] = time.time() - task_start_time
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        _write_metadata(task_id, task_dir, metadata)
 
     try:
         # Python 环境校验（可选）
@@ -298,26 +349,35 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
 
         # 生成 YAML 并执行 mergenetic 融合
         update_progress_callback(15, "生成融合配置...")
-        from mergenetic.merging.ties_dare_merger import TiesDareMerger
-
-        base_path = model_paths[0]
-        other_paths = model_paths[1:]
-        # weights: [w1, w2, ...], density 用 limit 如 0.5
         num_models = len(model_paths)
         weights_floats = [float(weights[i]) if i < len(weights) else 1.0 for i in range(num_models)]
-        density = float(limit) if limit else 0.5
-        densities = [density] * num_models
-        weights_and_densities = list(weights_floats) + list(densities)
-
-        merger = TiesDareMerger(
-            run_id=task_id,
-            path_to_base_model=base_path,
-            model_paths=other_paths,
-            path_to_store_yaml=yaml_config_dir,
-            path_to_store_merged_model=output_dir,
-            dtype=dtype,
-        )
-        merger.create_individual_configuration(weights_and_densities)
+        if (method or "").strip().lower() == "linear":
+            from mergenetic.merging.linear_merger import LinearMerger
+            merger = LinearMerger(
+                run_id=task_id,
+                path_to_base_model=model_paths[0],
+                model_paths=model_paths,
+                path_to_store_yaml=yaml_config_dir,
+                path_to_store_merged_model=output_dir,
+                dtype=dtype,
+            )
+            merger.create_individual_configuration(weights_floats)
+        else:
+            from mergenetic.merging.ties_dare_merger import TiesDareMerger
+            base_path = model_paths[0]
+            other_paths = model_paths[1:]
+            density = float(limit) if limit else 0.5
+            densities = [density] * num_models
+            weights_and_densities = list(weights_floats) + list(densities)
+            merger = TiesDareMerger(
+                run_id=task_id,
+                path_to_base_model=base_path,
+                model_paths=other_paths,
+                path_to_store_yaml=yaml_config_dir,
+                path_to_store_merged_model=output_dir,
+                dtype=dtype,
+            )
+            merger.create_individual_configuration(weights_and_densities)
 
         _logger.info("[run_merge_task] ========== 开始执行 Mergenetic 融合 ==========")
         _logger.info("[run_merge_task] 配置路径: %s", config_yaml_path)
@@ -370,22 +430,26 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
         _logger.info("[run_merge_task] 预期路径: %s", os.path.join(expected_dir, task_id))
         _logger.info("[run_merge_task] 返回路径存在: %s", os.path.isdir(out_str))
 
-        # 若输出在 output/task_id 下，将内容移到 output
+        # 若输出在 output/task_id 下，将内容移到 output（注意：切勿删除 output_dir，否则 inner 会一并被删）
         inner = os.path.join(output_dir, task_id)
         if os.path.isdir(inner):
             _logger.info("[run_merge_task] 融合输出路径存在: %s", inner)
             _logger.info("[run_merge_task] 模型在预期位置，准备移动到 output_dir: %s", output_dir)
             _logger.info("[run_merge_task] 移动模型内容从 %s 到 %s", inner, output_dir)
-            for name in os.listdir(inner):
-                src = os.path.join(inner, name)
-                dst = os.path.join(output_dir, name)
+            inner_abs = os.path.abspath(inner)
+            output_dir_abs = os.path.abspath(output_dir)
+            if not os.path.isdir(inner_abs):
+                raise RuntimeError("融合输出目录在复制前已不存在: %s" % inner_abs)
+            for name in os.listdir(inner_abs):
+                src = os.path.join(inner_abs, name)
+                dst = os.path.join(output_dir_abs, name)
                 if os.path.isfile(src):
                     shutil.copy2(src, dst)
                 else:
                     if os.path.exists(dst):
                         shutil.rmtree(dst)
                     shutil.copytree(src, dst)
-            shutil.rmtree(inner)
+            shutil.rmtree(inner_abs)
             _logger.info("[run_merge_task] ✅ 移动成功")
         elif os.path.isdir(out_str) and out_str != output_dir:
             # 若 out_path 是别的目录，整体拷贝到 output
@@ -433,6 +497,7 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
 
         metadata["status"] = "success"
         metadata["duration_seconds"] = time.time() - task_start_time
+        metadata["model_path"] = output_dir
         metadata["metrics"] = {
             "output_path": output_dir,
             "accuracy": None,
@@ -442,18 +507,49 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
             "base_name": models[0] if models else "",
             "comparison": {"labels": [], "base_data": [], "merged_data": []},
         }
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        _write_metadata(task_id, task_dir, metadata)
 
         update_progress_callback(100, "任务完成")
         return {"status": "success", "output_path": output_dir, "metrics": metadata.get("metrics", {})}
 
     except Exception as e:
         _logger.exception("[run_merge_task] 任务失败: %s", e)
-        _write_error_status(str(e))
+        err_str = str(e)
+        inner = os.path.join(output_dir, task_id)
+        salvaged = False
+        if "Circular reference" in err_str and os.path.isdir(inner):
+            try:
+                inner_abs = os.path.abspath(inner)
+                output_dir_abs = os.path.abspath(output_dir)
+                for name in os.listdir(inner_abs):
+                    src = os.path.join(inner_abs, name)
+                    dst = os.path.join(output_dir_abs, name)
+                    if os.path.isfile(src):
+                        shutil.copy2(src, dst)
+                    else:
+                        if os.path.exists(dst):
+                            shutil.rmtree(dst)
+                        shutil.copytree(src, dst)
+                shutil.rmtree(inner_abs)
+                _logger.info("[run_merge_task] 已从 %s 抢救输出到 %s", inner, output_dir)
+                if os.path.isdir(output_dir) and any(
+                    f.endswith(".safetensors") or f == "config.json"
+                    for f in os.listdir(output_dir)
+                ):
+                    salvaged = True
+                    metadata["status"] = "success"
+                    metadata["duration_seconds"] = time.time() - task_start_time
+                    metadata["model_path"] = output_dir
+                    metadata["metrics"] = {"output_path": output_dir}
+                    _write_metadata(task_id, task_dir, metadata)
+                    update_progress_callback(100, "任务完成（已抢救输出）")
+                    return {"status": "success", "output_path": output_dir, "metrics": metadata.get("metrics", {})}
+            except Exception as salvage_err:
+                _logger.warning("[run_merge_task] 抢救输出失败: %s", salvage_err)
+        _write_error_status(err_str)
         if task_control.get("aborted"):
             return {"status": "stopped", "message": "用户已停止"}
-        return {"status": "error", "error": str(e)}
+        return {"status": "error", "error": err_str}
 
 
 def materialize_recipe_to_temp(recipe_id, parent_task_id, suffix, update_progress_callback, task_control=None):
@@ -547,14 +643,12 @@ def run_recipe_apply_task(task_id, params, update_progress_callback, task_contro
         "dtype": dtype,
         "status": "pending",
     }
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    _write_metadata(task_id, task_dir, metadata)
 
     def _write_error_status(err_msg):
         metadata["status"] = "error"
         metadata["error"] = err_msg
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        _write_metadata(task_id, task_dir, metadata)
 
     try:
         import subprocess
@@ -664,9 +758,9 @@ def run_recipe_apply_task(task_id, params, update_progress_callback, task_contro
                 }
                 model_repo_api.register_merged_model(output_dir, custom_name, recipe_meta)
         metadata["status"] = "success"
+        metadata["model_path"] = output_dir
         metadata["metrics"] = {"output_path": output_dir}
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        _write_metadata(task_id, task_dir, metadata)
         update_progress_callback(100, "配方融合完成")
         return {"status": "success", "output_path": output_dir}
     except Exception as e:
@@ -713,6 +807,8 @@ def _pick_latest_json(path):
 HF_DATASET_TO_LM_EVAL_TASK = {
     "cais/mmlu": "mmlu",
     "mmlu": "mmlu",
+    "m-a-p/cmmmu": "cmmmu",
+    "cmmmu/cmmmu": "cmmmu",
 }
 
 def _load_testsets_dict():
@@ -1092,6 +1188,7 @@ def _save_eval_task_mapping(mapping_dict):
 
 
 def _update_leaderboard(testset_id, entry):
+    """写入 leaderboard.json。DB 侧由 app.services 在评估任务完成后通过 _db_insert_eval_result 双写 EvaluationResult，与本次调用成对。"""
     if not testset_id:
         return False
     lb_path = os.path.join(Config.PROJECT_ROOT, "testset_repo", "data", "leaderboard.json")
@@ -1126,24 +1223,24 @@ def _get_available_lm_eval_tasks():
     """获取所有可用的 lm_eval 任务列表（排除任务组，只返回具体任务）。"""
     try:
         from lm_eval.tasks import TaskManager
-        task_manager = TaskManager(verbosity="ERROR")  # 使用 ERROR 级别减少日志
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            task_manager = TaskManager()
+        # 0.4.11+: all_subtasks 只含具体任务；旧版回退 all_tasks - all_groups
+        if hasattr(task_manager, 'all_subtasks'):
+            return sorted(task_manager.all_subtasks)
         available_tasks = task_manager.all_tasks
-        # 获取任务组列表，用于过滤
+        task_groups_set = set()
         try:
             if hasattr(task_manager, 'all_groups'):
                 task_groups = task_manager.all_groups
-                # all_groups 可能是列表或字典
                 if isinstance(task_groups, list):
                     task_groups_set = set(task_groups)
                 elif hasattr(task_groups, 'keys'):
                     task_groups_set = set(task_groups.keys())
-                else:
-                    task_groups_set = set()
-            else:
-                task_groups_set = set()
         except Exception:
-            task_groups_set = set()
-        # 过滤掉任务组，只返回具体任务
+            pass
         if task_groups_set:
             filtered_tasks = [t for t in available_tasks if t not in task_groups_set]
             return sorted(filtered_tasks) if filtered_tasks else sorted(list(available_tasks))
@@ -1192,7 +1289,10 @@ def _auto_discover_lm_eval_task(hf_dataset, hf_subset=None):
     # 获取任务组集合，用于验证返回的不是任务组
     try:
         from lm_eval.tasks import TaskManager
-        task_manager = TaskManager(verbosity="ERROR")
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            task_manager = TaskManager()
         task_groups_set = set(task_manager.all_groups) if hasattr(task_manager, 'all_groups') else set()
     except Exception:
         task_groups_set = set()
@@ -1621,6 +1721,69 @@ def _prepare_custom_eval_task(hf_dataset, hf_subset, hf_split, task_dir):
         return None, None
 
 
+def _prepare_multimodal_model_for_eval(model_path, output_path):
+    """为 hf-multimodal 准备兼容模型目录（最小侵入：仅在评估目录生成临时配置）。"""
+    try:
+        cfg_path = os.path.join(model_path, "config.json")
+        if not os.path.isfile(cfg_path):
+            return model_path
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        top_type = (cfg.get("model_type") or "").strip().lower()
+        vcfg = cfg.get("vision_config") if isinstance(cfg.get("vision_config"), dict) else {}
+        vision_type = (vcfg.get("model_type") or "").strip().lower()
+
+        # 仅处理常见的 Qwen VL 退化配置（top-level 仍是 qwen2）
+        if top_type != "qwen2" or vision_type not in ("qwen2_5_vl", "qwen2_vl", "qwen3_vl", "qwen3_vl_moe"):
+            return model_path
+
+        arch_map = {
+            "qwen2_5_vl": "Qwen2_5_VLForConditionalGeneration",
+            "qwen2_vl": "Qwen2VLForConditionalGeneration",
+            "qwen3_vl": "Qwen3VLForConditionalGeneration",
+            "qwen3_vl_moe": "Qwen3VLMoeForConditionalGeneration",
+        }
+
+        patched_dir = os.path.join(output_path, "_mm_model")
+        os.makedirs(patched_dir, exist_ok=True)
+
+        # 除 config.json 外尽量复用原文件（软链接）
+        for name in os.listdir(model_path):
+            if name == "config.json":
+                continue
+            src = os.path.join(model_path, name)
+            dst = os.path.join(patched_dir, name)
+            try:
+                if os.path.islink(dst) or os.path.isfile(dst):
+                    os.remove(dst)
+                elif os.path.isdir(dst):
+                    continue
+            except Exception:
+                pass
+            try:
+                os.symlink(src, dst)
+            except Exception:
+                # 软链接失败时回退复制（小文件）
+                if os.path.isfile(src):
+                    try:
+                        shutil.copy2(src, dst)
+                    except Exception:
+                        pass
+
+        patched_cfg = dict(cfg)
+        patched_cfg["model_type"] = vision_type
+        patched_cfg["architectures"] = [arch_map.get(vision_type, patched_cfg.get("architectures", ["Qwen2_5_VLForConditionalGeneration"])[0])]
+        with open(os.path.join(patched_dir, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(patched_cfg, f, ensure_ascii=False, indent=2)
+
+        _logger.info("[eval] 已生成多模态兼容配置: %s (model_type=%s)", patched_dir, vision_type)
+        return patched_dir
+    except Exception as e:
+        _logger.warning("[eval] 生成多模态兼容配置失败，使用原模型目录: %s", e)
+        return model_path
+
+
 def run_lm_eval_stream(
     model_path,
     output_path,
@@ -1651,7 +1814,10 @@ def run_lm_eval_stream(
     task_groups_set = None
     try:
         from lm_eval.tasks import TaskManager
-        task_manager_temp = TaskManager(verbosity="ERROR")
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            task_manager_temp = TaskManager()
         task_groups_set = set(task_manager_temp.all_groups) if hasattr(task_manager_temp, 'all_groups') else set()
     except Exception:
         task_groups_set = set()
@@ -1687,6 +1853,14 @@ def run_lm_eval_stream(
                     task_name = mapped
             # 如果 mapped 为 None，说明找不到映射，task_name 保持为空
         
+        # CMMMU 数据集仅接受 cmmmu_* / mmmu_val_* 任务，防止历史错误映射污染到其它基准
+        hf_ds_lower = (hf_dataset or "").strip().lower()
+        if hf_ds_lower in ("m-a-p/cmmmu", "cmmmu/cmmmu"):
+            t = (task_name or "").strip()
+            if t and not (t == "cmmmu" or t.startswith("cmmmu_") or t.startswith("mmmu_val_") or "," in t):
+                _logger.warning("[eval] 忽略不兼容的 CMMMU 任务映射: %s", t)
+                task_name = "cmmmu"
+
         # 验证从映射获取的任务名不是任务组
         if task_name and task_name.strip() and task_groups_set:
             if task_name in task_groups_set:
@@ -1695,8 +1869,74 @@ def run_lm_eval_stream(
         if task_name and task_name.strip():
             available_tasks = _get_available_lm_eval_tasks()
             if available_tasks and task_name not in available_tasks:
-                _logger.warning("[eval] 从映射获取的任务名不存在，尝试自动发现: %s", task_name)
-                task_name = ""
+                # cmmmu 是任务组占位符，后续会进入专门解析逻辑，不能在这里清空
+                if (task_name or "").strip().lower() != "cmmmu":
+                    _logger.warning("[eval] 从映射获取的任务名不存在，尝试自动发现: %s", task_name)
+                    task_name = ""
+
+    # 若传入 lm_eval_task 为任务组名 "cmmmu"，按本机可用任务动态解析（避免硬编码到不存在任务）
+    if (task_name or "").strip() == "cmmmu":
+        available_tasks = _get_available_lm_eval_tasks() or []
+        subset_key = (hf_subset or "").strip().lower().replace("-", "_")
+
+        # 1) 优先使用原生 cmmmu_*（若环境已安装对应任务）
+        cmmmu_tasks = sorted(t for t in available_tasks if t.startswith("cmmmu_"))
+        if cmmmu_tasks:
+            if subset_key and subset_key != "all":
+                # 尝试按子集名匹配；匹配不到则回退全部，保证任务可执行
+                chosen = [t for t in cmmmu_tasks if subset_key in t.lower()]
+                task_name = ",".join(chosen or cmmmu_tasks)
+            else:
+                task_name = ",".join(cmmmu_tasks)
+            _logger.info("[eval] CMMMU 解析到原生任务: %s", task_name)
+        else:
+            # 2) 兼容回退：当前环境若仅有 mmmu_val_*，则使用其可用子任务（不影响其它数据集）
+            mmmu_tasks = sorted(t for t in available_tasks if t.startswith("mmmu_val_"))
+            if mmmu_tasks:
+                # 仅保留当前环境可加载到数据集配置的任务，避免部分 config 缺失导致进程中断
+                try:
+                    cfg_norm = set()
+                    eval_cache = getattr(Config, "EVAL_HF_DATASETS_CACHE", None) or os.path.join(Config.PROJECT_ROOT, "cache", "eval_datasets")
+                    local_cfg_root = Path(eval_cache) / "MMMU___mmmu"
+                    if local_cfg_root.exists() and local_cfg_root.is_dir():
+                        for p in local_cfg_root.iterdir():
+                            if p.is_dir():
+                                cfg_norm.add(p.name.strip().lower().replace("-", "_"))
+                        if cfg_norm:
+                            _logger.info("[eval] MMMU 使用本地缓存配置过滤，共 %d 项", len(cfg_norm))
+                    if not cfg_norm:
+                        from datasets import get_dataset_config_names
+                        cfgs = get_dataset_config_names("MMMU/MMMU", trust_remote_code=True) or []
+                        cfg_norm = {str(c).strip().lower().replace("-", "_") for c in cfgs}
+                    filtered = []
+                    for t in mmmu_tasks:
+                        suffix = t.replace("mmmu_val_", "", 1).strip().lower().replace("-", "_")
+                        if suffix in cfg_norm:
+                            filtered.append(t)
+                    if filtered:
+                        mmmu_tasks = filtered
+                except Exception as e:
+                    _logger.warning("[eval] 读取 MMMU 可用 configs 失败，将使用全部 mmmu_val_* 任务: %s", e)
+
+                if subset_key and subset_key != "all":
+                    # 领域到关键词映射（匹配不到则回退全部可用任务，确保可执行）
+                    keyword_map = {
+                        "art_and_design": ["art", "design"],
+                        "business": ["business", "finance", "economics", "manage"],
+                        "health_and_medicine": ["medical", "medicine", "health", "pharmacy", "biology"],
+                        "humanities_and_social_sciences": ["history", "literature", "sociology", "psychology", "law", "politics"],
+                        "science": ["physics", "chemistry", "math", "biology", "science"],
+                        "technology_and_engineering": ["computer", "engineering", "electronics", "energy"],
+                    }
+                    kws = keyword_map.get(subset_key, [subset_key])
+                    chosen = [t for t in mmmu_tasks if any(k in t.lower() for k in kws)]
+                    task_name = ",".join(chosen or mmmu_tasks)
+                else:
+                    task_name = ",".join(mmmu_tasks)
+                _logger.warning("[eval] 环境无 cmmmu_*，回退使用 mmmu_val_* 任务: %s", task_name)
+            else:
+                # CMMMU 请求下若环境既无 cmmmu_* 也无 mmmu_val_*，直接报错，避免误匹配到其它 mmlu 任务
+                raise ValueError("当前 lm_eval 环境未注册 CMMMU 兼容任务（缺少 cmmmu_* 与 mmmu_val_*）。请安装含多模态任务的 lm_eval 版本后重试。")
 
     # 验证任务名是否有效，如果无效则尝试自动发现
     if not task_name or task_name.strip() == "":
@@ -1715,12 +1955,20 @@ def run_lm_eval_stream(
                 hf_key = (hf_dataset or "").strip()
                 subset = (hf_subset or "").strip()
                 exact_key = "%s|%s" % (hf_key, subset) if subset else hf_key
-                extra[exact_key] = discovered_task
-                # 如果没有 subset，也保存通用映射
-                if not subset:
-                    extra[hf_key] = discovered_task
-                _save_eval_task_mapping(extra)
-                _logger.info("[eval] 已自动保存映射: %s -> %s", exact_key, discovered_task)
+                hf_ds_lower2 = (hf_dataset or "").strip().lower()
+                allow_save = True
+                if hf_ds_lower2 in ("m-a-p/cmmmu", "cmmmu/cmmmu"):
+                    dt = (discovered_task or "").strip()
+                    allow_save = bool(dt.startswith("cmmmu_") or dt.startswith("mmmu_val_"))
+                if allow_save:
+                    extra[exact_key] = discovered_task
+                    # 如果没有 subset，也保存通用映射
+                    if not subset:
+                        extra[hf_key] = discovered_task
+                    _save_eval_task_mapping(extra)
+                    _logger.info("[eval] 已自动保存映射: %s -> %s", exact_key, discovered_task)
+                else:
+                    _logger.warning("[eval] CMMMU 自动发现结果不兼容，跳过保存映射: %s", discovered_task)
             except Exception as save_err:
                 _logger.warning("[eval] 自动保存映射失败: %s", save_err)
         else:
@@ -1739,27 +1987,34 @@ def run_lm_eval_stream(
         # 额外验证：尝试加载任务，确保可以正常加载（不是任务组）
         try:
             from lm_eval.tasks import TaskManager
-            verify_tm = TaskManager(verbosity="ERROR")
-            loaded = verify_tm.load_task_or_group(task_name)
-            # 如果返回的是 ChainMap（任务组），则报错
-            from collections import ChainMap
-            if isinstance(loaded, ChainMap):
-                error_msg = f"任务名 '{task_name}' 是任务组（返回 ChainMap），无法直接使用。请使用具体任务名。"
-                _logger.error("[eval] %s", error_msg)
-                raise ValueError(error_msg)
-            # 如果返回的是字典且包含 'group' 键，也是任务组
-            if isinstance(loaded, dict) and 'group' in loaded:
-                error_msg = f"任务名 '{task_name}' 是任务组（配置包含 'group' 键），无法直接使用。请使用具体任务名。"
-                _logger.error("[eval] %s", error_msg)
-                raise ValueError(error_msg)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                verify_tm = TaskManager()
+            # 0.4.11+: 优先用 load()；旧版回退 load_task_or_group
+            if hasattr(verify_tm, 'load'):
+                result = verify_tm.load(task_name)
+                if result.get("groups") and task_name in result["groups"]:
+                    error_msg = f"任务名 '{task_name}' 是任务组而非具体任务，无法直接使用。请使用具体任务名。"
+                    _logger.error("[eval] %s", error_msg)
+                    raise ValueError(error_msg)
+            else:
+                loaded = verify_tm.load_task_or_group(task_name)
+                from collections import ChainMap
+                if isinstance(loaded, ChainMap):
+                    error_msg = f"任务名 '{task_name}' 是任务组（返回 ChainMap），无法直接使用。"
+                    _logger.error("[eval] %s", error_msg)
+                    raise ValueError(error_msg)
         except ValueError:
-            raise  # 重新抛出 ValueError
+            raise
         except Exception as verify_err:
-            # 如果加载失败，可能是网络问题或其他原因，记录警告但不阻止执行
             _logger.warning("[eval] 验证任务加载失败（非致命）: %s", verify_err)
 
     if task_name == "all":
         target_tasks_list = list(STANDARD_BENCHMARKS)
+        cmd_task_str = ",".join(target_tasks_list)
+    elif "," in (task_name or ""):
+        target_tasks_list = [t.strip() for t in task_name.split(",") if t.strip()]
         cmd_task_str = ",".join(target_tasks_list)
     else:
         target_tasks_list = [task_name]
@@ -1810,12 +2065,22 @@ def run_lm_eval_stream(
         else:
             _logger.warning("[eval] 未在 %s 找到 lm_eval，将尝试系统 PATH", bin_dir)
 
+    # 多模态任务需使用 hf-multimodal / vllm-vlm；这里按任务名自动切换到 hf-multimodal
+    is_multimodal_task = any((t or "").startswith("mmmu_val_") or (t or "").startswith("cmmmu_") for t in (target_tasks_list or []))
+    model_backend = "hf-multimodal" if is_multimodal_task else "hf"
+    eval_model_path = model_path
+    if is_multimodal_task:
+        _logger.info("[eval] 检测到多模态任务，使用模型后端: %s", model_backend)
+        eval_model_path = _prepare_multimodal_model_for_eval(model_path, output_path)
+        model_args = model_args.replace("pretrained=%s" % model_path, "pretrained=%s" % eval_model_path, 1)
+
+    batch_size_arg = "1" if is_multimodal_task else "auto"
     cmd = [
-        lm_eval_bin, "--model", "hf",
+        lm_eval_bin, "--model", model_backend,
         "--model_args", model_args,
         "--tasks", cmd_task_str,
         "--device", device,
-        "--batch_size", "auto",
+        "--batch_size", batch_size_arg,
         "--output_path", output_path,
         "--log_samples",
     ]
@@ -2009,16 +2274,20 @@ def run_lm_eval_stream(
 
     if process.returncode != 0:
         _logger.warning("[eval] lm_eval 退出码 %s", process.returncode)
-        err_path = os.path.join(output_path, "eval_stderr.txt")
-        try:
-            with open(err_path, "w", encoding="utf-8") as f:
-                f.write(_fail_msg("lm_eval 退出码: %s" % process.returncode))
-        except Exception:
-            pass
         tail_text = "\n".join(last_lines[-30:]) if last_lines else ""
         hint = ""
         if "dataclass" in tail_text or "Features.from_dict" in tail_text:
             hint = " 若为 datasets 缓存兼容问题，可尝试删除 HF 数据集缓存或 pip install -U datasets。"
+        elif "does not recognize this architecture" in tail_text or ("model type" in tail_text and "Transformers" in tail_text):
+            hint = " 该架构可能未被当前 transformers 版本识别，请确认 pip install --upgrade 'lm_eval[hf]' transformers 已升级到最新。"
+        elif "canUse32BitIndexMath" in tail_text:
+            hint = " 大张量索引溢出：可尝试 batch_size=1 或减小 --limit。"
+        err_path = os.path.join(output_path, "eval_stderr.txt")
+        try:
+            with open(err_path, "w", encoding="utf-8") as f:
+                f.write(_fail_msg("lm_eval 退出码: %s%s" % (process.returncode, hint)))
+        except Exception:
+            pass
         raise RuntimeError("评测进程退出码 %s，详见任务目录 eval_stderr.txt.%s\n--- 输出尾行 ---\n%s" % (process.returncode, hint, tail_text[-2000:] if len(tail_text) > 2000 else tail_text))
 
     json_path = _pick_latest_json(output_path)
@@ -2158,8 +2427,8 @@ def run_eval_only_task(task_id, params, update_progress_callback, task_control=N
             metadata["metrics"] = metrics
         if error:
             metadata["error"] = error
-        with open(os.path.join(task_dir, "metadata.json"), "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        metadata["model_path"] = model_path
+        _write_metadata(task_id, task_dir, metadata)
 
     try:
         _write_meta("running")
@@ -2176,8 +2445,7 @@ def run_eval_only_task(task_id, params, update_progress_callback, task_control=N
         use_yaml = bool(prompt_yaml and os.path.isfile(prompt_yaml) and (prompt_yaml.endswith(".yaml") or prompt_yaml.endswith(".yml")))
         if use_yaml:
             metadata["yaml_template"] = prompt_yaml
-            with open(os.path.join(task_dir, "metadata.json"), "w", encoding="utf-8") as f:
-                json.dump(metadata, f, ensure_ascii=False, indent=2)
+            _write_metadata(task_id, task_dir, metadata)
             
             # 直接调用 lm_eval，不再使用 eval_worker.py 避免递归死循环
             # 解析任务名和包含路径

@@ -360,6 +360,9 @@
             saveTestsetsCache([]);
             loadTestsets(true);
         };
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') loadTestsets(true);
+        });
         loadTestsets(false);
     </script>
 </body>

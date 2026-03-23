@@ -21,27 +21,48 @@ function initEval() {
     setupDeleteModal();
     initSegmentedControls();
     setupTestsetRefresh();
+    restoreActiveEvalTask();
+}
+
+async function restoreActiveEvalTask() {
+    const candidates = [];
     const tid = sessionStorage.getItem(STORAGE_ACTIVE_EVAL);
-    if (tid) {
-        currentTaskId = tid;
-        pollStatus(currentTaskId);
-    } else {
-        // 无会话ID时，回退到历史记录中查找运行中的评估任务
+    if (tid) candidates.push(tid);
+    // 无会话 ID 时，或会话 ID 失效时，回退到历史记录中查找“正在运行/排队”的评估任务
+    try {
+        const r = await fetch('/api/test_history');
+        const d = await r.json();
+        const list = (d.history || []).filter(it => (it && it.type === 'eval_only'));
+        list.forEach(it => {
+            if (it && (it.status === 'running' || it.status === 'queued') && it.id) {
+                candidates.push(it.id);
+            }
+        });
+    } catch (e) {}
+
+    const uniq = [...new Set(candidates.filter(Boolean))];
+    for (const cid of uniq) {
         try {
-            fetch('/api/test_history')
-                .then(r => r.json())
-                .then(d => {
-                    const list = (d.history || []).filter(it => (it && it.type === 'eval_only'));
-                    const running = list.find(it => it && (it.status === 'running' || it.status === 'queued'));
-                    if (running && running.id) {
-                        currentTaskId = running.id;
-                        try { sessionStorage.setItem(STORAGE_ACTIVE_EVAL, currentTaskId); } catch (e) {}
-                        pollStatus(currentTaskId);
-                    }
-                })
-                .catch(() => {});
+            const r = await fetch(`/api/status/${cid}`);
+            const s = await r.json();
+            const status = s ? s.status : null;
+            const isActive = s ? (s.is_active !== false) : false;
+            const isEval = !!(s && (s.type === 'eval_only' || ((s.original_data || {}).type === 'eval_only') || s.eval_progress));
+            if ((status === 'running' || status === 'queued') && isActive && isEval) {
+                currentTaskId = cid;
+                try { sessionStorage.setItem(STORAGE_ACTIVE_EVAL, currentTaskId); } catch (e) {}
+                pollStatus(currentTaskId);
+                return;
+            }
         } catch (e) {}
     }
+
+    // 没有可恢复的活跃任务：清理残留状态，确保进度条隐藏
+    currentTaskId = null;
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    try { sessionStorage.removeItem(STORAGE_ACTIVE_EVAL); } catch (e) {}
+    const progressContainer = document.querySelector('.progress-container');
+    if (progressContainer) progressContainer.style.display = 'none';
 }
 
 function initSegmentedControls() {
@@ -376,6 +397,7 @@ async function doHfDownloadAndAdd() {
 
 async function loadHistoryList() {
     const listEl = document.getElementById('history-list');
+    if (!listEl) return;
     listEl.innerHTML = '';
     
     try {
@@ -771,12 +793,15 @@ function normalizeEvalStatusMessage(message, status) {
 function pollStatus(taskId) {
     if (pollTimer) clearInterval(pollTimer);
     let pollCount = 0;
+    let errorCount = 0;
     pollTimer = setInterval(async () => {
         try {
             const res = await fetch(`/api/status/${taskId}`);
             const data = await res.json();
+            errorCount = 0;
+            const isActive = data && (data.is_active !== false);
             
-            if (data.status === 'running' || data.status === 'queued') {
+            if ((data.status === 'running' || data.status === 'queued') && isActive) {
                 // 确保进度条容器可见（用于刷新页面后的恢复）
                 const progressContainer = document.querySelector('.progress-container');
                 if (progressContainer && progressContainer.style.display === 'none') {
@@ -808,8 +833,9 @@ function pollStatus(taskId) {
                 setStatusUI(msg, prog, stripe);
                 document.getElementById('start-eval').innerText = "正在运行...";
             } 
-            else if (['completed', 'error', 'stopped'].includes(data.status)) {
+            else if (['completed', 'error', 'stopped', 'interrupted', 'failed'].includes(data.status) || !isActive) {
                 clearInterval(pollTimer);
+                pollTimer = null;
                 currentTaskId = null;
                  try { sessionStorage.removeItem(STORAGE_ACTIVE_EVAL); } catch (e) {}
                 resetUI();
@@ -830,7 +856,17 @@ function pollStatus(taskId) {
                     setStatusUI(data.message || (isStopped ? "测试已停止" : "任务失败"), 0, false, isStopped ? '#86868b' : '#ff3b30');
                 }
             }
-        } catch(e) { console.error(e); }
+        } catch(e) {
+            errorCount += 1;
+            // 连续失败视为任务状态不可恢复，避免进度条常驻
+            if (errorCount >= 3) {
+                if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+                currentTaskId = null;
+                try { sessionStorage.removeItem(STORAGE_ACTIVE_EVAL); } catch (e2) {}
+                resetUI();
+            }
+            console.error(e);
+        }
         pollCount++;
     }, 1000);
 }
@@ -838,9 +874,10 @@ function pollStatus(taskId) {
 function resetUI() {
     const startBtn = document.getElementById('start-eval');
     const clearBtn = document.getElementById('clear-eval');
-    startBtn.disabled = false;
+    startBtn.disabled = !evalState.selectedModel;
     startBtn.innerText = "开始测试";
     clearBtn.innerText = "重置";
+    clearBtn.disabled = !evalState.selectedModel;
     const progressContainer = document.querySelector('.progress-container');
     if (progressContainer) progressContainer.style.display = 'none';
 }
@@ -914,9 +951,11 @@ function drawChart(compData, baseName) {
     const allZero = (arr) => arr.length && arr.every((v) => v === 0);
     const baseAllZero = allZero(baseData);
     const mergedAllZero = allZero(mergedData);
-    // 全为 0 时多边形会塌缩到中心不可见，用最小显示值画出小三角形
-    const displayBase = baseAllZero ? baseData.map(() => 2) : baseData;
-    const displayMerged = mergedAllZero ? mergedData.map(() => 2) : mergedData;
+    // 全为 0 时多边形会塌缩到中心不可见：基准线用较大占位值(12)保证可见，目标模型用 2 表示暂无数据
+    const BASE_PLACEHOLDER = 12;
+    const MERGED_PLACEHOLDER = 2;
+    const displayBase = baseAllZero ? baseData.map(() => BASE_PLACEHOLDER) : baseData;
+    const displayMerged = mergedAllZero ? mergedData.map(() => MERGED_PLACEHOLDER) : mergedData;
 
     myChart = new Chart(chartCtx, {
         type: 'radar',
@@ -985,9 +1024,18 @@ function setupSidebar() {
     const overlay = document.getElementById('sidebar-overlay');
     const closeBtn = document.getElementById('close-sidebar');
 
+    const openSidebar = () => {
+        sidebar.classList.add('open');
+        overlay.classList.add('show');
+        loadHistoryList(); // 打开侧栏时刷新测试历史，保证看到最新列表
+    };
+    const closeSidebar = () => {
+        sidebar.classList.remove('open');
+        overlay.classList.remove('show');
+    };
     const toggle = () => {
-        sidebar.classList.toggle('open');
-        overlay.classList.toggle('show');
+        if (sidebar.classList.contains('open')) closeSidebar();
+        else openSidebar();
     };
 
     menuBtn.addEventListener('click', toggle);
@@ -995,6 +1043,11 @@ function setupSidebar() {
     overlay.addEventListener('click', toggle);
     
     loadHistoryList();
+
+    // 页面重新可见时刷新测试历史列表，避免多 tab 或 bfcache 后看到旧数据
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') loadHistoryList();
+    });
 }
 
 function initDropdowns() {

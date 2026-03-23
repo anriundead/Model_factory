@@ -7,6 +7,7 @@ import uuid
 from flask import render_template, jsonify, request, send_from_directory
 
 from .dataset_info import DataRequest
+from .repositories import task_upsert
 
 
 MMLU_SUBSETS = [
@@ -111,12 +112,35 @@ def register_routes(app, state, services, dataset_service):
     @app.route("/api/models")
     def get_models():
         try:
+            refresh = request.args.get("refresh", "0") == "1"
+            if refresh:
+                services.scan_base_models_to_db()
+
+            from .repositories import model_list_all
+            from .models import Model
+            from .extensions import db as _db
+            db_base = _db.session.query(Model).filter_by(source="base").all()
+            if db_base and not refresh:
+                models = []
+                for m in db_base:
+                    models.append({
+                        "name": m.name,
+                        "size": m.size_bytes or 0,
+                        "details": {"family": "HuggingFace Local"},
+                        "path": m.path,
+                        "is_vlm": m.is_vlm or False,
+                        "source": "base",
+                    })
+                base_path = getattr(state.config, "LOCAL_MODELS_PATH", None) or state.model_pool_path
+                return jsonify({"status": "success", "models": models, "base_path": base_path})
+
             seen_paths = set()
             models = []
+            extra_paths = getattr(state.config, "LOCAL_MODELS_EXTRA_PATHS", None) or []
             for base_path in (
                 getattr(state.config, "LOCAL_MODELS_PATH", None),
                 state.model_pool_path,
-            ):
+            ) + tuple(extra_paths):
                 if not base_path or not os.path.exists(base_path):
                     if base_path:
                         os.makedirs(base_path, exist_ok=True)
@@ -146,10 +170,11 @@ def register_routes(app, state, services, dataset_service):
             if not resolved_path:
                  return jsonify({"status": "error", "message": "模型不存在或路径无效"}), 404
             
+            extra_paths = getattr(state.config, "LOCAL_MODELS_EXTRA_PATHS", None) or []
             allowed_bases = [
                 getattr(state.config, "LOCAL_MODELS_PATH", None),
                 state.model_pool_path,
-            ]
+            ] + list(extra_paths)
             
             is_allowed = False
             for base in allowed_bases:
@@ -175,7 +200,10 @@ def register_routes(app, state, services, dataset_service):
                 shutil.rmtree(resolved_path)
             else:
                 os.remove(resolved_path)
-                
+            try:
+                services.model_delete_from_db_by_path(resolved_path)
+            except Exception:
+                pass
             return jsonify({"status": "success", "message": "模型已删除"})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
@@ -186,6 +214,8 @@ def register_routes(app, state, services, dataset_service):
 
     @app.route("/api/merged_models")
     def get_merged_models():
+        # 先调用 model_repo_list 触发「文件/merges → DB」同步，保证 Navicat 等能看到最新 models 表
+        services.model_repo_list()
         models = []
         if not os.path.exists(state.merge_dir):
             return jsonify({"status": "success", "models": models})
@@ -211,30 +241,6 @@ def register_routes(app, state, services, dataset_service):
             except Exception:
                 continue
         return jsonify({"status": "success", "models": models})
-
-    @app.route("/api/fusion_3d_data/<task_id>")
-    def get_fusion_3d_data(task_id):
-        merge_dir = os.path.join(state.merge_dir, task_id)
-        # 修正路径：bridge 脚本传递的 results-dir 为 vlm_search_results，文件名默认为 vlm_search.csv
-        csv_path = os.path.join(merge_dir, "vlm_search_results", "vlm_search.csv")
-        
-        if not os.path.exists(csv_path):
-            return jsonify({"status": "error", "message": "数据文件不存在"}), 404
-
-        try:
-            import pandas as pd
-            df = pd.read_csv(csv_path)
-            # 清理列名（去除空格）
-            df.columns = [c.strip() for c in df.columns]
-            # 填充 NaN
-            df = df.where(pd.notnull(df), None)
-            
-            # 构造返回数据
-            # 假设列: Unnamed: 0, objective_1, genotype_1, genotype_2, step
-            records = df.to_dict(orient="records")
-            return jsonify({"status": "success", "data": records})
-        except Exception as e:
-            return jsonify({"status": "error", "message": str(e)}), 500
 
     @app.route("/api/check_compatibility", methods=["POST"])
     def api_check_compatibility():
@@ -324,7 +330,17 @@ def register_routes(app, state, services, dataset_service):
                 resolved.append(os.path.abspath(path))
             data["model_paths"] = resolved
         elif models:
-            data["model_paths"] = None
+            # 将模型名解析为绝对路径，与前端/模型列表一致，避免 worker 中 MODEL_POOL_PATH 不一致导致立即失败
+            resolved = []
+            for name in models:
+                path = services.resolve_model_path(name if isinstance(name, str) else str(name))
+                if not path:
+                    return jsonify({
+                        "status": "error",
+                        "message": "模型路径不存在: %s（已尝试 LOCAL_MODELS_PATH 与 MODEL_POOL_PATH 及目录名匹配）" % (name,),
+                    }), 400
+                resolved.append(path)
+            data["model_paths"] = resolved
         else:
             return jsonify({"status": "error", "message": "请提供 model_paths、models 或 items"}), 400
         
@@ -373,6 +389,10 @@ def register_routes(app, state, services, dataset_service):
                 "priority": priority_str,
             }
             state.task_queue.put((priority_score, created_at, task_id, data))
+        try:
+            task_upsert(task_id, "merge", data)
+        except Exception as e:
+            state.logger.warning("[API] Task DB upsert 失败 (merge): %s", e)
         return jsonify({"status": "success", "task_id": task_id})
 
     @app.route("/api/merge_evolutionary", methods=["POST"])
@@ -441,8 +461,8 @@ def register_routes(app, state, services, dataset_service):
         }
         merge_dir = os.path.join(state.merge_dir, task_id)
         os.makedirs(merge_dir, exist_ok=True)
-        with open(os.path.join(merge_dir, "metadata.json"), "w", encoding="utf-8") as f:
-            json.dump({"id": task_id, "status": "pending", **task_data}, f, ensure_ascii=False, indent=2)
+        import merge_manager as _mm
+        _mm._write_metadata(task_id, merge_dir, {"id": task_id, "status": "pending", **task_data})
         state.logger.info(
             "[API] 提交完全融合 task_id=%s custom_name=%s model_paths=%s hf_subsets=%s pop_size=%s n_iter=%s",
             task_id, task_data.get("custom_name"), resolved[:3], hf_subsets, task_data.get("pop_size"), task_data.get("n_iter"),
@@ -457,6 +477,10 @@ def register_routes(app, state, services, dataset_service):
                 "priority": data.get("priority", "common"),
             }
             state.task_queue.put((state.priority_map.get(data.get("priority", "common"), 10), created_at, task_id, task_data))
+        try:
+            task_upsert(task_id, "merge_evolutionary", task_data)
+        except Exception as e:
+            state.logger.warning("[API] Task DB upsert 失败 (merge_evolutionary): %s", e)
         return jsonify({"status": "success", "task_id": task_id})
 
     @app.route("/api/evaluate", methods=["POST"])
@@ -554,6 +578,10 @@ def register_routes(app, state, services, dataset_service):
         with state.scheduler_lock:
             state.tasks[task_id] = task_data
             state.task_queue.put((10, created_at, task_id, task_data))
+        try:
+            task_upsert(task_id, "eval_only", task_data)
+        except Exception as e:
+            state.logger.warning("[API] Task DB upsert 失败 (eval_only): %s", e)
         return jsonify({"status": "success", "task_id": task_id})
 
     @app.route("/api/history", methods=["GET"])
@@ -584,6 +612,13 @@ def register_routes(app, state, services, dataset_service):
         task = state.tasks.get(task_id)
         if task is not None:
             resp = {k: v for k, v in task.items() if k not in ("control", "original_data")}
+            # 运行态可信来源：仅当前 worker 正在执行的任务，或仍在当前进程队列中的任务
+            is_active = False
+            if task.get("status") == "running":
+                is_active = state.running_task_info.get("id") == task_id
+            elif task.get("status") == "queued":
+                is_active = True
+            resp["is_active"] = is_active
             if task.get("status") == "queued":
                 my_priority = state.priority_map.get(task.get("priority", "common"), 10)
                 pos = 0
@@ -597,18 +632,52 @@ def register_routes(app, state, services, dataset_service):
             if task.get("original_data", {}).get("type") == "merge_evolutionary" or task.get("type") == "merge_evolutionary":
                 evo = services.read_evolution_progress(task_id)
                 if evo is not None:
+                    # 兼容历史任务：某些任务可能出现 current_step > total_expected_steps，
+                   
+                    cur = evo.get("current_step")
+                    tot = evo.get("total_expected_steps")
+                    if isinstance(cur, int) and isinstance(tot, int) and cur > 0 and tot > 0 and cur > tot:
+                        evo["total_expected_steps"] = cur
                     resp["evolution_progress"] = evo
+                    if evo.get("percent") is not None and task.get("status") == "running":
+                        resp["progress"] = min(99, max(0, int(evo["percent"])))
+                    elif evo.get("current_step") is not None and evo.get("total_expected_steps"):
+                        total = evo["total_expected_steps"]
+                        if total > 0:
+                            resp["progress"] = min(99, round(100 * evo["current_step"] / total))
+                    if evo.get("message") and task.get("status") == "running":
+                        resp["message"] = evo["message"]
                 od = task.get("original_data") or {}
                 resp["original_data"] = {"n_iter": od.get("n_iter"), "pop_size": od.get("pop_size")}
             if task.get("type") == "eval_only" or (task.get("original_data") or {}).get("type") == "eval_only":
                 ep = services.read_eval_progress(task_id)
                 if ep is not None:
                     resp["eval_progress"] = ep
+            # 已完成评估任务：用磁盘结果（含基准线注入）覆盖内存 result，保证雷达图基准线能显示
+            if task.get("status") == "completed" and (task.get("type") == "eval_only" or (task.get("original_data") or {}).get("type") == "eval_only"):
+                disk = services.status_from_disk(task_id)
+                if disk and disk.get("result"):
+                    resp["result"] = disk["result"]
+            # 以磁盘 metadata 为准：若任务已成功完成但内存仍为 running（进程异常退出未写回），则强制返回 completed，前端才能更新
+            meta_path = os.path.join(state.merge_dir, task_id, "metadata.json")
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    if meta.get("status") == "success":
+                        resp["status"] = "completed"
+                        resp["progress"] = 100
+                        resp["is_active"] = False
+                        if meta.get("message"):
+                            resp["message"] = meta["message"]
+                except Exception:
+                    pass
             return jsonify(resp)
         disk = services.status_from_disk(task_id)
         if disk is not None:
+            disk.setdefault("is_active", False)
             return jsonify(disk)
-        return jsonify({"status": "error"}), 404
+        return jsonify({"status": "error", "is_active": False}), 404
 
     @app.route("/api/stop/<task_id>", methods=["POST"])
     def stop_task(task_id):
@@ -651,6 +720,19 @@ def register_routes(app, state, services, dataset_service):
             "models": merged,
         })
 
+    @app.route("/api/model_repo/sync")
+    def api_model_repo_sync():
+        """手动触发「文件/merges → DB」同步，并返回当前 DB 中 models 数量，用于验证 Navicat 是否能看到数据。"""
+        merged = services.model_repo_list()
+        count = 0
+        try:
+            from app.extensions import db
+            from app.models import Model
+            count = db.session.query(Model).count()
+        except Exception:
+            pass
+        return jsonify({"status": "success", "list_count": len(merged), "db_models_count": count})
+
     @app.route("/api/model_repo/<model_id>/path")
     def api_model_repo_path(model_id):
         path = services.model_repo_path(model_id)
@@ -667,9 +749,24 @@ def register_routes(app, state, services, dataset_service):
         if not isinstance(models, dict):
             return jsonify({"status": "error", "message": "仓库数据异常"}), 500
         m = models.get(model_id)
+        path = m.get("path") if m else None
         if not m:
-            return jsonify({"status": "error", "message": "模型不存在"}), 404
-        path = m.get("path")
+            # 列表可能来自 DB（model_id 为 Model.id），从 DB 取 path 再删
+            path = services.model_get_path_by_id(model_id)
+            if not path:
+                return jsonify({"status": "error", "message": "模型不存在"}), 404
+            if os.path.isdir(path):
+                try:
+                    shutil.rmtree(path)
+                    state.logger.info("[model_repo] 已删除磁盘目录: %s", path)
+                except Exception as e:
+                    state.logger.exception("[model_repo] 删除目录失败: %s", path)
+                    return jsonify({"status": "error", "message": "删除磁盘文件失败: %s" % str(e)}), 500
+            try:
+                services.model_delete_from_db_by_path(path)
+            except Exception:
+                pass
+            return jsonify({"status": "success"})
         if path and os.path.isdir(path):
             try:
                 shutil.rmtree(path)
@@ -683,6 +780,11 @@ def register_routes(app, state, services, dataset_service):
         except Exception as e:
             state.logger.exception("[model_repo] 保存仓库失败")
             return jsonify({"status": "error", "message": "更新仓库失败: %s" % str(e)}), 500
+        try:
+            if path:
+                services.model_delete_from_db_by_path(path)
+        except Exception:
+            pass
         return jsonify({"status": "success"})
 
     @app.route("/api/resolve_model_path")
@@ -1089,7 +1191,33 @@ def register_routes(app, state, services, dataset_service):
 
     @app.route("/api/test_history")
     def api_test_history():
-        return jsonify({"status": "success", "history": services.get_all_eval_history()})
+        history = services.get_all_eval_history() or []
+        active_id = state.running_task_info.get("id")
+        normalized = []
+        for h in history:
+            item = dict(h or {})
+            tid = item.get("id") or item.get("task_id")
+            st = (item.get("status") or "").strip()
+            # 启动重启后，历史/DB 里的 running|queued 可能已失真；仅当前 active_id 视作活跃
+            if st in ("running", "queued") and tid and tid != active_id:
+                meta_path = os.path.join(state.merge_dir, tid, "metadata.json")
+                if os.path.isfile(meta_path):
+                    try:
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            raw = (json.load(f).get("status") or "").strip()
+                        if raw == "success":
+                            st = "completed"
+                        elif raw == "error":
+                            st = "error"
+                        else:
+                            st = "interrupted"
+                    except Exception:
+                        st = "interrupted"
+                else:
+                    st = "interrupted"
+                item["status"] = st
+            normalized.append(item)
+        return jsonify({"status": "success", "history": normalized})
 
     @app.route("/api/mmlu_subsets")
     def api_mmlu_subsets():
@@ -1097,7 +1225,12 @@ def register_routes(app, state, services, dataset_service):
 
     @app.route("/api/cmmmu_subsets")
     def api_cmmmu_subsets():
-        return jsonify({"status": "success", "subsets": CMMMU_SUBSETS})
+        return jsonify({
+            "status": "success",
+            "subsets": CMMMU_SUBSETS,
+            "count": len(CMMMU_SUBSETS),
+            "note": "不选子集或选「全部」时，评估将优先使用 cmmmu_*；若环境无该任务，将回退到 mmmu_val_* 兼容任务",
+        })
 
     @app.route("/api/model_is_vlm")
     def api_model_is_vlm():
@@ -1220,6 +1353,10 @@ def register_routes(app, state, services, dataset_service):
                 "priority": data.get("priority", "common"),
             }
             state.task_queue.put((state.priority_map.get(data.get("priority", "common"), 10), created_at, task_id, task_data))
+        try:
+            task_upsert(task_id, "recipe_apply", task_data)
+        except Exception as e:
+            state.logger.warning("[API] Task DB upsert 失败 (recipe_apply): %s", e)
         state.logger.info("[API] 提交配方应用 task_id=%s recipe_id=%s", task_id, recipe_id)
         return jsonify({"status": "success", "task_id": task_id})
 
@@ -1289,6 +1426,7 @@ def register_routes(app, state, services, dataset_service):
 
     @app.route("/api/fusion_history", methods=["GET"])
     def api_fusion_history():
+        """仅返回进化融合任务（type=merge_evolutionary），不包含标准融合、配方融合或评估任务。"""
         history = []
         if not os.path.isdir(state.merge_dir):
             return jsonify({"status": "success", "history": history})
@@ -1321,6 +1459,14 @@ def register_routes(app, state, services, dataset_service):
                         if "current_step" in prog:
                             evo_progress["current_step"] = prog.get("current_step")
                             evo_progress["total_expected_steps"] = prog.get("total_expected_steps")
+                            # 兼容历史任务显示：避免出现 current_step > total_expected_steps
+                            try:
+                                cs = int(evo_progress.get("current_step") or 0)
+                                ts = int(evo_progress.get("total_expected_steps") or 0)
+                                if cs > 0 and ts > 0 and cs > ts:
+                                    evo_progress["total_expected_steps"] = cs
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                 recipe_path = os.path.join(state.recipes_dir, "%s.json" % tid)
@@ -1362,52 +1508,162 @@ def register_routes(app, state, services, dataset_service):
         history.sort(key=lambda x: x.get("created_at", 0), reverse=True)
         return jsonify({"status": "success", "history": history})
 
+    def _read_csv_to_points(csv_path):
+        out = []
+        try:
+            import csv
+            import re
+            unnamed_re = re.compile(r"^Unnamed\s*:\s*\d+$", re.I)
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    point = {}
+                    for k, v in row.items():
+                        if not k or (unnamed_re.match(k.strip())):
+                            continue
+                        try:
+                            if isinstance(v, str) and "/" in v:
+                                v = v.split("/")[0].strip()
+                            point[k] = float(v)
+                        except (TypeError, ValueError):
+                            point[k] = v
+                    out.append(point)
+        except Exception as e:
+            state.logger.warning("Failed to parse CSV %s: %s", csv_path, e)
+        return out
+
     @app.route("/api/fusion_3d_data/<task_id>", methods=["GET"])
     def api_fusion_3d_data(task_id):
         task_dir = os.path.join(state.merge_dir, task_id)
-        if not os.path.isdir(task_dir):
-            return jsonify({"status": "error", "message": "Task not found"})
-        
-        data_points = []
-        
-        # 1. Check vlm_search.csv (VLM)
-        csv_path = os.path.join(task_dir, "vlm_search_results", "vlm_search.csv")
-        if os.path.isfile(csv_path):
-            try:
-                import csv
-                with open(csv_path, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        point = {}
-                        for k, v in row.items():
-                            try:
-                                point[k] = float(v)
-                            except:
-                                point[k] = v
-                        data_points.append(point)
-            except Exception as e:
-                state.logger.warning("Failed to parse vlm_search.csv: %s", e)
 
-        # 2. Check search_results.csv (generic)
-        if not data_points:
-            csv_path = os.path.join(task_dir, "search_results.csv")
+        data_points = []
+        if not os.path.isdir(task_dir):
+            # 目录不存在时仍尝试 DB
+            try:
+                from app.repositories import evolution_steps_for_task
+                db_rows = evolution_steps_for_task(task_id)
+                if db_rows:
+                    for r in db_rows:
+                        geno = r.get("genotype") or []
+                        data_points.append({
+                            "step": r.get("eval_index", 0),
+                            "objective_1": r.get("accuracy", 0),
+                            "genotype_1": geno[0] if len(geno) > 0 else 0,
+                            "genotype_2": geno[1] if len(geno) > 1 else 0,
+                            "generation": r.get("generation", 0),
+                            "best_acc": r.get("best_accuracy", 0),
+                        })
+            except Exception:
+                pass
+            if not data_points:
+                return jsonify({"status": "error", "message": "Task not found"})
+            return jsonify({"status": "success", "data": data_points})
+
+        # 多路径查找 CSV：兼容不同版本的 run_vlm_search 输出位置
+        csv_candidates = [
+            os.path.join(task_dir, "vlm_search_results", "vlm_search.csv"),
+            os.path.join(task_dir, "vlm_search_results", "vlm_search", "vlm_search.csv"),
+            os.path.join(task_dir, "search_results.csv"),
+        ]
+        for csv_path in csv_candidates:
             if os.path.isfile(csv_path):
-                 try:
-                    import csv
-                    with open(csv_path, "r", encoding="utf-8") as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            point = {}
-                            for k, v in row.items():
-                                try:
-                                    point[k] = float(v)
-                                except:
-                                    point[k] = v
-                            data_points.append(point)
-                 except Exception:
-                     pass
-        
+                data_points = _read_csv_to_points(csv_path)
+                if data_points:
+                    break
+        # 若 vlm_search_results 下有其它 CSV 也尝试
+        if not data_points:
+            results_dir = os.path.join(task_dir, "vlm_search_results")
+            if os.path.isdir(results_dir):
+                for name in sorted(os.listdir(results_dir)):
+                    if name.endswith(".csv"):
+                        data_points = _read_csv_to_points(os.path.join(results_dir, name))
+                        if data_points:
+                            break
+                    sub = os.path.join(results_dir, name)
+                    if os.path.isdir(sub):
+                        for subname in sorted(os.listdir(sub)):
+                            if subname.endswith(".csv"):
+                                data_points = _read_csv_to_points(os.path.join(sub, subname))
+                                if data_points:
+                                    break
+                    if data_points:
+                        break
+
+        # 无 CSV 时尝试 DB
+        if not data_points:
+            try:
+                from app.repositories import evolution_steps_for_task
+                db_rows = evolution_steps_for_task(task_id)
+                if db_rows:
+                    for r in db_rows:
+                        geno = r.get("genotype") or []
+                        data_points.append({
+                            "step": r.get("eval_index", 0),
+                            "objective_1": r.get("accuracy", 0),
+                            "genotype_1": geno[0] if len(geno) > 0 else 0,
+                            "genotype_2": geno[1] if len(geno) > 1 else 0,
+                            "generation": r.get("generation", 0),
+                            "best_acc": r.get("best_accuracy", 0),
+                        })
+            except Exception:
+                pass
+
+        # 无 CSV 也无 DB 时从 progress.json 合成单点
+        if not data_points:
+            progress_path = os.path.join(task_dir, "progress.json")
+            if os.path.isfile(progress_path):
+                try:
+                    with open(progress_path, "r", encoding="utf-8") as f:
+                        prog = json.load(f)
+                    best = prog.get("best_genotype")
+                    acc = prog.get("current_best")
+                    if best is not None and acc is not None:
+                        try:
+                            vals = list(best) if isinstance(best, (list, tuple)) else [float(best)]
+                        except (TypeError, ValueError):
+                            vals = []
+                        if vals:
+                            point = {"step": 0, "objective_1": float(acc), "accuracy": float(acc)}
+                            for i, v in enumerate(vals[:10]):
+                                point["genotype_%d" % (i + 1)] = float(v)
+                            if len(vals) == 1:
+                                point["genotype_2"] = 0.0
+                            data_points = [point]
+                except Exception as e:
+                    state.logger.debug("Fallback 3D from progress.json: %s", e)
+
         return jsonify({"status": "success", "data": data_points})
+
+    # ── 进化步骤数据 API（DB 查询/修改） ──
+
+    @app.route("/api/evolution_steps/<task_id>", methods=["GET"])
+    def api_evolution_steps(task_id):
+        from app.repositories import evolution_steps_for_task
+        try:
+            rows = evolution_steps_for_task(task_id)
+            return jsonify({"status": "success", "data": rows})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.route("/api/evolution_steps/<task_id>/<int:step_id>", methods=["PUT"])
+    def api_evolution_step_update(task_id, step_id):
+        from app.repositories import evolution_step_update
+        data = request.json or {}
+        row = evolution_step_update(step_id, **data)
+        if row is None:
+            return jsonify({"status": "error", "message": "Step not found"}), 404
+        return jsonify({"status": "success", "data": row.to_dict()})
+
+    @app.route("/api/evolution_steps/<task_id>/sync", methods=["POST"])
+    def api_evolution_steps_sync(task_id):
+        """手动触发从 CSV 同步进化步骤到 DB。"""
+        try:
+            services._sync_evolution_csv_to_db(task_id)
+            from app.repositories import evolution_steps_for_task
+            rows = evolution_steps_for_task(task_id)
+            return jsonify({"status": "success", "synced": len(rows)})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
 
     @app.route("/fusion_history")
     def fusion_history_page():

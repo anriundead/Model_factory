@@ -1,501 +1,179 @@
-# Mergenetic Pro 开发文档
+# mergeKit_beta 开发进度与注意事项
 
-## 项目概述
+## 范围说明
 
-Mergenetic Pro (Beta) 是一个基于 Web 的模型融合系统，支持标准融合和进化融合两种模式，使用 TIES-DARE 算法和 CMA-ES 优化器进行模型权重融合。目前正处于从 Beta 向正式版演进的阶段，重点在于增强自动化评估、数据管理和可视化分析能力。
+本文件仅描述 `Workspaces/mergeKit_beta` 的现状与约定，不覆盖仓库内其他子项目。
 
-### 核心功能 (已实现)
+## 当前开发进度（已核验）
 
-1. **标准融合**：基于用户指定的权重直接融合模型
-2. **进化融合**：使用进化算法自动搜索最优融合权重
-3. **配方管理**：保存和复用融合配方
-4. **模型评估**：支持多种基准测试（MMLU、CMMMU 等）
-5. **历史记录**：追踪所有融合任务和结果
-6. **兼容性检查**：基于 `hidden_size` 和 `num_hidden_layers` 的自动校验
+### 1) 融合与评估主链路
 
-## 项目结构
+- 标准融合：`/api/merge` -> `app/services.py` -> `merge_manager.py:run_merge_task()`
+- 进化融合：`/api/merge_evolutionary` -> `app/services.py` -> `scripts/run_vlm_search_bridge.py`
+- 评估任务：`/api/evaluate` -> `app/services.py` -> `merge_manager.py:run_eval_only_task()`
+- 配方复现：`/api/recipes/apply` -> `merge_manager.py:run_recipe_apply_task()`
 
-```
-mergeKit_beta/
-├── app.py                      # Flask 后端主应用入口
-├── config.py                   # 配置管理
-├── merge_manager.py            # 融合与评估任务核心调度逻辑
-├── app/                        # 应用逻辑模块
-│   ├── routes.py              # API 路由定义
-│   ├── services.py            # 业务服务层（模型路径、基准线查找等）
-│   ├── models.py              # 数据库模型定义 (Task等)
-│   ├── extensions.py          # Flask 扩展初始化 (db, migrate, admin)
-│   └── admin.py               # Flask-Admin 后台视图配置
-├── core/                       # 核心底层模块
-│   ├── task_manager.py        # 任务队列管理
-│   └── process_manager.py     # 进程管理
-├── scripts/                    # 脚本目录
-│   ├── run_vlm_search_bridge.py  # 进化融合桥接脚本
-│   └── cleanup_orphaned_models.py # 清理遗留模型脚本
-├── templates/                  # HTML 模板
-│   ├── index.html             # 主页面
-│   ├── fusion_history.html    # 融合历史页面
-│   └── model_repo.html        # 模型仓库页面
-├── static/                     # 静态资源
-│   ├── app.js                 # 前端主逻辑
-│   └── styles.css             # 样式文件
-├── merges/                     # 融合结果目录
-├── recipes/                    # 配方存储目录
-└── logs/                       # 日志目录
-```
+### 2) 数据层能力
 
-## 核心概念与实现机制
+- 已接入 ORM 与迁移：Flask-SQLAlchemy + Flask-Migrate
+- 已接入管理后台：`/admin`
+- 已有核心表：`tasks`、`models`、`testsets`、`evaluation_results`、`evolution_steps`、`tags`
+- 当前策略：数据库优先读取，文件回退读取保留（历史兼容）
+- **测试集补全**：若 DB 中某条测试集缺少 `hf_dataset`、`lm_eval_task` 等（例如由评测结果自动创建时未带完整参数），在**读取测试集列表**时会自动从 `testsets.json` 或该测试集下的某条 `EvaluationResult` 补全并回写 DB；**写入新评测结果**时若需新建测试集，会优先从 `testsets.json` 取完整信息再写入，避免产生空记录。Navicat 中若仍见部分测试集字段为空，可刷新前端「测试集」列表或重新执行 `scripts/backfill_db_from_files.py` 触发补全。
+- **脚本**：`scripts/check_db_file_consistency.py` 对比 DB 与文件一致性；`scripts/backfill_db_from_files.py` 从 `testsets.json` 与 `merges/*/metadata.json` 回填 TestSet/Task 到 DB（可选 `--compare` 回填后跑一致性检查）。
 
-### 1. 模型兼容性检查
+### 3) 前端与可视化
 
-两个或多个模型能否进行融合，取决于它们是否属于**同一架构**。判定依据：
+- 任务状态轮询与进度展示可用
+- 进化任务支持 3D 数据读取（CSV -> DB -> progress 回退）
+- 测试集榜单与基础对比可用
 
-- **`hidden_size`**：隐藏层维度，必须一致
-- **`num_hidden_layers`**：隐藏层数，必须一致
+### 4) 回报与刷新机制（已核验并补全）
 
-**实现位置**：`app/services.py` (原 `app.py`) 中的 `ModelCompatibilityMixin` 类。
+- **任务回报**：融合/进化/评估均通过轮询 `GET /api/status/<task_id>`（约 1s 间隔）更新进度与结果；完成后会刷新对应列表或展示结果。
+- **记忆**：当前进行中的任务 ID 存于 `sessionStorage`（`mergenetic_active_task` / `mergekit_eval_active_task`），刷新页面或从其他页返回时会恢复轮询。
+- **列表刷新**：
+  - 主页：打开侧栏时拉取 `/api/history`；页面重新可见（visibilitychange）时也会刷新侧栏数据。
+  - 评估页：打开侧栏时拉取 `/api/test_history`；visibility 可见时刷新测试历史列表。
+  - 融合历史 / 模型仓库 / 测试历史：每页均有「刷新」按钮，且页面从隐藏变为可见时会自动重新拉取列表，避免多 tab 或 bfcache 导致看到旧数据。
 
-**注意**：不同来源的模型可能使用不同的 `model_type`（如 `llama`、`llama3`），但只要 `hidden_size` 和 `num_hidden_layers` 一致，即可融合。
+## 统一运行规范
 
-### 2. 双 Split 评估机制
+- 主入口：`./start_app.sh`
+- 重启入口：`./restart_app.sh`
+- 标准端口：`5000`
+- 模块化应用入口：`app/__init__.py:create_app()`
+- `app.py`：仅兼容回退，不作为主入口继续扩展
 
-进化融合采用双 split 评估策略：
+## 应用启动与外网访问
 
-- **进化阶段**：使用 `--hf-split`（建议 `validation`）进行训练与验证，得到最优 genotype
-- **最终评测**：使用 `--hf-split-final`（建议 `test`）对最优模型做一次准确率评估
+- **启动方式**：`start_app.sh` 内联 Python 加载 `app/__init__.py` 得到 `app`，执行 `app.run(host="0.0.0.0", debug=True, port=PORT, use_reloader=False)`。绑定 `0.0.0.0` 表示监听本机所有网卡；端口由环境变量 `PORT` 决定，默认 `5000`。前端与 API 由同一 Flask 应用提供，模板在 `templates/`，静态在 `static/`，前端所有请求使用相对路径（如 `/api/...`、`/static/...`），无硬编码 localhost 或固定域名。
+- **外网用户能否进入**：可以，应用层已就绪。只要用户能访问到「服务器 IP 或域名:5000」，即可打开前端并正常使用。前置条件：本机防火墙需放行 5000（如 `sudo ufw allow 5000/tcp`）；服务器在内网时需在路由器做端口转发或通过内网穿透（如 natapp）将外网端口映射到本机 5000；对外暴露建议使用反向代理（如 nginx）将 80/443 转发到 5000，并配置域名与 HTTPS。
 
-**参数传递**：
-- `--hf-split-final`：最终评测使用的 split（如 `test`）
-- `--final-acc-file`：保存最终 test 准确率的 JSON 文件路径
+## 使用注意事项
 
-**实现位置**：
-- 桥接脚本：`scripts/run_vlm_search_bridge.py`
-- 外部脚本：`run_vlm_search.py`（需支持上述参数）
+### 1) 外部脚本依赖
 
-### 3. 配方系统
+进化融合依赖外部 `run_vlm_search.py`。当前阶段不内嵌重构，相关路径与参数必须保持可用，否则进化任务会失败。
 
-配方（Recipe）保存了完整的融合配置，包括：
-- `best_genotype`：最优权重向量
-- `model_paths`：父模型路径
-- `hf_dataset`、`hf_subsets`：数据集配置
-- `current_best_acc`、`final_test_acc`：准确率指标
+### 2) 数据一致性约定
 
-**配方应用**：可以通过配方直接融合出最终模型，跳过进化搜索过程。
+- 主数据源以 DB 为准（管理、查询、统计都优先 DB）
+- 文件数据（如 `metadata.json`、`leaderboard.json`）保留为兼容与回退通道
+- 新功能默认先写 DB，再保证文件回退不破坏现有行为
 
-**存储位置**：`recipes/<task_id>.json`
+### 3) 风险控制（当前优先级）
 
-### 4. 基准线与排行榜 (Leaderboard)
+- 文档漂移：通过精简文档与单一规范修复
+- 双写偏差：以 DB 为主源治理，文件作为回退
+- 入口分叉：统一到 `start_app.sh` + `create_app()`
+- 扩展边界：新增或修改功能仅进入 `app/` 模块体系（routes/services/repositories 等），禁止在 `app.py` 增加新路由或业务逻辑；`app.py` 仅保留兼容回退
 
-系统动态查找基准线数据以生成雷达图：
-1. **优先**：查找当前测试集 ID 对应的 `leaderboard.json` 数据。
-2. **全局回退**：如果在当前测试集未找到，则扫描所有排行榜数据，匹配模型名称 + 数据集 + 子集。
-3. **硬编码回退**：最后回退到 `Meta-Llama-3-8B-Instruct` 等常用基准。
+### 4) 模型兼容性说明（融合前）
 
-**实现位置**：`app/services.py` 中的 `status_from_disk` 方法。
+- 当前兼容性校验以 `hidden_size` 与 `num_hidden_layers` 为核心依据
+- 任一模型无法读取上述架构字段时，任务会被拒绝
+- 架构字段不一致时，任务会被拒绝
 
-### 5. 数据库与管理后台
+### 5) 评测依赖版本（当前环境）
 
-系统引入了 ORM 层以支持更强大的数据查询与管理能力：
+- **lm_eval**: `0.4.11`（安装命令需用 `pip install 'lm_eval[hf]'` 以包含 HuggingFace 后端）
+- **transformers**: `5.3.0`
+- lm_eval 0.4.11 已原生使用 `AutoModelForImageTextToText`，兼容 transformers 5.x，**不再需要** `scripts/patch_lm_eval_transformers5.py` 补丁
+- 升级/恢复命令：`conda activate mergenetic && pip install --upgrade 'lm_eval[hf]' transformers`
 
-- **技术栈**：Flask-SQLAlchemy (ORM) + Flask-Migrate (迁移) + Flask-Admin (后台)
-- **数据库**：默认使用 SQLite (`app.db`)，可配置为 PostgreSQL。
-- **管理后台**：访问 `/admin` 路径，提供可视化的数据增删改查功能。
-- **数据模型**：`Task` (任务状态与配置)，后续将扩展 `EvaluationResult` 等。
+### 6) 依赖冲突说明
 
-## 未来架构与需求规划 (Future Architecture & Roadmap)
+- mergenetic 在 `pyproject.toml` 中固定 `transformers==4.45.2` 和 `lm-eval==0.4.8`，升级后 pip 会报冲突警告，属预期行为
+- 不重装 mergenetic（`pip install -e .`）则当前环境保持升级后版本，融合与评测可照常使用
+- 若执行 `pip install -e .` 重装 mergenetic 会拉回旧版本，需重新运行升级命令
 
-详细的开发需求与演进规划请参考独立文档：[development_requirements.md](../development_requirements.md)。
+### 7) 融合与评测的架构支持
 
----
+- **标准融合**（mergekit/mergenetic）：不支持 Qwen3_5 架构（报 Unsupported architecture），仅支持旧架构模型间融合
+- **评测**（lm_eval 0.4.11 + transformers 5.3.0）：支持旧架构和新架构（含 qwen3_5 VLM）
+- 结论：「旧架构模型融合 + 旧/新架构模型评测」均可做，仅「新架构模型融合」暂不可用
 
-## API 接口参考
+### 8) 可追踪与日志
 
-### 模型相关
+- 异常/失败日志应尽量携带 `task_id`（任务相关时必选）、`model_id`（涉及模型时）、`testset_id`（涉及评测时）。
+- 推荐在 logger 的 message 中直接写出或使用 `extra={"task_id": task_id}`，便于 grep 与后续集中日志。
 
-- `GET /api/models` - 获取本地模型列表
-- `GET /api/models_pool` - 获取模型池列表
-- `GET /api/merged_models` - 获取已融合模型列表
-- `GET /api/resolve_model_path` - 解析模型路径
-- `POST /api/models/delete` - 删除模型（支持文件删除）
+## 开发步骤细化（参考）
+
+以下为短期/中期/后期开发的操作级参考，具体以 ROADMAP 与当前分支为准。
+
+- **短期 1.1（/api/status DB 优先）**：在 `app/repositories/__init__.py` 新增 `task_get_by_id(task_id)`；在 `app/routes.py` 的 `get_status` 中当任务不在内存时先查 DB，用 Task 组 JSON 并可选以 `status_from_disk` 补 result/evolution_progress/eval_progress。
+- **短期 1.2（不在 app.py 扩展）**：见上文风险控制「扩展边界」；可选在 `app.py` 文件头注释注明仅兼容回退。
+- **短期 3.1/3.2（可追踪与日志）**：见上文「可追踪与日志」；在 `app/services.py` 的 worker 相关 except 与 logger 中补全 task_id/model_id/testset_id。
+- **中期（单机双 worker / 双集群）**：见下节「单机双 worker 与双集群」；实现 `task_claim_next(worker_task_types)`、tasks 表 `priority_order`、提交时必写 DB、Worker 按 `WORKER_TASK_TYPES` 从 DB 消费，单机可起两线程分别跑融合类型与 eval_only。
+- **后期（新服务器迁移）**：见下节「新服务器迁移与部署」。
+
+## 单机双 worker 与双集群
+
+- **目标**：融合 worker 只处理 merge/merge_evolutionary/recipe_apply；评估 worker 只处理 eval_only。单机可为一进程两线程，双机为两进程共享同一 DB 与存储。
+- **配置**：环境变量 `WORKER_TASK_TYPES`，逗号分隔，如 `merge,merge_evolutionary,recipe_apply` 或 `eval_only`；不设或空则保持现有单机全类型（从内存队列消费）。
+- **实现要点**：`app/repositories` 中 `task_claim_next(worker_task_types)` 从 DB 抢占一条 queued 任务并更新为 running；tasks 表需有 `priority_order`（或等价）用于排序；提交接口在入队时写入 DB 且 status=queued；worker 循环按 WORKER_TASK_TYPES 调用 `task_claim_next`，抢到后执行现有 run_merge_task/run_eval_only_task/run_recipe_apply_task 并写回完成状态。双机时两进程共享 DATABASE_URL、merges/、模型目录等。在新服务器 **4×RTX 3090（两两 NVLink）+ 128GB 内存** 场景下，推荐通过 `CUDA_VISIBLE_DEVICES` 或进程启动参数，将不同 worker 绑定到不同 GPU 组（如融合使用 0,1，评估使用 2,3）；eval_only 并发数可按负载上调（128GB 比 64GB 更宽裕），但仍建议设上限并观察 `htop`/`nvidia-smi`，避免 lm_eval/datasets 与多进程把内存或某张卡打满。
+
+## 新服务器迁移与部署
+
+- **代码获取**：Git clone 或 rsync 同步 `Workspaces/mergeKit_beta`（不含虚拟环境与大型模型目录）。
+- **环境**：在旧机使用 `conda env export -n mergenetic --no-builds > environment.yml` 导出当前运行环境；将 `environment.yml` 拷贝到新机仓库根，在新机执行 `conda env create -n mergenetic -f environment.yml`（已存在时可用 `conda env update -n mergenetic -f environment.yml`），确保新机与旧机依赖版本一致；`config.py` 中路径通过环境变量覆盖（见下）。
+- **配置清单**：`DATABASE_URL`、`LOCAL_MODELS_PATH`、`MERGEKIT_MODEL_POOL`、`PORT`、`MERGENETIC_PYTHON`、`MERGEKIT_EVAL_HF_CACHE`、`HF_DATASETS_CACHE`、`WORKER_TASK_TYPES`（双集群时使用）；项目内路径如 `MERGE_DIR`、`LOGS_DIR`、`RECIPES_DIR`、`TESTSET_REPO` 等默认相对 `PROJECT_ROOT`。
+- **数据迁移顺序**：DB（拷贝 app.db 或迁至 PostgreSQL）→ merges/ → 模型目录（LOCAL_MODELS_PATH、MODEL_POOL_PATH）→ testset_repo（testsets.json 及已下载数据集）→ recipes/。
+- **部署命令**：单机 `./start_app.sh`；生产可用 gunicorn/uWSGI + systemd 或 supervisor；双集群时两台机分别设不同 `WORKER_TASK_TYPES`，共享同一 `DATABASE_URL` 与存储。
+- **迁移后校验**：执行 `scripts/backfill_db_from_files.py --compare`。
+- **回滚要点**：保留旧机 DB 与关键目录备份；若新机出问题可切回旧机或从备份恢复。
+
+## Docker 构建与迁移到新服务器
+
+- **目标机硬件（当前规划）**：CPU AMD EPYC 7543；GPU 4×RTX 3090（两两 NVLink）；内存 **128GB** DDR4；与本节多卡、`CUDA_VISIBLE_DEVICES` 及并发建议一致。
+- **目标**：在不改变现有开发方式的前提下，提供一套基于 Docker 的「整仓 + GPU」运行环境，用于新服务器迁移与按需复现，且容器内环境与本机 `mergenetic` conda 环境保持一致。
+- **环境标准**：以旧机导出的 `environment.yml` 为唯一环境真相；Docker 镜像与新服务器宿主机都通过这份文件创建/更新 `mergenetic` 环境，避免因依赖差异导致无法运行。
+- **Dockerfile 位置与构建**：
+  - 文件在 `Workspaces/mergeKit_beta/Dockerfile`，**构建上下文为仓库根 `ServiceEndFiles`**（与 Git 仅跟踪 `mergeKit_beta` 不矛盾）。
+  - 命令：`cd ServiceEndFiles && docker build -f Workspaces/mergeKit_beta/Dockerfile -t mergekit-beta .`
+  - 可选：`docker compose build`（使用仓库根 `docker-compose.yml`）。
+  - 基础镜像：`nvidia/cuda:12.4.1-runtime-ubuntu22.04`；镜像内安装 Miniconda，用本目录 `environment.yml` 执行 `conda env create -n mergenetic`（Dockerfile 内已含 `conda tos accept`，以通过新版 Conda 对 `defaults` 频道的服务条款校验）。
+  - **Docker 与裸机差异**：`conda env create` 会严格解析 pip 依赖，无法复现「本机已手动升级 lm-eval/transformers 后与 mergenetic 元数据冲突但仍可跑」的状态；Dockerfile 在创建环境前会从副本里**去掉**若干与 ray/mergenetic 冲突的显式钉版本（如 `lm-eval`、`transformers`、`huggingface-hub`、`tokenizers`、`virtualenv`），创建成功后再 `pip install` 升级到与上文「评测依赖版本」一致的栈；`pip` 可能对 `mergenetic` 报版本不兼容警告，与裸机说明一致，可忽略除非重装 mergenetic。
+  - 镜像内路径：`WORKDIR=/app/ServiceEndFiles/Workspaces/mergeKit_beta`；`Packages/` 复制到 `/app/ServiceEndFiles/Packages/`；`modelmerge_visual` 若本机不存在则仅创建空目录，**进化融合**需挂载含 `run_vlm_search.py` 的树或设置 `VLM_SEARCH_DIR`。
+  - 启动：`CMD ./start_app.sh`（与宿主机一致）；通过环境变量与卷传入 `LOCAL_MODELS_PATH`、`MERGEKIT_MODEL_POOL`、`DATABASE_URL`、`PORT`、`VLM_SEARCH_DIR`、模型与 merges 等。
+- **.dockerignore 建议**：
+  - 排除 `Models/`、`Models-local_dir/`、`mergeKit/models_pool/` 等大模型目录，以及 `Datasets/`（若体量较大）。
+  - 排除 `.git/`（可选）、`logs/`、`__pycache__/`、`*.pyc`、`.cursor/`、`.env` 等不应进镜像的内容。
+  - 保证 `Workspaces/mergeKit_beta/`、`Workspaces/modelmerge_visual/`（含 VLM_merge_total/VLM_merge）、`Packages/` 等代码被打包入镜像。
+- **运行与迁移流程（Docker 视角）**：
+  - **建议先在当前开发机**完成 `environment.yml` 导出、`Dockerfile` / `.dockerignore`（及可选 compose）编写，并在本机 `docker build` 做一次冒烟，再迁到新服务器；详见 Cursor 计划「Docker 整仓迁移方案」§0（当前设备先行与 Git）。
+  - 在新机安装 Docker 与 nvidia-container-toolkit，在 `ServiceEndFiles` 根目录构建：`docker build -f Workspaces/mergeKit_beta/Dockerfile -t mergekit-beta .` 或 `docker compose build`。
+  - 同步 `Models/`、`merges/`、`app.db`、`testset_repo/`、`recipes/` 至新机指定路径，通过 `-v` 或 docker-compose `volumes` 挂载到容器内。
+  - 使用 `docker run --gpus all -p 5000:5000 ... mergekit-beta` 或 `docker compose up` 启动，验证 Web 与融合/评估任务是否正常。
+  - 日常开发仍按照上文「新服务器迁移与部署」在宿主机激活 `mergenetic` 环境并运行 `./start_app.sh`；需要对比或复现时，使用基于同一 `environment.yml` 构建的 Docker 镜像启动服务。
+- **Git 版本管理**：强烈建议将代码与 `environment.yml`、Docker 相关文件纳入 Git，大目录（Models、大体量 Datasets、日志、缓存、`.env` 等）用 `.gitignore` 排除；便于新机 `git clone` 与回滚。Docker 构建不依赖 Git，但迁移与协作强烈依赖版本管理。
+
+## 近期已完成的治理动作
+
+- 端口规范统一为 `5000`
+- 启动/重启脚本与测试脚本端口同步
+- 文档收敛为三份，移除过时与重复说明
+- lm_eval 升级至 0.4.11 + transformers 升级至 5.3.0，代码已适配新 API
+
+## 快速核验清单
 
-### 融合任务
-
-- `POST /api/merge` - 提交标准融合任务
-- `POST /api/merge_evolutionary` - 提交进化融合任务
-- `POST /api/recipes/apply` - 根据配方直接融合
-- `GET /api/status/<task_id>` - 获取任务状态和进度
-- `POST /api/stop/<task_id>` - 停止任务
-- `POST /api/resume/<task_id>` - 恢复任务
-
-### 历史记录
-
-- `GET /api/history` - 获取历史记录列表
-- `GET /api/history/<task_id>` - 获取任务详情
-- `DELETE /api/history/<task_id>` - 删除历史记录
-- `GET /api/fusion_history` - 获取融合历史（含性能指标）
-
-### 评估任务
-
-- `POST /api/evaluate` - 提交评估任务（支持内置基准、测试集仓库、自定义数据集）
-- `GET /api/status/<task_id>` - 获取任务状态和进度（含评估结果）
-
-### 测试集管理
-
-- `GET /api/testset/list` - 获取测试集仓库列表
-- `POST /api/testset/create` - 创建新测试集（从 HuggingFace 下载）
-- `POST /api/testset/search` - 搜索测试集
-- `POST /api/dataset/hf_info` - 获取 HuggingFace 数据集信息（configs、splits）
-
-### 配方管理
-
-- `GET /api/recipes` - 获取所有配方列表
-- `GET /api/recipes/<recipe_id>` - 获取配方详情
-
-### 搜索
-
-- `GET /api/search?q=<query>` - 搜索任务、配方、模型
-
-## 配置说明
-
-### 环境变量
-
-- `LOCAL_MODELS_PATH`：本地模型存储路径（默认：`/home/a/ServiceEndFiles/Models`）
-- `MERGEKIT_MODEL_POOL`：模型池路径
-- `HF_DATASETS_CACHE`：HuggingFace 数据集缓存目录
-- `MERGENETIC_PYTHON`：Python 解释器路径（用于运行外部脚本）
-
-### 配置文件
-
-主要配置在 `config.py` 中：
-
-```python
-class Config:
-    PROJECT_ROOT = ...           # 项目根目录
-    LOCAL_MODELS_PATH = ...      # 本地模型路径
-    MERGE_DIR = ...              # 融合结果目录
-    RECIPES_DIR = ...            # 配方目录
-    HF_ENDPOINT = ...            # HuggingFace 镜像地址
-    MERGENETIC_PYTHON = ...      # Python 解释器
-```
-
-## 任务执行流程
-
-### 标准融合流程
-
-1. 用户提交融合任务（模型路径、权重、方法等）
-2. 任务加入队列，等待执行
-3. `merge_manager.py` 中的 `run_merge_task()` 执行融合
-4. 使用 `mergenetic` 库进行模型融合
-5. 结果保存到 `merges/<task_id>/output/`
-6. 更新 `metadata.json` 状态为 `success`
-
-### 进化融合流程
-
-1. 用户提交进化融合任务（模型路径、数据集、参数等）
-2. 任务加入队列，等待执行
-3. `merge_manager.py` 调用桥接脚本 `run_vlm_search_bridge.py`
-4. 桥接脚本读取 `metadata.json`，调用外部 `run_vlm_search.py`
-5. `run_vlm_search.py` 执行 CMA-ES 进化搜索：
-   - 每次迭代生成多个 genotype（权重向量）
-   - 对每个 genotype 进行融合和评估
-   - 更新最优 genotype
-   - 将进度写入 `progress.json`
-6. 搜索完成后，保存最优模型到 `final_vlm`
-7. 桥接脚本将模型复制到命名目录（`<model1>_<model2>_<timestamp>`）
-8. 清理中间目录 `final_vlm`
-9. 保存配方到 `recipes/<task_id>.json`
-10. 更新 `metadata.json` 状态为 `success`
-
-## 数据集验证
-
-在启动 `run_vlm_search.py` 前，桥接脚本会验证数据集是否可以成功加载：
-
-1. 尝试加载少量样本（最多 4 个）
-2. 检查样本结构（必须包含 `question`、`choices`、`answer`）
-3. 验证失败时记录错误并终止任务
-
-**实现位置**：`scripts/run_vlm_search_bridge.py` 第 100-130 行
-
-## 进度追踪
-
-### 进度文件格式
-
-`merges/<task_id>/progress.json`：
-
-```json
-{
-  "step": 1,
-  "current_best": 0.125,
-  "global_best": 0.125,
-  "best_genotype": [0.44, 0.45],
-  "eta_seconds": 3600,
-  "estimated_completion": 1234567890.0,
-  "current_step": 5,
-  "total_expected_steps": 20
-}
-```
-
-### ETA 计算
-
-- 从标准输出解析评估信息（step、acc、耗时）
-- 基于平均评估耗时和剩余步数计算 ETA
-- 每 10 步更新一次 `progress.json` 中的 ETA
-
-## 模型清理策略
-
-### 自动清理
-
-1. **中间模型**：每次评估后自动清理（`run_vlm_search.py` 中）
-2. **final_vlm 目录**：任务完成后自动清理（桥接脚本中）
-3. **命名目录**：保留最终融合结果，不清理
-
-### 手动清理
-
-使用清理脚本清理遗留的中间模型：
-
-```bash
-python3 scripts/cleanup_orphaned_models.py
-```
-
-**清理策略**：
-- 任务状态为 `success` 且有命名目录 → 清理
-- 任务状态为 `error` → 清理
-- 目录大于 1GB 且状态未知 → 清理（可能是遗留）
-
-## 前端功能
-
-### 主页面（index.html）
-
-- 标准融合工作台
-- 进化融合工作台
-- 任务进度显示
-- 配方直接融合
-
-### 融合历史页面（fusion_history.html）
-
-- 显示所有完全融合任务
-- 性能指标（current_best、global_best）
-- 完成步骤（评估次数/迭代次数）
-- 搜索功能
-
-### 模型仓库页面（model_repo.html）
-
-- 显示基础模型和融合模型
-- 显示融合配方
-- 模型详情查看
-
-## 开发指南
-
-### 添加新的融合方法
-
-1. 在 `merge_manager.py` 中实现融合逻辑
-2. 在 `app.py` 中添加对应的 API 端点
-3. 在前端添加相应的 UI
-
-### 添加新的评估数据集
-
-1. 确保数据集支持 HuggingFace `datasets` 库
-2. 在桥接脚本中添加数据集加载逻辑
-3. 更新前端数据集选择器
-
-### 调试技巧
-
-1. **查看日志**：
-   - 应用日志：`logs/app.log`
-   - 桥接日志：`merges/<task_id>/bridge.log`
-   - 任务日志：`merges/<task_id>/task.log`
-
-2. **检查任务状态**：
-   - `merges/<task_id>/metadata.json`
-   - `merges/<task_id>/progress.json`
-
-3. **测试 API**：
-   ```bash
-   curl http://localhost:5000/api/status/<task_id>
-   ```
-
-## 评估功能详解
-
-### 评估任务执行流程
-
-1. **前端提交**：用户选择模型、数据集、测试深度（10%/50%/100%）、采样方式（顺序/随机）
-2. **后端处理**：`app.py` 的 `start_evaluation_task()` 接收参数，生成任务 ID
-3. **任务执行**：`merge_manager.py` 的 `run_eval_only_task()` 调用 `run_lm_eval_stream()`
-4. **lm_eval 执行**：根据数据集自动发现或映射到对应的 lm_eval 任务名，执行评估
-5. **结果解析**：从 lm_eval 输出中提取准确率、F1、样本数、上下文长度等指标
-6. **结果展示**：前端显示数值和雷达图（Accuracy、Efficiency、Context 三维）
-
-### 数据集支持
-
-- **内置基准**：`all`、`hellaswag`、`arc_easy`、`boolq`、`winogrande`、`piqa`
-- **测试集仓库**：从 HuggingFace 下载的数据集（如 `TIGER-Lab/MMLU-Pro`）
-- **自定义数据集**：支持任意 HuggingFace 数据集 ID
-
-### 自动任务映射
-
-系统支持自动发现 HuggingFace 数据集到 lm_eval 任务的映射：
-
-1. **优先级**：手动配置 > 内置映射 > 自动发现
-2. **自动发现策略**：
-   - 精确匹配数据集和子集名称
-   - 关键词匹配（如 `health_and_medicine` → `professional_medicine`）
-   - MMLU 特殊处理（支持 MMLU-Pro 等变体）
-   - 智能评分选择最佳匹配任务
-3. **映射保存**：自动发现的映射会保存到 `config/eval_task_mapping.json`
-
-### 任务组过滤
-
-系统会过滤掉 lm_eval 任务组（如 `mmlu`），只使用具体任务（如 `mmlu_professional_medicine`），避免 `TypeError: TaskConfig.__init__() got an unexpected keyword argument 'group'` 错误。
-
-### 采样方式
-
-- **顺序采样**：使用 `--limit` 参数，从数据集开头顺序取样本
-- **随机采样**：由于 lm_eval CLI 不支持 `--samples`，当前使用 `--limit` 近似实现（未来可改进）
-
-### 评估指标计算
-
-- **Accuracy**：从 lm_eval 结果中提取
-- **F1 Score**：从 lm_eval 结果中提取（如有）
-- **Efficiency**：基于 `samples/time` 计算，归一化到 0-100（基准：100 samples/s = 100分）
-- **Context**：从模型配置中提取上下文长度，归一化到 0-100
-
-## 常见问题
-
-### Q: 为什么融合步骤显示为 "1次评估 (1/5 迭代)"？
-
-A: 这个显示有两个部分：
-1. **"1次评估"**：表示实际完成了 1 次评估（`step=1`）
-2. **"(1/5 迭代)"**：表示根据评估次数和种群大小计算的迭代进度
-
-**问题原因**：
-- `step` 表示**评估次数**，每次调用 `_evaluate()` 方法时 `step` 会加 1
-- CMA-ES 算法每次迭代应该评估 `pop_size` 个个体（例如 `pop_size=4` 时，每次迭代应评估 4 次）
-- 如果 `step=1`，说明只完成了 1 次评估，这可能是因为：
-  1. **任务提前终止**：CMA-ES 可能在第一次评估后就找到了足够好的解，或者遇到了错误
-  2. **并行评估问题**：如果使用 Ray 并行，可能某些评估任务失败或未完成
-  3. **进度更新延迟**：`progress.json` 可能没有及时更新所有评估结果
-  4. **CSV 保存问题**：`results_df` 可能没有正确保存到 CSV 文件（检查 `vlm_search_results/vlm_search/vlm_search.csv`）
-
-**如何判断是否正常**：
-- 如果任务状态为 `success` 且有最终模型输出，说明任务正常完成
-- 如果 `step` 远小于 `pop_size × n_iter`，可能是任务提前结束或遇到问题
-- 检查 `bridge.log` 和 `subprocess_output.log` 查看是否有错误信息
-- 检查 `vlm_search_results/vlm_search/configs/` 目录中的配置文件数量，如果有很多配置文件但 CSV 为空，可能是 CSV 保存逻辑有问题
-
-**显示逻辑说明**：
-前端使用 `Math.ceil(currentStep / popSize)` 计算迭代次数，这是估算值。例如：
-- `step=1, pop_size=4` → `Math.ceil(1/4) = 1` → 显示 "(1/5 迭代)"
-- `step=4, pop_size=4` → `Math.ceil(4/4) = 1` → 显示 "(1/5 迭代)"
-- `step=5, pop_size=4` → `Math.ceil(5/4) = 2` → 显示 "(2/5 迭代)"
-
-**排查方法**：
-1. 检查 `merges/<task_id>/subprocess_output.log` 文件，查看子进程的完整输出
-2. 检查 `vlm_search_results/vlm_search/configs/` 目录中的配置文件数量
-3. 检查 `vlm_search_results/vlm_search/vlm_search.csv` 文件是否有数据行
-4. 如果配置文件很多但 CSV 为空，可能是 `results_df.to_csv()` 调用时机有问题，或者 `results_df` 在保存前被清空
-
-### Q: 准确率为什么是 0？
-
-A: 可能的原因：
-1. 数据集加载失败
-2. 评估过程未执行
-3. `run_vlm_search.py` 未正确写入准确率
-
-检查方法：
-- 查看 `bridge.log` 中的数据集验证日志
-- 检查 `final_test_acc.json` 是否存在
-- 查看 `run_vlm_search.py` 的标准输出
-
-### Q: 磁盘空间占用过大？
-
-A: 运行清理脚本：
-```bash
-python3 scripts/cleanup_orphaned_models.py
-```
-
-定期清理可以释放大量空间（通常可释放 50-100GB）。
-
-### Q: 如何重启应用？
-
-A: 使用重启脚本：
 ```bash
 ./restart_app.sh
+curl -s http://127.0.0.1:5000/api/models
+curl -s http://127.0.0.1:5000/api/history
 ```
 
-或手动：
-```bash
-# 查找并终止现有进程
-ps aux | grep app.py | grep -v grep | awk '{print $2}' | xargs kill
+若三个请求可用，说明基础服务链路正常。
 
-# 启动应用
-./start_app.sh
-```
+## 文档变更历史
 
-### Q: 评估任务失败，提示 "无法推断有效的 lm_eval 任务名"？
-
-A: 可能原因：
-1. 数据集名称或子集名称无法映射到 lm_eval 任务
-2. 自动发现功能未找到匹配的任务
-
-解决方法：
-1. 检查 `config/eval_task_mapping.json`，手动添加映射
-2. 查看日志中的自动发现过程，确认是否找到候选任务
-3. 对于 MMLU-Pro 等新数据集，系统会自动尝试智能匹配
-
-### Q: 评估结果显示 0 或 N/A？
-
-A: 可能原因：
-1. lm_eval 执行失败（检查 `eval_stderr.txt`）
-2. 数据集加载失败
-3. 任务组被误用（应使用具体任务名）
-
-解决方法：
-1. 查看任务目录下的 `eval_stderr.txt` 文件
-2. 检查数据集是否正确下载到缓存目录
-3. 确认使用的任务名不是任务组（如 `mmlu` 应改为 `mmlu_professional_medicine`）
-
-### Q: 测试集下载后，下拉栏中看不到子集？
-
-A: 系统会优先从本地已加载的数据集读取真实的 splits 和 configs。如果看不到：
-1. 确认数据集已成功下载到缓存目录
-2. 检查 `config/eval_task_mapping.json` 中是否有该数据集的映射
-3. 前端会自动添加已存储的 `hf_subset` 到下拉选项
-
-## 版本历史
-
-### v1.1 (2026-02-04)
-
-- ✅ 修复评估结果显示 0s/N/A 的问题
-- ✅ 修复雷达图显示问题，支持单任务三维展示
-- ✅ 修复 lm_eval CLI 参数错误（移除不支持的 --task_args）
-- ✅ 实现 Efficiency 参数的有意义计算（基于 samples/time）
-- ✅ 修复测试集下载后 hf_subset 和 sample_count 显示问题
-- ✅ 实现随机采样和顺序采样功能
-- ✅ 修复 TypeError: TaskConfig.__init__() got an unexpected keyword argument 'group' 错误
-- ✅ 实现自动发现 lm_eval 任务映射功能（支持 MMLU-Pro 等新数据集）
-- ✅ 优化从本地数据集读取真实的 splits 和 configs
-- ✅ 增强任务组过滤和验证机制
-- ✅ 实现资源分割与任务队列设计方案
-- ✅ 定义铁人五项领域特化测试标准
-
-### v1.0 (2026-02-03)
-
-- ✅ 实现标准融合和进化融合
-- ✅ 添加配方管理系统
-- ✅ 实现双 split 评估机制
-- ✅ 添加数据集验证功能
-- ✅ 优化进度条显示（支持 ETA）
-- ✅ 实现模型清理机制
-- ✅ 添加融合历史页面
-- ✅ 实现搜索功能
-
-## 贡献指南
-
-1. 遵循现有代码风格
-2. 添加必要的注释和文档
-3. 确保向后兼容
-4. 更新本文档
-
-## 许可证
-
-[根据项目实际情况填写]
+| 日期       | 变更摘要 |
+|------------|----------|
+| 2025-03-04 | DB 主源收敛：Phase A–E 落地（TestSet/EvaluationResult/Task/Model 双写消除或补全，metadata 统一写入，基座模型启动扫描，一致性校验与回填脚本）；测试集补全逻辑（读列表/写评测时从文件或 EvaluationResult 补全并回写）；数据层能力中补充脚本 `check_db_file_consistency.py`、`backfill_db_from_files.py` 说明；Navicat 连接文档新增外网映射、Y: 盘、Samba、方案二及变更历史。 |
+| 2025-03-04 | 新增「应用启动与外网访问」「可追踪与日志」「开发步骤细化（参考）」「单机双 worker 与双集群」「新服务器迁移与部署」「Docker 构建与迁移到新服务器」；风险控制中增加扩展边界（不在 app.py 扩展）；迁移与 Docker 章节强调以 environment.yml 作为统一环境标准。 |
+| 2025-03-10 | 目标新服务器内存更正为 128GB；Docker 小节补充目标机硬件摘要；双 worker 场景下 eval 并发建议改为按负载与内存观察调整。 |
+| 2025-03-10 | Docker 小节补充：建议当前设备先行构建冒烟、Git 与 `.gitignore` 约定；与 Docker 整仓迁移方案 §0 对齐。 |
+| 2025-03-10 | Docker：实际 `Dockerfile` 位于 `mergeKit_beta/`，构建上下文为 `ServiceEndFiles`；仓库根增加 `.dockerignore`；`modelmerge_visual` 缺失时镜像内仅占位目录，进化融合需挂载或 `VLM_SEARCH_DIR`。 |
+| 此前       | 端口统一 5000；文档收敛为 README/DEVELOPMENT/ROADMAP；lm_eval 0.4.11 + transformers 5.3.0 升级与适配。 |

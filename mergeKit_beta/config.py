@@ -23,6 +23,9 @@ class Config:
     MODEL_POOL_PATH = os.path.abspath(MODEL_POOL_PATH)
     # 基座模型（本地可融合模型）的正式存放路径，界面「本地基座模型」列表由此读取
     LOCAL_MODELS_PATH = os.path.abspath(os.environ.get("LOCAL_MODELS_PATH", "/home/a/ServiceEndFiles/Models"))
+    # 额外模型目录（可与主目录同级，如 Models-local_dir）；仅包含存在的目录
+    _extra = os.path.join(os.path.dirname(LOCAL_MODELS_PATH), "Models-local_dir")
+    LOCAL_MODELS_EXTRA_PATHS = [os.path.abspath(_extra)] if os.path.isdir(_extra) else []
     MERGE_DIR = os.path.join(PROJECT_ROOT, "merges")
     LOGS_DIR = os.path.join(PROJECT_ROOT, "logs", "merge")
     # 测试集仓库：用户下载的 HF 数据集在此登记，测试集列表与评估页共用

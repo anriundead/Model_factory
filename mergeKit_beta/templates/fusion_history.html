@@ -64,7 +64,10 @@
         <div class="section apple-card">
             <div class="section-header">
                 <h3>历史记录</h3>
-                <span class="helper-text">Fusion History</span>
+                <div style="display:flex; align-items:center; gap:8px;">
+                    <button type="button" id="fusion-history-refresh" class="icon-btn" title="刷新列表"><i class="ri-refresh-line"></i></button>
+                    <span class="helper-text">Fusion History</span>
+                </div>
             </div>
             <div id="history-container">
                 <div class="loading-state">
@@ -150,10 +153,16 @@
             loadFusionHistory();
             setupSearch();
             setupSidebar();
+            const refreshBtn = document.getElementById('fusion-history-refresh');
+            if (refreshBtn) refreshBtn.addEventListener('click', () => { loadFusionHistory(); });
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') loadFusionHistory();
+            });
         });
 
         async function loadFusionHistory() {
             const container = document.getElementById('history-container');
+            if (container) container.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>正在加载历史记录...</p></div>';
             try {
                 const res = await fetch('/api/fusion_history');
                 const data = await res.json();
@@ -184,25 +193,22 @@
                     const popSize = task.pop_size || 20;
                     const nIter = task.n_iter || 15;
                     
-                    let displayStep = currentStep;
-                    // 如果任务成功完成，强制显示为满迭代 (修复旧任务进度记录不全的问题)
-                    if (status === 'success' && popSize > 0 && nIter > 0) {
-                        const totalSteps = popSize * nIter;
-                        if (displayStep < totalSteps) displayStep = totalSteps;
-                    }
-                    
-                    const completedIterations = popSize > 0 ? Math.ceil(displayStep / popSize) : 0;
-                    const expectedIterations = nIter;
-                    
+                    const plannedSteps = (totalExpectedSteps || (popSize > 0 && nIter > 0 ? popSize * nIter : 0));
+                    const displayTotalSteps = currentStep > 0 ? Math.max(currentStep, plannedSteps || 0) : (plannedSteps || 0);
+                    const actualIterations = popSize > 0 ? Math.ceil((currentStep || 0) / popSize) : 0;
+                    const plannedIterations = nIter || 0;
+
                     let stepDisplay = '';
                     if (currentStep > 0) {
-                        // 优先展示更有意义的迭代信息 (Generation)
-                        if (expectedIterations > 0 && popSize > 0) {
-                            stepDisplay = `Gen: ${completedIterations} / ${expectedIterations}`;
-                        } else if (totalExpectedSteps > 0) {
-                            // 非进化算法或未知迭代数，显示百分比
-                            const pct = Math.floor((currentStep / totalExpectedSteps) * 100);
-                            stepDisplay = `${pct}% (${currentStep}/${totalExpectedSteps})`;
+                        if (plannedIterations > 0 && popSize > 0) {
+                            if (actualIterations > plannedIterations) {
+                                stepDisplay = `Eval: ${currentStep}/${displayTotalSteps} · Gen: ${actualIterations} (计划 ${plannedIterations})`;
+                            } else {
+                                stepDisplay = `Gen: ${actualIterations} / ${plannedIterations}`;
+                            }
+                        } else if (displayTotalSteps > 0) {
+                            const pct = Math.floor((currentStep / displayTotalSteps) * 100);
+                            stepDisplay = `${pct}% (${currentStep}/${displayTotalSteps})`;
                         } else {
                             stepDisplay = `Step: ${currentStep}`;
                         }
@@ -288,19 +294,16 @@
                 // Calculate iteration
                 const popSize = task.pop_size || 20;
                 let currentStep = evo.current_step || evo.step || 0;
-                
-                // 如果任务成功完成，强制显示为满迭代
-                if (task.status === 'success' && popSize > 0 && task.n_iter > 0) {
-                     const totalSteps = popSize * task.n_iter;
-                     if (currentStep < totalSteps) currentStep = totalSteps;
-                }
-                
+                const plannedIters = task.n_iter || 0;
                 const currentIter = popSize > 0 ? Math.ceil(currentStep / popSize) : 0;
+                const iterText = (plannedIters > 0 && currentIter > plannedIters)
+                    ? `${currentIter}（计划 ${plannedIters}）`
+                    : `${currentIter} / ${plannedIters || '-'}`;
 
                 evoInfo.innerHTML = `
                     <div class="info-item"><span class="info-label">当前最优</span><span class="info-value">${evo.current_best != null ? Number(evo.current_best).toFixed(4) : '-'}</span></div>
                     <div class="info-item"><span class="info-label">全局最优</span><span class="info-value">${evo.global_best != null ? Number(evo.global_best).toFixed(4) : '-'}</span></div>
-                    <div class="info-item"><span class="info-label">当前迭代 (Iter)</span><span class="info-value">${currentIter} / ${task.n_iter || '-'}</span></div>
+                    <div class="info-item"><span class="info-label">当前迭代 (Iter)</span><span class="info-value">${iterText}</span></div>
                 `;
             } else {
                 evoContainer.style.display = 'none';
@@ -332,13 +335,16 @@
                     const points = data.data;
                     const keys = Object.keys(points[0]);
                     
-                    // Heuristic to find Z (accuracy) and X/Y (params)
-                    // Z is likely "acc", "accuracy", "score", "f1"
-                    let zKey = keys.find(k => /acc|score|f1|result/i.test(k));
-                    if (!zKey) zKey = keys[keys.length - 1]; // Fallback to last column
-                    
-                    // X/Y are the other numeric columns
-                    const paramKeys = keys.filter(k => k !== zKey && !isNaN(parseFloat(points[0][k])));
+                    // 优先使用标准列，避免误把 step/generation 当参数轴导致图像失真
+                    let zKey = keys.includes('objective_1') ? 'objective_1' : null;
+                    if (!zKey) zKey = keys.includes('accuracy') ? 'accuracy' : null;
+                    if (!zKey) zKey = keys.find(k => /acc|score|f1|result/i.test(k));
+                    if (!zKey) zKey = keys[keys.length - 1];
+
+                    const preferred = ['genotype_1', 'genotype_2'].filter(k => keys.includes(k));
+                    const paramKeys = preferred.length >= 1
+                        ? preferred
+                        : keys.filter(k => k !== zKey && !isNaN(parseFloat(points[0][k])) && k !== 'step' && k !== 'generation');
                     
                     if (paramKeys.length < 1) {
                          console.warn("Not enough parameters for 3D plot");
@@ -351,9 +357,19 @@
                     const x = points.map(p => parseFloat(p[xKey]));
                     const y = points.map(p => parseFloat(p[yKey]));
                     const z = points.map(p => parseFloat(p[zKey]));
+                    const skipKeys = /^Unnamed\s*:\s*\d+$/i;
+                    const numKeys = ['objective_1','accuracy','genotype_1','genotype_2','step','generation','best_acc'];
+                    const fmtVal = (k, v) => {
+                        if (v == null || v === '') return String(v);
+                        if (numKeys.includes(k) && typeof v === 'string' && v.includes('/'))
+                            v = parseFloat(v.split('/')[0]);
+                        if (typeof v === 'number' && !isNaN(v))
+                            return Number.isInteger(v) ? v : Number(v).toFixed(4);
+                        return v;
+                    };
                     const text = points.map(p => {
                         let t = '';
-                        keys.forEach(k => t += `${k}: ${p[k]}<br>`);
+                        keys.filter(k => !skipKeys.test(k)).forEach(k => t += `${k}: ${fmtVal(k, p[k])}<br>`);
                         return t;
                     });
                     

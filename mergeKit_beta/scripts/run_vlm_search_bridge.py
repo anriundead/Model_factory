@@ -33,6 +33,17 @@ VLM_SEARCH_DIR = os.environ.get(
 RUN_VLM_SEARCH_PY = os.path.join(VLM_SEARCH_DIR, "run_vlm_search.py")
 PROMPT_MMLU = "eval/prompt_mmlu.yaml"
 
+# cais/mmlu 的 BuilderConfig 名称与前端/分组中使用的简称不一致时，在此映射为 HF 实际 config 名
+MMLU_SUBSET_TO_HF_CONFIG = {
+    "high_school_government": "high_school_government_and_politics",
+}
+
+def _normalize_mmlu_subsets(hf_dataset: str, hf_subsets: list) -> list:
+    """将前端/API 传入的子集名映射为 HuggingFace cais/mmlu 的 config 名，避免 BuilderConfig not found。"""
+    if not hf_subsets or "mmlu" not in (hf_dataset or "").lower():
+        return hf_subsets or []
+    return [MMLU_SUBSET_TO_HF_CONFIG.get(s, s) for s in hf_subsets if s]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - [%(name)s] - %(levelname)s - %(message)s",
@@ -89,6 +100,196 @@ class TestsetYamlResolver:
         return candidates[0][2]
 
 
+def _ensure_metadata_success(meta_path: str, log: logging.Logger, message: str = "任务完成") -> None:
+    """将 metadata.json 的 status 置为 success，失败只打日志不抛异常。"""
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        meta["status"] = "success"
+        meta.pop("error", None)
+        meta["message"] = message
+        task_id = meta.get("id") or os.path.basename(os.path.dirname(meta_path))
+        task_dir = os.path.dirname(meta_path)
+        try:
+            from merge_manager import _write_metadata
+            _write_metadata(task_id, task_dir, meta)
+        except Exception:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        log.info("已更新 metadata.json status=success")
+    except Exception as e:
+        log.warning("更新 metadata.json 失败: %s", e)
+
+
+def _do_success_path(
+    *,
+    merge_dir: str,
+    final_vlm_output: str,
+    meta_path: str,
+    progress_path: str,
+    task_id: str,
+    hf_split_final: str,
+    hf_split: str,
+    logger: logging.Logger,
+) -> None:
+    """
+    完全融合成功路径：复制 final_vlm 到命名目录、写 fusion_info/README/配方、创建 output 链接、
+    清理中间目录，并更新 metadata.json 为 success。任一步骤失败会抛异常，由调用方决定是否仍写 metadata。
+    """
+    output_dir = os.path.join(merge_dir, "output")
+    if not os.path.isdir(final_vlm_output) or not os.listdir(final_vlm_output):
+        if not os.path.isdir(final_vlm_output):
+            logger.warning("final_vlm_output 目录不存在: %s", final_vlm_output)
+        else:
+            logger.warning("final_vlm_output 目录为空: %s", final_vlm_output)
+            try:
+                shutil.rmtree(final_vlm_output, ignore_errors=True)
+                logger.info("已清理空的中间模型目录: %s", final_vlm_output)
+            except Exception as e:
+                logger.warning("清理空目录失败（可忽略）: %s", e)
+        _ensure_metadata_success(meta_path, logger)
+        return
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    model_paths = meta.get("model_paths") or []
+
+    def _safe_name(s):
+        return re.sub(r"[^\w\-.]", "_", (os.path.basename(s) if s else "unknown").strip())[:64]
+
+    name1 = _safe_name(model_paths[0]) if model_paths else "base"
+    name2 = _safe_name(model_paths[1]) if len(model_paths) > 1 else "other"
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    named_dir_name = f"{name1}_{name2}_{ts}"
+    named_dir = os.path.join(merge_dir, named_dir_name)
+    shutil.copytree(final_vlm_output, named_dir)
+    logger.info("已复制最终模型到命名目录 %s", named_dir)
+
+    completed_at = datetime.now().isoformat()
+    best_genotype = None
+    current_best_acc = None
+    try:
+        with open(progress_path, "r", encoding="utf-8") as pf:
+            prog = json.load(pf)
+        best_genotype = prog.get("best_genotype")
+        current_best_acc = prog.get("current_best")
+    except Exception:
+        pass
+
+    final_test_acc = None
+    final_test_duration = None
+    if hf_split_final and hf_split_final != hf_split:
+        acc_path = os.path.join(merge_dir, "final_test_acc.json")
+        if os.path.isfile(acc_path):
+            try:
+                with open(acc_path, "r", encoding="utf-8") as af:
+                    acc_data = json.load(af)
+                final_test_acc = acc_data.get("final_test_acc") or acc_data.get("accuracy")
+                final_test_duration = acc_data.get("duration")
+            except Exception:
+                pass
+
+    fusion_info = {
+        "task_id": task_id,
+        "output_dir_name": named_dir_name,
+        "custom_name": meta.get("custom_name", ""),
+        "model_paths": model_paths,
+        "parent_names": [name1, name2],
+        "best_genotype": best_genotype,
+        "hf_dataset": meta.get("hf_dataset", ""),
+        "hf_subsets": meta.get("hf_subsets", []),
+        "hf_subset_group": meta.get("hf_subset_group", ""),
+        "hf_split": meta.get("hf_split", ""),
+        "hf_split_final": meta.get("hf_split_final", "") or (hf_split_final or ""),
+        "hf_split_train": meta.get("hf_split_train", ""),
+        "hf_split_test": meta.get("hf_split_test", ""),
+        "pop_size": meta.get("pop_size"),
+        "n_iter": meta.get("n_iter"),
+        "max_samples": meta.get("max_samples"),
+        "dtype": meta.get("dtype", ""),
+        "ray_num_gpus": meta.get("ray_num_gpus"),
+        "eval_mode": meta.get("eval_mode", ""),
+        "completed_at": completed_at,
+        "current_best_acc": current_best_acc,
+        "final_test_acc": final_test_acc,
+        "final_test_duration": final_test_duration,
+    }
+    with open(os.path.join(named_dir, "fusion_info.json"), "w", encoding="utf-8") as f:
+        json.dump(fusion_info, f, ensure_ascii=False, indent=2)
+    readme_lines = [
+        "# 融合输出",
+        "",
+        f"- **任务 ID**: {task_id}",
+        f"- **自定义名称**: {meta.get('custom_name', '')}",
+        f"- **父模型**: {name1}, {name2}",
+        f"- **完成时间**: {completed_at}",
+        "",
+        "## 配方（可复现）",
+        f"- **best_genotype**: {best_genotype}",
+        f"- **验证准确率 (current_best)**: {current_best_acc}",
+        f"- **最终 test 准确率 (final_test_acc)**: {fusion_info.get('final_test_acc')}",
+        f"- **最终评测耗时**: {fusion_info.get('final_test_duration')}s" if fusion_info.get('final_test_duration') else "",
+        "",
+        "## 参数",
+        f"- 数据集: {meta.get('hf_dataset', '')}",
+        f"- 子集: {meta.get('hf_subsets', [])}",
+        f"- 种群大小: {meta.get('pop_size')}, 迭代: {meta.get('n_iter')}, 最大样本: {meta.get('max_samples')}",
+        f"- 精度: {meta.get('dtype', '')}, Ray GPU: {meta.get('ray_num_gpus')}",
+        "",
+        "详见 fusion_info.json。",
+    ]
+    with open(os.path.join(named_dir, "README.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(readme_lines))
+
+    recipes_dir = getattr(Config, "RECIPES_DIR", None) or os.path.join(PROJECT_ROOT, "recipes")
+    os.makedirs(recipes_dir, exist_ok=True)
+    recipe_path = os.path.join(recipes_dir, "%s.json" % task_id)
+    with open(recipe_path, "w", encoding="utf-8") as f:
+        json.dump(fusion_info, f, ensure_ascii=False, indent=2)
+    logger.info("已保存配方到 %s", recipe_path)
+
+    if os.path.lexists(output_dir):
+        if os.path.islink(output_dir):
+            os.unlink(output_dir)
+            logger.info("已移除旧的 output 符号链接")
+        elif os.path.isdir(output_dir):
+            shutil.rmtree(output_dir, ignore_errors=True)
+        else:
+            try:
+                os.remove(output_dir)
+            except OSError:
+                pass
+    try:
+        os.symlink(named_dir_name, output_dir)
+        logger.info("已创建 output -> %s 符号链接", named_dir_name)
+    except OSError:
+        shutil.copytree(named_dir, output_dir)
+        logger.info("已复制命名目录到 output（无符号链接时回退）")
+
+    try:
+        shutil.rmtree(final_vlm_output, ignore_errors=True)
+        logger.info("已清理中间模型目录: %s", final_vlm_output)
+    except Exception as e:
+        logger.warning("清理中间模型目录失败（可忽略）: %s", e)
+
+    # 后置检查：若还有 final_vlm 且已有命名目录，再清一次
+    if os.path.isdir(final_vlm_output):
+        has_named_dir = any(
+            os.path.isdir(os.path.join(merge_dir, item)) and not os.path.islink(os.path.join(merge_dir, item))
+            for item in os.listdir(merge_dir)
+            if item not in ("final_vlm", "output", "metadata.json", "progress.json", "bridge.log") and not item.startswith("_")
+            and ("_202" in item or len(item) > 50)
+        )
+        if has_named_dir:
+            try:
+                shutil.rmtree(final_vlm_output, ignore_errors=True)
+                logger.info("已清理中间模型目录（后置检查）: %s", final_vlm_output)
+            except Exception as e:
+                logger.warning("后置清理中间模型目录失败（可忽略）: %s", e)
+
+    _ensure_metadata_success(meta_path, logger)
+
+
 def main():
     ap = argparse.ArgumentParser(description="进化融合桥接：按 task_id 读取参数并调用 run_vlm_search.py")
     ap.add_argument("--task-id", required=True, help="任务 ID，对应 merges/<task_id>")
@@ -117,20 +318,22 @@ def main():
         logger.error("至少需要 2 个模型路径")
         sys.exit(1)
 
-    hf_dataset = meta.get("hf_dataset", "cais/mmlu")
+    hf_dataset = meta.get("hf_dataset") or "cais/mmlu"
     hf_subsets = meta.get("hf_subsets")
     if not hf_subsets or not isinstance(hf_subsets, list):
-        hf_subsets = [meta.get("hf_subset", "college_medicine")]
-    hf_split = meta.get("hf_split", "test")
+        hf_subsets = [meta.get("hf_subset") or "college_medicine"]
+    # 将前端/API 子集名映射为 HF 实际 config 名（如 high_school_government -> high_school_government_and_politics）
+    hf_subsets = _normalize_mmlu_subsets(hf_dataset, hf_subsets)
+    hf_split = meta.get("hf_split") or "test"
     # 双 split：进化阶段用 hf_split（建议 val），最终评测用 hf_split_final（建议 test）
-    hf_split_final = meta.get("hf_split_final", "").strip() or (None if hf_split == "test" else "test")
+    hf_split_final = (meta.get("hf_split_final") or "").strip() or (None if hf_split == "test" else "test")
     pop_size = int(meta.get("pop_size", 20))
     n_iter = int(meta.get("n_iter", 15))
     max_samples = int(meta.get("max_samples", 64))
-    dtype = meta.get("dtype", "bfloat16")
-    ray_num_gpus = int(meta.get("ray_num_gpus", 1))
-    eval_mode = meta.get("eval_mode", "text")
-    vlm_path = meta.get("vlm_path", "")
+    dtype = meta.get("dtype") or "bfloat16"
+    ray_num_gpus = int(meta.get("ray_num_gpus") or 1)
+    eval_mode = meta.get("eval_mode") or "text"
+    vlm_path = meta.get("vlm_path") or ""
     testset_id = (meta.get("testset_id") or "").strip()
 
     logger.info("=" * 80)
@@ -163,7 +366,7 @@ def main():
         sys.path.insert(0, VLM_SEARCH_DIR)
         from run_vlm_search import _load_mmlu_samples_one_split
         cache_dir = os.environ.get("HF_DATASETS_CACHE") or (getattr(Config, "HF_DATASETS_CACHE", None) or None)
-        hf_subset_group = meta.get("hf_subset_group", "").strip()
+        hf_subset_group = (meta.get("hf_subset_group") or "").strip()
         test_samples = _load_mmlu_samples_one_split(
             hf_dataset,
             hf_subsets,
@@ -257,25 +460,61 @@ def main():
             env=env,
         )
         logger.info("子进程已启动，PID: %s", proc.pid)
+        # 立即写入初始 progress.json，避免前端轮询时文件不存在而显示卡住
+        total_steps = max(1, pop_size * n_iter)
+        try:
+            with open(progress_path, "w", encoding="utf-8") as pf:
+                json.dump({
+                    "status": "running",
+                    "message": "子进程已启动，等待进化搜索首次进度…",
+                    "percent": 0,
+                    "current": 0,
+                    "total": total_steps,
+                    "current_step": 0,
+                    "total_expected_steps": total_steps,
+                    "step": 0,
+                }, pf, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("写入初始 progress.json 失败: %s", e)
         out_lines = []
-        # 用于解析进度信息和计算 ETA
+        import csv as csv_mod
         import re
         import time as time_module
-        
-        # 计时相关状态
-        step_start_times = {} # step -> start_time
-        gen_start_times = {}  # gen -> start_time
-        gen_durations = {}    # gen -> duration
-        step_durations = []   # list of (step, duration)
-        
-        last_step = 0
+
+        # ── 全局计数器与追踪状态 ──
+        eval_count = 0            # 全局评估计数（只增不减，作为 current_step）
+        max_acc_seen = 0.0        # 历史最优 acc
+        current_gen = 0           # 当前代数
+        prev_within_gen_step = 0  # 上一次 [eval] 里的代内 step，用于检测代切换
+        gen_start_times = {}
+        gen_durations = {}
+        eval_times = []           # 最近评估耗时，用于 ETA
+        eval_start_time = None    # 当前评估开始时间
         start_time = time_module.time()
-        
-        # 创建子进程输出日志文件
+        total_expected_steps = max(1, pop_size * n_iter)
+
+        # ── 准备 CSV：每步追加，前端/3D 图可用 ──
+        csv_dir = os.path.join(merge_dir, "vlm_search_results")
+        os.makedirs(csv_dir, exist_ok=True)
+        csv_path = os.path.join(csv_dir, "vlm_search.csv")
+        csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+        csv_writer = csv_mod.writer(csv_file)
+        csv_writer.writerow(["step", "objective_1", "genotype_1", "genotype_2", "generation", "best_acc"])
+        csv_file.flush()
+        csv_rows_written = 0
+
+        # ── 子进程输出日志 ──
         subprocess_log_path = os.path.join(merge_dir, "subprocess_output.log")
         subprocess_log_file = open(subprocess_log_path, "w", encoding="utf-8")
         logger.info("子进程输出将保存到: %s", subprocess_log_path)
-        
+
+        def _flush_progress(prog_dict):
+            """原子写 progress.json（先写临时再 rename）。"""
+            tmp = progress_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(prog_dict, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, progress_path)
+
         try:
             while True:
                 line = proc.stdout.readline() if proc.stdout else ""
@@ -285,135 +524,158 @@ def main():
                     out_lines.append(line)
                     sys.stdout.write(line)
                     sys.stdout.flush()
-                    # 写入子进程输出日志文件
                     subprocess_log_file.write(line)
                     subprocess_log_file.flush()
-                    
-                    # 同时写入 bridge.log（INFO 级别的重要信息）
-                    if "[eval]" in line or "[main]" in line or "step=" in line or "ERROR" in line.upper() or "WARNING" in line.upper():
+                    if "[eval]" in line or "[main]" in line or "ERROR" in line.upper():
                         logger.info("子进程: %s", line.rstrip())
-                
-                # 1. 捕获 Step 开始: [eval-print] step=1 ...
-                start_match = re.search(r'\[eval-print\]\s+step=(\d+)', line)
-                if start_match:
-                    s_step = int(start_match.group(1))
-                    step_start_times[s_step] = time_module.time()
-                    
-                    # 判定是否为新的一代开始 (step 1, pop_size+1, ...)
-                    # generation 从 1 开始
-                    # (1-1)//pop + 1 = 1
-                    # (pop+1 - 1)//pop + 1 = 2
-                    if (s_step - 1) % pop_size == 0:
-                        gen_idx = (s_step - 1) // pop_size + 1
-                        gen_start_times[gen_idx] = time_module.time()
-                        logger.info("Generation %d 开始 (Step %d)", gen_idx, s_step)
 
-                # 2. 捕获 Step 结束: [eval] step=1 ...
-                eval_match = re.search(r'\[eval\]\s+step=(\d+).*?acc=([\d.]+)', line)
+                # ── [eval-print] 标记评估开始，用于计算单步耗时 ──
+                if "[eval-print]" in line and "step=" in line:
+                    eval_start_time = time_module.time()
+
+                # ── [eval] 标记评估完成，是关键数据来源 ──
+                eval_match = re.search(
+                    r'\[eval\]\s+step=(\d+)\s+acc=([\d.]+)(?:\s+best_acc=([\d.]+))?',
+                    line,
+                )
                 if eval_match:
-                    current_step = int(eval_match.group(1))
-                    if current_step in step_start_times:
-                        duration = time_module.time() - step_start_times[current_step]
-                        step_durations.append((current_step, duration))
-                        
-                        # 判定是否为一代结束
-                        if current_step % pop_size == 0:
-                            gen_idx = (current_step - 1) // pop_size + 1
-                            if gen_idx in gen_start_times:
-                                g_duration = time_module.time() - gen_start_times[gen_idx]
-                                gen_durations[gen_idx] = g_duration
-                                logger.info("Generation %d 结束 (耗时: %.2fs)", gen_idx, g_duration)
-                                
-                                # 更新 progress.json
-                                try:
-                                    with open(progress_path, "r", encoding="utf-8") as pf:
-                                        prog = json.load(pf)
-                                    prog["gen_durations"] = gen_durations
-                                    # 记录详细的每一步耗时 (step -> duration)
-                                    prog["step_durations"] = {str(s): d for s, d in step_durations}
-                                    
-                                    # 保留 first_gen_time 兼容旧字段
-                                    if 1 in gen_durations:
-                                        prog["first_gen_time"] = gen_durations[1]
-                                    
-                                    # 计算平均 step 耗时
-                                    if step_durations:
-                                        avg_step = sum(d for s, d in step_durations) / len(step_durations)
-                                        prog["avg_step_time"] = avg_step
-                                        
-                                    with open(progress_path, "w", encoding="utf-8") as pf:
-                                        json.dump(prog, pf, ensure_ascii=False, indent=2)
-                                except Exception:
-                                    pass
+                    within_gen_step = int(eval_match.group(1))
+                    acc_val = float(eval_match.group(2))
+                    best_acc_val = float(eval_match.group(3)) if eval_match.group(3) else acc_val
 
-                    last_step = current_step
-                
-                # 尝试解析 ETA 信息（如果 run_vlm_search.py 输出）
-                eta_match = re.search(r'eta[=:]?\s*([\d.]+)\s*(s|sec|second)', line, re.IGNORECASE)
-                if eta_match:
-                    eta_seconds = float(eta_match.group(1))
-                    # 更新 progress.json 中的 ETA
+                    # 检测代切换：代内 step 回退到 1 说明新一代开始
+                    if within_gen_step <= prev_within_gen_step and eval_count > 0:
+                        if current_gen > 0 and current_gen in gen_start_times:
+                            gen_durations[current_gen] = time_module.time() - gen_start_times[current_gen]
+                            logger.info("Generation %d 结束 (耗时: %.2fs)", current_gen, gen_durations[current_gen])
+                        current_gen += 1
+                        gen_start_times[current_gen] = time_module.time()
+                        logger.info("Generation %d 开始", current_gen)
+                    elif eval_count == 0:
+                        current_gen = 1
+                        gen_start_times[1] = time_module.time()
+                        logger.info("Generation 1 开始")
+                    prev_within_gen_step = within_gen_step
+
+                    eval_count += 1
+                    max_acc_seen = max(max_acc_seen, acc_val, best_acc_val)
+
+                    # 单步耗时
+                    if eval_start_time is not None:
+                        eval_times.append(time_module.time() - eval_start_time)
+                        eval_start_time = None
+
+                    # 解析 genotype
+                    geno_match = re.search(r'genotype=\[([\d.,\s\-eE+]+)\]', line)
+                    genotype = []
+                    if geno_match:
+                        try:
+                            genotype = [float(x.strip()) for x in geno_match.group(1).split(",")]
+                        except (ValueError, TypeError):
+                            pass
+
+                    # ── 追加 CSV 行 ──
+                    g1 = genotype[0] if len(genotype) > 0 else 0.0
+                    g2 = genotype[1] if len(genotype) > 1 else 0.0
+                    csv_writer.writerow([eval_count, acc_val, g1, g2, current_gen, max_acc_seen])
+                    csv_file.flush()
+                    csv_rows_written += 1
+
+                    # ── 更新 progress.json ──
+                    # 说明：外部搜索在某些配置下实际评估次数可能超过 pop_size*n_iter（预估值）。
+                    # 为避免前端出现“32/18”这类反直觉展示，这里使用 display_total 做显示总步数。
+                    display_total_steps = max(total_expected_steps, eval_count)
+                    percent = (
+                        min(99, max(0, round(100 * eval_count / display_total_steps)))
+                        if display_total_steps else 0
+                    )
+                    step_message = "Step %d/%d (Gen %d, acc=%.4f, best=%.4f)" % (
+                        eval_count, display_total_steps, current_gen, acc_val, max_acc_seen)
+
                     try:
                         with open(progress_path, "r", encoding="utf-8") as pf:
                             prog = json.load(pf)
-                        prog["eta_seconds"] = eta_seconds
-                        prog["estimated_completion"] = time_module.time() + eta_seconds
-                        with open(progress_path, "w", encoding="utf-8") as pf:
-                            json.dump(prog, pf, ensure_ascii=False, indent=2)
+                    except Exception:
+                        prog = {}
+                    prog["step"] = eval_count
+                    prog["current_step"] = eval_count
+                    prog["current"] = eval_count
+                    prog["total"] = display_total_steps
+                    prog["total_expected_steps"] = display_total_steps
+                    prog["percent"] = percent
+                    prog["message"] = step_message
+                    prog["status"] = "running"
+                    prog["current_best"] = max_acc_seen
+                    prog["global_best"] = max_acc_seen
+                    if genotype:
+                        prog["best_genotype"] = genotype
+                    if gen_durations:
+                        prog["gen_durations"] = gen_durations
+                    if eval_times:
+                        recent = eval_times[-min(5, len(eval_times)):]
+                        avg_eval = sum(recent) / len(recent)
+                        prog["avg_step_time"] = avg_eval
+                        remaining = max(0, display_total_steps - eval_count)
+                        prog["eta_seconds"] = avg_eval * remaining
+                        prog["estimated_completion"] = time_module.time() + prog["eta_seconds"]
+                    if 1 in gen_durations:
+                        prog["first_gen_time"] = gen_durations[1]
+                    try:
+                        _flush_progress(prog)
                     except Exception:
                         pass
-                
-                # 基于评估次数和平均耗时计算 ETA（如果没有直接输出）
-                if last_step > 0 and len(eval_times) > 0:
-                    avg_eval_time = sum(eval_times[-min(5, len(eval_times)):]) / min(5, len(eval_times))  # 使用最近5次的平均
-                    total_expected_steps = pop_size * n_iter  # 估算总步数
-                    remaining_steps = max(0, total_expected_steps - last_step)
-                    estimated_eta = avg_eval_time * remaining_steps
-                    
-                    # 每10步更新一次 progress.json 中的 ETA
-                    if last_step % 10 == 0 or last_step == 1:
+
+                # ── 外部 ETA（如果 run_vlm_search 输出） ──
+                if eval_count == 0:
+                    eta_match = re.search(r'eta[=:]?\s*([\d.]+)\s*(s|sec|second)', line, re.IGNORECASE)
+                    if eta_match:
                         try:
                             with open(progress_path, "r", encoding="utf-8") as pf:
                                 prog = json.load(pf)
-                            prog["eta_seconds"] = estimated_eta
-                            prog["estimated_completion"] = time_module.time() + estimated_eta
-                            prog["current_step"] = last_step
-                            prog["total_expected_steps"] = total_expected_steps
-                            with open(progress_path, "w", encoding="utf-8") as pf:
-                                json.dump(prog, pf, ensure_ascii=False, indent=2)
+                            prog["eta_seconds"] = float(eta_match.group(1))
+                            prog["estimated_completion"] = time_module.time() + prog["eta_seconds"]
+                            _flush_progress(prog)
                         except Exception:
                             pass
+
         finally:
+            csv_file.close()
             subprocess_log_file.close()
             logger.info("子进程输出已保存到: %s", subprocess_log_path)
-        
+            logger.info("CSV 已写入 %d 行到 %s", csv_rows_written, csv_path)
+
         proc.wait()
+
+        # 最终一代结束
+        if current_gen > 0 and current_gen in gen_start_times and current_gen not in gen_durations:
+            gen_durations[current_gen] = time_module.time() - gen_start_times[current_gen]
 
         # 任务结束，强制更新最后一次进度
         try:
             if proc.returncode == 0:
                 with open(progress_path, "r", encoding="utf-8") as pf:
                     prog = json.load(pf)
-                # 确保进度显示为完成
-                prog["current_step"] = max(last_step, prog.get("current_step", 0))
-                # 如果 last_step 远小于 total，可能是解析漏了，强制修正为 total
-                total_steps = pop_size * n_iter
-                if total_steps > 0 and prog["current_step"] < total_steps:
-                    prog["current_step"] = total_steps
-                
+                final_step = max(eval_count, prog.get("current_step", 0))
+                if total_expected_steps > 0 and final_step < total_expected_steps:
+                    final_step = total_expected_steps
+                prog["step"] = final_step
+                prog["current_step"] = final_step
+                prog["current"] = final_step
+                prog["percent"] = 100
                 prog["eta_seconds"] = 0
                 prog["estimated_completion"] = time_module.time()
                 prog["total_task_time"] = time_module.time() - start_time
-                with open(progress_path, "w", encoding="utf-8") as pf:
-                    json.dump(prog, pf, ensure_ascii=False, indent=2)
+                prog["current_best"] = max(max_acc_seen, prog.get("current_best", 0) or 0)
+                prog["global_best"] = prog["current_best"]
+                if gen_durations:
+                    prog["gen_durations"] = gen_durations
+                _flush_progress(prog)
         except Exception as e:
             logger.warning("更新最终进度失败: %s", e)
-        
-        # 任务完成后，记录子进程输出的统计信息
+
         if out_lines:
-            eval_count = len([l for l in out_lines if "[eval]" in l or "step=" in l])
-            logger.info("子进程输出统计: 总行数=%d, 评估日志行数=%d", len(out_lines), eval_count)
-            # 记录最后100行输出（便于排查问题）
+            logger.info("子进程输出统计: 总行数=%d, [eval]行数=%d, CSV行数=%d",
+                         len(out_lines), eval_count, csv_rows_written)
             tail_lines = out_lines[-100:] if len(out_lines) > 100 else out_lines
             logger.info("子进程输出（最后100行）:\n%s", "".join(tail_lines))
         
@@ -428,12 +690,9 @@ def main():
             logger.error("run_vlm_search 执行失败（返回码: %s）", proc.returncode)
             sys.exit(1)
 
-        # 外部最终评测 (如果需要)
+        # 外部最终评测 (可选)：失败不阻断主流程，仅记录日志
         if proc.returncode == 0 and hf_split_final and hf_split_final != hf_split:
             logger.info("执行外部最终评测 (eval_final.py)...")
-            # 确保 prompt_yaml 是绝对路径，或者相对于 VLM_SEARCH_DIR
-            # prompt_yaml 是 resolve 出来的，可能是绝对路径
-            
             eval_cmd = [
                 python_cmd,
                 os.path.join(VLM_SEARCH_DIR, "eval_final.py"),
@@ -448,176 +707,31 @@ def main():
                 eval_cmd.extend(["--hf-subset", *hf_subsets])
             if hf_subset_group:
                 eval_cmd.extend(["--hf-subset-group", hf_subset_group])
-            
             try:
                 logger.info("Final Eval Command: %s", " ".join(eval_cmd))
-                subprocess.run(eval_cmd, check=True, cwd=VLM_SEARCH_DIR, env=env)
-            except subprocess.CalledProcessError as e:
-                logger.error("最终评测失败: %s", e)
+                result = subprocess.run(eval_cmd, cwd=VLM_SEARCH_DIR, env=env, timeout=3600)
+                if result.returncode != 0:
+                    logger.warning("最终评测退出码非 0: %s，继续完成收尾", result.returncode)
+            except subprocess.TimeoutExpired as e:
+                logger.warning("最终评测超时: %s，继续完成收尾", e)
+            except Exception as e:
+                logger.warning("最终评测异常（不阻断主流程）: %s", e)
 
-        # 完全融合成功：输出命名为「父模型1_父模型2_结束时间戳」，写入详细信息，并保留 output 以兼容
-        output_dir = os.path.join(merge_dir, "output")
-        if os.path.isdir(final_vlm_output) and os.listdir(final_vlm_output):
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            model_paths = meta.get("model_paths") or []
-            # 父辈模型名（目录名，做文件名安全处理）
-            def _safe_name(s):
-                return re.sub(r"[^\w\-.]", "_", (os.path.basename(s) if s else "unknown").strip())[:64]
-            name1 = _safe_name(model_paths[0]) if model_paths else "base"
-            name2 = _safe_name(model_paths[1]) if len(model_paths) > 1 else "other"
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            named_dir_name = f"{name1}_{name2}_{ts}"
-            named_dir = os.path.join(merge_dir, named_dir_name)
-            shutil.copytree(final_vlm_output, named_dir)
-            logger.info("已复制最终模型到命名目录 %s", named_dir)
-
-            # 融合详细信息（供下游与人工查阅）
-            completed_at = datetime.now().isoformat()
-            # 从 progress.json 读取进化得到的最优 genotype（完整配方）
-            best_genotype = None
-            current_best_acc = None
-            try:
-                with open(progress_path, "r", encoding="utf-8") as pf:
-                    prog = json.load(pf)
-                best_genotype = prog.get("best_genotype")
-                current_best_acc = prog.get("current_best")
-            except Exception:
-                pass
-            # 双 split：若 run_vlm_search 写入了最终 test 准确率，读入并写入配方
-            final_test_acc = None
-            final_test_duration = None
-            if hf_split_final and hf_split_final != hf_split:
-                acc_path = os.path.join(merge_dir, "final_test_acc.json")
-                if os.path.isfile(acc_path):
-                    try:
-                        with open(acc_path, "r", encoding="utf-8") as af:
-                            acc_data = json.load(af)
-                        final_test_acc = acc_data.get("final_test_acc") or acc_data.get("accuracy")
-                        final_test_duration = acc_data.get("duration")
-                    except Exception:
-                        pass
-            fusion_info = {
-                "task_id": task_id,
-                "output_dir_name": named_dir_name,
-                "custom_name": meta.get("custom_name", ""),
-                "model_paths": model_paths,
-                "parent_names": [name1, name2],
-                "best_genotype": best_genotype,
-                "hf_dataset": meta.get("hf_dataset", ""),
-                "hf_subsets": meta.get("hf_subsets", []),
-                "hf_subset_group": meta.get("hf_subset_group", ""),
-                "hf_split": meta.get("hf_split", ""),
-                "hf_split_final": meta.get("hf_split_final", "") or (hf_split_final or ""),
-                "hf_split_train": meta.get("hf_split_train", ""),
-                "hf_split_test": meta.get("hf_split_test", ""),
-                "pop_size": meta.get("pop_size"),
-                "n_iter": meta.get("n_iter"),
-                "max_samples": meta.get("max_samples"),
-                "dtype": meta.get("dtype", ""),
-                "ray_num_gpus": meta.get("ray_num_gpus"),
-                "eval_mode": meta.get("eval_mode", ""),
-                "completed_at": completed_at,
-                "current_best_acc": current_best_acc,
-                "final_test_acc": final_test_acc,
-                "final_test_duration": final_test_duration,
-            }
-            with open(os.path.join(named_dir, "fusion_info.json"), "w", encoding="utf-8") as f:
-                json.dump(fusion_info, f, ensure_ascii=False, indent=2)
-            readme_lines = [
-                "# 融合输出",
-                "",
-                f"- **任务 ID**: {task_id}",
-                f"- **自定义名称**: {meta.get('custom_name', '')}",
-                f"- **父模型**: {name1}, {name2}",
-                f"- **完成时间**: {completed_at}",
-                "",
-                "## 配方（可复现）",
-                f"- **best_genotype**: {best_genotype}",
-                f"- **验证准确率 (current_best)**: {current_best_acc}",
-                f"- **最终 test 准确率 (final_test_acc)**: {fusion_info.get('final_test_acc')}",
-                f"- **最终评测耗时**: {fusion_info.get('final_test_duration')}s" if fusion_info.get('final_test_duration') else "",
-                "",
-                "## 参数",
-                f"- 数据集: {meta.get('hf_dataset', '')}",
-                f"- 子集: {meta.get('hf_subsets', [])}",
-                f"- 种群大小: {meta.get('pop_size')}, 迭代: {meta.get('n_iter')}, 最大样本: {meta.get('max_samples')}",
-                f"- 精度: {meta.get('dtype', '')}, Ray GPU: {meta.get('ray_num_gpus')}",
-                "",
-                "详见 fusion_info.json。",
-            ]
-            with open(os.path.join(named_dir, "README.md"), "w", encoding="utf-8") as f:
-                f.write("\n".join(readme_lines))
-
-            # 保存到配方目录，供「根据配方直接融合」与前端查询
-            recipes_dir = getattr(Config, "RECIPES_DIR", None) or os.path.join(PROJECT_ROOT, "recipes")
-            os.makedirs(recipes_dir, exist_ok=True)
-            recipe_path = os.path.join(recipes_dir, "%s.json" % task_id)
-            with open(recipe_path, "w", encoding="utf-8") as f:
-                json.dump(fusion_info, f, ensure_ascii=False, indent=2)
-            logger.info("已保存配方到 %s", recipe_path)
-
-            # 兼容：output 指向命名目录（符号链接或拷贝）
-            if os.path.exists(output_dir):
-                shutil.rmtree(output_dir, ignore_errors=True)
-            try:
-                os.symlink(named_dir_name, output_dir)
-                logger.info("已创建 output -> %s 符号链接", named_dir_name)
-            except OSError:
-                shutil.copytree(named_dir, output_dir)
-                logger.info("已复制命名目录到 output（无符号链接时回退）")
-
-            # 清理中间模型目录：final_vlm 已复制到命名目录，可以删除
-            if os.path.isdir(final_vlm_output):
-                try:
-                    shutil.rmtree(final_vlm_output, ignore_errors=True)
-                    logger.info("已清理中间模型目录: %s", final_vlm_output)
-                except Exception as e:
-                    logger.warning("清理中间模型目录失败（可忽略）: %s", e)
-        else:
-            # 如果 final_vlm_output 不存在或为空，记录日志
-            if not os.path.isdir(final_vlm_output):
-                logger.warning("final_vlm_output 目录不存在: %s", final_vlm_output)
-            elif not os.listdir(final_vlm_output):
-                logger.warning("final_vlm_output 目录为空: %s", final_vlm_output)
-                # 即使为空也尝试清理
-                try:
-                    shutil.rmtree(final_vlm_output, ignore_errors=True)
-                    logger.info("已清理空的中间模型目录: %s", final_vlm_output)
-                except Exception as e:
-                    logger.warning("清理空目录失败（可忽略）: %s", e)
-
-        # 无论是否进入上面的 if 块，都尝试清理 final_vlm（如果存在且有命名目录）
-        if os.path.isdir(final_vlm_output):
-            # 检查是否有命名目录（表示任务已完成）
-            has_named_dir = False
-            for item in os.listdir(merge_dir):
-                if item.startswith("_") or item in ["final_vlm", "output", "metadata.json", "progress.json", "bridge.log"]:
-                    continue
-                item_path = os.path.join(merge_dir, item)
-                if os.path.isdir(item_path) and not os.path.islink(item_path):
-                    # 检查是否是命名目录（包含时间戳格式或长度较长）
-                    if "_202" in item or len(item) > 50:
-                        has_named_dir = True
-                        break
-            if has_named_dir:
-                try:
-                    shutil.rmtree(final_vlm_output, ignore_errors=True)
-                    logger.info("已清理中间模型目录（后置检查）: %s", final_vlm_output)
-                except Exception as e:
-                    logger.warning("后置清理中间模型目录失败（可忽略）: %s", e)
-
+        # 完全融合成功：复制到命名目录、写 fusion_info、更新 metadata；任一步骤失败仍尽量将任务标为成功
         try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            meta["status"] = "success"
-            meta.pop("error", None)
-            meta["message"] = "任务完成"
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
-            logger.info("已更新 metadata.json status=success")
+            _do_success_path(
+                merge_dir=merge_dir,
+                final_vlm_output=final_vlm_output,
+                meta_path=meta_path,
+                progress_path=progress_path,
+                task_id=task_id,
+                hf_split_final=hf_split_final,
+                hf_split=hf_split,
+                logger=logger,
+            )
         except Exception as e:
-            logger.warning("更新 metadata.json 失败: %s", e)
+            logger.exception("收尾步骤异常: %s", e)
+            _ensure_metadata_success(meta_path, logger, message="任务完成（收尾步骤部分失败，模型在 final_vlm）")
 
         logger.info("=" * 80)
         logger.info("桥接脚本结束（成功）")

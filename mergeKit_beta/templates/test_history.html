@@ -40,7 +40,13 @@
                 <p class="page-subtitle">查看过往评测任务与结果</p>
             </div>
             <section class="section apple-card">
-                <div class="section-header"><h3>历史记录</h3> <span class="helper-text">Test History</span></div>
+                <div class="section-header">
+                    <h3>历史记录</h3>
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <button type="button" id="test-history-refresh" class="icon-btn" title="刷新列表"><i class="ri-refresh-line"></i></button>
+                        <span class="helper-text">Test History</span>
+                    </div>
+                </div>
                 <div id="test-history-list"><div class="loading-state"><div class="spinner"></div><p>加载中...</p></div></div>
             </section>
         </main>
@@ -111,14 +117,20 @@
             }
             document.getElementById('test-history-detail-close').onclick = hideDetail;
             document.getElementById('test-history-detail-overlay').onclick = function(e) { if (e.target === this) hideDetail(); };
-            fetch('/api/test_history').then(r=>r.json()).then(d=>{
+            function loadTestHistory() {
                 const el = document.getElementById('test-history-list');
-                if (!d.history || d.history.length === 0) { el.innerHTML = '<p class="limit-desc">暂无测试历史</p>'; return; }
-                el.innerHTML = d.history.map(renderCard).join('');
-                el.querySelectorAll('.history-item').forEach((item, idx) => {
-                    item.onclick = () => showDetail(d.history[idx]);
-                });
-            }).catch(() => { document.getElementById('test-history-list').innerHTML = '<p class="limit-desc">加载失败</p>'; });
+                el.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>加载中...</p></div>';
+                fetch('/api/test_history').then(r=>r.json()).then(d=>{
+                    if (!d.history || d.history.length === 0) { el.innerHTML = '<p class="limit-desc">暂无测试历史</p>'; return; }
+                    el.innerHTML = d.history.map(renderCard).join('');
+                    el.querySelectorAll('.history-item').forEach((item, idx) => {
+                        item.onclick = () => showDetail(d.history[idx]);
+                    });
+                }).catch(() => { el.innerHTML = '<p class="limit-desc">加载失败</p>'; });
+            }
+            document.getElementById('test-history-refresh').onclick = loadTestHistory;
+            document.addEventListener('visibilitychange', function() { if (document.visibilityState === 'visible') loadTestHistory(); });
+            loadTestHistory();
         });
     </script>
     <div id="test-history-detail-overlay" class="modal-overlay" style="display:none; opacity:0;">
