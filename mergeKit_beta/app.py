@@ -317,8 +317,7 @@ def worker():
                         os.makedirs(merge_dir, exist_ok=True)
                         progress_path = os.path.join(merge_dir, "progress.json")
                         meta_path = os.path.join(merge_dir, "metadata.json")
-                        with open(meta_path, "w", encoding="utf-8") as f:
-                            json.dump({"id": task_id, "type": "merge_evolutionary", "status": "running", **_data}, f, ensure_ascii=False, indent=2)
+                        _mm._write_metadata(task_id, merge_dir, {"id": task_id, "type": "merge_evolutionary", "status": "running", **_data})
                         proc = subprocess.Popen(
                             [Config.MERGENETIC_PYTHON, script_path, "--task-id", task_id],
                             cwd=Config.PROJECT_ROOT,
@@ -353,8 +352,7 @@ def worker():
                                     m = json.load(f)
                                 m["status"] = "error"
                                 m["error"] = str(e)
-                                with open(meta_path, "w", encoding="utf-8") as f:
-                                    json.dump(m, f, ensure_ascii=False, indent=2)
+                                _mm._write_metadata(task_id, merge_dir, m)
                             except Exception:
                                 pass
                             _result = {"status": "error", "error": str(e)}
@@ -714,8 +712,7 @@ def start_merge_evolutionary():
     }
     merge_dir = os.path.join(MERGE_DIR, task_id)
     os.makedirs(merge_dir, exist_ok=True)
-    with open(os.path.join(merge_dir, "metadata.json"), "w", encoding="utf-8") as f:
-        json.dump({"id": task_id, "status": "pending", **task_data}, f, ensure_ascii=False, indent=2)
+    _mm._write_metadata(task_id, merge_dir, {"id": task_id, "status": "pending", **task_data})
     _app_logger.info(
         "[API] 提交完全融合 task_id=%s custom_name=%s model_paths=%s hf_subsets=%s pop_size=%s n_iter=%s",
         task_id, task_data.get("custom_name"), resolved[:3], hf_subsets, task_data.get("pop_size"), task_data.get("n_iter"),
@@ -1292,10 +1289,41 @@ def _load_testsets_dict():
 
 
 def _save_testsets_dict(testsets_dict):
-    path = _testset_repo_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"testsets": testsets_dict}, f, ensure_ascii=False, indent=2)
+    """DB-first：先写 DB，再写文件缓存。"""
+    if testsets_dict:
+        try:
+            from app.repositories import testset_upsert as _ts_upsert
+            for tid, entry in testsets_dict.items():
+                if not entry or not isinstance(entry, dict):
+                    continue
+                testset_id = entry.get("testset_id") or tid
+                _ts_upsert(
+                    testset_id=str(testset_id),
+                    name=entry.get("name") or str(testset_id) or "未命名",
+                    hf_dataset=entry.get("hf_dataset"),
+                    hf_subset=entry.get("hf_subset"),
+                    hf_split=entry.get("hf_split"),
+                    lm_eval_task=entry.get("lm_eval_task"),
+                    benchmark_config=entry.get("benchmark_config"),
+                    version=entry.get("version"),
+                    sample_count=int(entry.get("sample_count") or 0),
+                    is_local=bool(entry.get("is_local")),
+                    local_path=entry.get("local_path"),
+                    yaml_template_path=entry.get("yaml_template_path"),
+                    created_by=entry.get("created_by"),
+                    notes=entry.get("notes"),
+                    question_type=entry.get("question_type"),
+                    type=entry.get("type"),
+                )
+        except Exception as e:
+            _app_logger.warning("[_save_testsets_dict] DB upsert 失败: %s", e)
+    try:
+        path = _testset_repo_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"testsets": testsets_dict}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        _app_logger.warning("[_save_testsets_dict] 文件缓存写入失败: %s", e)
 
 
 @app.route("/api/testset/create", methods=["POST"])
@@ -1563,7 +1591,12 @@ def api_mmlu_subset_groups():
 
 @app.route("/api/cmmmu_subsets")
 def api_cmmmu_subsets():
-    return jsonify({"status": "success", "subsets": CMMMU_SUBSETS})
+    return jsonify({
+        "status": "success",
+        "subsets": CMMMU_SUBSETS,
+        "count": len(CMMMU_SUBSETS),
+        "note": "不选子集或选「全部」时，评估将优先使用 cmmmu_*；若环境无该任务，将回退到 mmmu_val_* 兼容任务",
+    })
 
 
 @app.route("/api/cmmmu_subset_groups")
@@ -1679,7 +1712,7 @@ def _check_merge_compatible(model_paths: list) -> tuple[bool, str, list]:
             return False, "无法读取模型 config 的 hidden_size/num_hidden_layers：%s" % (os.path.basename(p) if p else p), types
         archs.append((hs, nhl))
     if len(set(archs)) != 1:
-        return False, "模型架构不一致（hidden_size 或 num_hidden_layers 不同），无法融合。请参见 docs/模型融合配对说明.md。", types
+        return False, "模型架构不一致（hidden_size 或 num_hidden_layers 不同），无法融合。请参见 DEVELOPMENT.md 的兼容性说明。", types
     return True, "", types
 
 
@@ -2284,6 +2317,6 @@ if __name__ == "__main__":
     except Exception:
         app_to_run = app
         print("--- 模块化入口不可用，回退到本文件内置应用 ---")
-    port = int(os.environ.get("PORT", 5001))
+    port = int(os.environ.get("PORT", 5000))
     print("--- mergeKit_beta 后端启动 (port=%s) ---" % port)
     app_to_run.run(host="0.0.0.0", debug=True, port=port, use_reloader=False)

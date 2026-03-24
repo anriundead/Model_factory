@@ -1,94 +1,66 @@
-# Mergenetic Pro (Beta)
+# mergeKit_beta
 
-基于 Web 的模型融合系统，支持标准融合和进化融合两种模式。
+`mergeKit_beta` 是当前模型融合工厂主工程（仅围绕本目录维护），提供 Web 化的融合、评估、历史追踪和基础可视化能力。
+
+## 统一入口与端口（当前规范）
+
+- 统一启动入口：`./start_app.sh`
+- 统一重启入口：`./restart_app.sh`
+- 统一端口：`5000`（可用环境变量 `PORT` 覆盖）
+- 推荐访问：`http://localhost:5000`
+
+说明：
+- `start_app.sh` 走模块化入口 `app/__init__.py:create_app()`，这是当前最完整入口。
+- `app.py` 仅保留兼容回退能力，不作为主入口文档对外推荐。
 
 ## 快速开始
 
-### 安装依赖
+1) 在可用环境中安装依赖（至少包含 Flask、SQLAlchemy、Flask-Migrate、Flask-Admin、mergenetic、lm_eval、datasets 等）。
 
-```bash
-pip install flask mergenetic transformers datasets torch
-```
-
-### 配置环境
-
-编辑 `config.py` 或设置环境变量：
-- `LOCAL_MODELS_PATH`：本地模型存储路径
-- `HF_DATASETS_CACHE`：HuggingFace 数据集缓存目录
-
-### 启动应用
+2) 启动服务：
 
 ```bash
 ./start_app.sh
 ```
 
-或
+3) 打开：
 
-```bash
-python3 app.py
+```text
+http://localhost:5000
 ```
 
-访问 http://localhost:5000
+外网访问：服务已监听 `0.0.0.0:5000`，前端使用相对路径，外网用户只要能访问到服务器 5000 端口即可使用；需放行本机防火墙，内网时需端口转发或内网穿透，生产建议 nginx 反向代理与 HTTPS。详见 DEVELOPMENT.md「应用启动与外网访问」。
 
-## 主要功能 (已实现)
+## 已实现能力（核验后）
 
-- ✅ **标准模型融合**（TIES-DARE）：支持基于权重的直接融合
-- ✅ **进化融合**（CMA-ES）：自动化搜索最优融合权重
-- ✅ **配方管理**：保存、复用和分享融合配置
-- ✅ **模型评估**：
-  - 集成 LM Evaluation Harness
-  - 支持 YAML 配置和流式日志
-  - 支持 MMLU、GSM8K 等主流 Benchmark
-- ✅ **融合历史追踪**：记录所有任务状态与结果
-- ✅ **模型兼容性检查**：自动校验架构一致性
-- ✅ **前端可视化**：基础雷达图、进度监控与日志查看
+- 标准融合（Linear / TIES-DARE）
+- 进化融合（桥接外部搜索脚本）
+- 配方保存与配方复现融合
+- 评估任务（lm_eval / YAML）
+- 进化步骤 CSV 与 `evolution_steps` 数据库同步
+- 历史与榜单（数据库优先，文件回退）
+- 测试集列表：DB 中缺失的测试集字段（如 `hf_dataset`、`lm_eval_task`）会在读取时从文件或评估历史自动补全并回写
+- 管理后台（`/admin`）
 
-## 开发路线图 (Roadmap)
+## 当前架构约定
 
-我们正在进行下一阶段的重大升级，计划包含以下核心特性：
-
-1.  **基础设施升级**
-    - [ ] **数据库接入**：从 JSON 文件迁移至 SQLite/PostgreSQL，支持大规模数据管理。
-    - [ ] **任务队列**：引入 Redis + Celery/RQ 管理高负载评估任务。
-
-2.  **核心评估体系**
-    - [ ] **铁人五项测试**：引入 Reasoning, Knowledge, Coding, Instruction, Safety 五维深度评估。
-    - [ ] **特化能力识别**：自动分析模型强项，打上 `Math-Specialist` 等标签。
-
-3.  **自动化流水线**
-    - [ ] **优胜劣汰机制**：自动保留 Top 10% 表现的模型。
-    - [ ] **自动清理**：自动删除低分模型权重（保留元数据），优化磁盘空间。
-
-4.  **独立可视化系统**
-    - [ ] **动态榜单**：支持多维度排序与基准线对比。
-    - [ ] **高级图表**：趋势图、能力雷达、散点图（性价比分析）。
-    - [ ] **深度透视**：展示模型血缘关系与完整进化路径。
-
-详细需求文档请参阅 [DEVELOPMENT.md](DEVELOPMENT.md)
-
-## 项目结构
-
-- `app.py` - Flask 后端主应用
-- `merge_manager.py` - 融合任务执行逻辑
-- `app/` - 应用逻辑模块
-  - `routes.py` - API 路由
-  - `services.py` - 业务逻辑服务
-- `scripts/` - 桥接脚本和工具脚本
-- `templates/` - HTML 模板
-- `static/` - 前端资源
+- 数据主源：数据库（SQLite 默认，支持 `DATABASE_URL` 切换）
+- 文件策略：保留读取回退能力（`metadata.json` / `leaderboard.json` 等）
+- 运行目录：`merges/`、`recipes/`、`logs/`
+- 外部依赖：进化融合仍依赖外部 `run_vlm_search.py`，暂不内嵌重构
+- 维护脚本：`scripts/check_db_file_consistency.py`（DB 与文件一致性）、`scripts/backfill_db_from_files.py`（从文件回填 TestSet/Task）
 
 ## 文档
 
-详细开发文档请参阅 [DEVELOPMENT.md](DEVELOPMENT.md)
+| 文档 | 说明 |
+|------|------|
+| `DEVELOPMENT.md` | 开发进度、注意事项、运行规范、依赖与兼容性；外网访问、可追踪与日志、开发步骤细化、单机双 worker/双集群、新服务器迁移与部署 |
+| `ROADMAP.md` | 后续需求与开发路径（短期/中期/长期） |
+| `docs/NAVICAT_连接数据库.md` | 外网环境下用 Navicat 连接 SQLite（映射 Y: 或下载 app.db）及 Samba 配置 |
 
-## 清理遗留模型
+## 文档变更历史
 
-定期运行清理脚本释放磁盘空间：
-
-```bash
-python3 scripts/cleanup_orphaned_models.py
-```
-
-## 许可证
-
-[根据项目实际情况填写]
+| 日期       | 变更摘要 |
+|------------|----------|
+| 2025-03-04 | 与 DEVELOPMENT/ROADMAP 同步：数据主源 DB、测试集自动补全、文档索引与变更历史；架构约定中补充维护脚本说明；快速开始后增加外网访问说明，文档表补充 DEVELOPMENT 中迁移与部署等章节说明。 |
+| 此前       | 统一入口与端口；已实现能力与架构约定收敛。 |

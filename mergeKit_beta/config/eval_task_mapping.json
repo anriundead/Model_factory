@@ -1,5 +1,6 @@
 {
   "openai/gsm8k|socratic": "gsm8k",
   "openai/gsm8k|main": "gsm8k",
-  "TIGER-Lab/MMLU-Pro|default": "mmlu_flan_n_shot_loglikelihood_high_school_government_and_politics"
+  "TIGER-Lab/MMLU-Pro|default": "mmlu_flan_n_shot_loglikelihood_high_school_government_and_politics",
+  "Rowan/hellaswag": "hellaswag"
 }
