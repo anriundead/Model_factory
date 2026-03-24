@@ -45,6 +45,69 @@
 - 模块化应用入口：`app/__init__.py:create_app()`
 - `app.py`：仅兼容回退，不作为主入口继续扩展
 
+## 最终环境参数清单
+
+以下为 **mergeKit_beta 运行与 Docker 编排** 所需环境变量与宿主机路径变量的统一对照；迁移新机时优先按此设置，再在 `config.py` 中核对默认值是否需改代码层回退路径。
+
+### 1) 应用进程（`config.py` / `start_app.sh`）
+
+| 变量 | 含义 | 默认或未设时 |
+|------|------|----------------|
+| `PORT` | HTTP 端口 | `5000`（`start_app.sh` 与 `app.py` 回退一致） |
+| `LOCAL_MODELS_PATH` | 基座模型根目录（前端列表、路径解析） | 代码默认 `/home/a/ServiceEndFiles/Models`；**新机务必设为实际路径**；`start_app.sh` 在未设置时也会导出同一默认（建议改为仅依赖环境或删除硬编码） |
+| `MERGEKIT_MODEL_POOL` | 融合模型池目录 | 未设时为「项目上级」`mergeKit/models_pool` 的规范化绝对路径 |
+| `DATABASE_URL` | SQLAlchemy 连接串 | 未设时为 `sqlite:///<PROJECT_ROOT>/app.db` |
+| `MERGENETIC_PYTHON` | 调用 mergenetic/子进程用的 Python | 未设时尝试固定 conda 路径，不存在则 `python`；`start_app.sh` 在激活 `mergenetic` 后会设为当前 `which python` |
+| `MERGEKIT_EVAL_HF_CACHE` | lm_eval 所用 HF 数据集缓存 | 未设为项目内 `cache/eval_datasets` |
+| `HF_DATASETS_CACHE` | HuggingFace `datasets` 缓存 | 未设为项目内 `cache/datasets` |
+| `VLM_SEARCH_DIR` | 进化融合 `run_vlm_search.py` 所在目录 | 未设为 `Workspaces/modelmerge_visual/VLM_merge_total/VLM_merge`（相对 `mergeKit_beta` 的上级） |
+| `NUMEXPR_MAX_THREADS` | numexpr 线程数 | 由 `Config.setup_environment` 设为 `64`（类内常量，非环境变量读取） |
+| `HF_ENDPOINT` | HuggingFace 端点 | 代码默认 `https://hf-mirror.com`，`setup_environment` 会写入 `os.environ` |
+
+以下路径**无单独环境变量**，默认相对 `mergeKit_beta`（`PROJECT_ROOT`）：`merges/`、`logs/merge/`、`testset_repo/`、`recipes/`、`cache/`。
+
+### 2) Docker Compose（`Workspaces/docker-compose.yml`）
+
+容器内环境（`environment`）：
+
+| 变量 | compose 中示例值 | 说明 |
+|------|------------------|------|
+| `PORT` | `5000` | 与端口映射一致 |
+| `LOCAL_MODELS_PATH` | `/data/Models` | 需与卷挂载一致 |
+| `MERGEKIT_MODEL_POOL` | `/data/models_pool` | 需与卷挂载一致 |
+| `DATABASE_URL` | `${DATABASE_URL:-}` | 空则走容器内默认 SQLite 路径；生产可注入 PostgreSQL 等 |
+| `VLM_SEARCH_DIR` | `${VLM_SEARCH_DIR:-}` | 进化融合必填时挂载脚本树或显式设置 |
+| `HF_DATASETS_CACHE` | `/data/hf_datasets` | 建议持久化卷或大盘路径 |
+| `MERGEKIT_EVAL_HF_CACHE` | `/data/eval_datasets` | 评测数据集缓存 |
+
+宿主机侧卷变量（`volumes`，均在 **Workspaces** 目录下解析）：
+
+| 变量 | 默认 | 挂载到容器 |
+|------|------|------------|
+| `HOST_MODELS` | `../Models` | `:/data/Models:ro` |
+| `HOST_MODEL_POOL` | `../mergeKit/models_pool` | `:/data/models_pool` |
+| `HOST_PACKAGES` | `../Packages` | `:/app/ServiceEndFiles/Packages:ro` |
+| `HOST_MERGES` | `./mergeKit_beta/merges` | 融合输出 |
+| `HOST_APP_DB` | `./mergeKit_beta/app.db` | **必须为文件**；不存在先 `touch` |
+
+GPU：`gpus: all`，宿主机需 **nvidia-container-toolkit**。
+
+### 3) 规划项（文档已描述，代码尚未统一读取）
+
+| 变量 | 用途 |
+|------|------|
+| `WORKER_TASK_TYPES` | 双 worker / 双机任务分片（逗号分隔任务类型），见上文「单机双 worker 与双集群」 |
+| `CUDA_VISIBLE_DEVICES` | 多卡机器上为不同进程绑定 GPU（shell 或 systemd 环境） |
+
+### 4) 不建议纳入版本库的运行时文件
+
+| 路径/文件 | 说明 |
+|-----------|------|
+| `mergeKit_beta/model_repo/data/models.json` | 常含本机绝对路径与目录快照，宜 `.gitignore` 或仅本地保留 |
+| `mergeKit_beta/app.db` | 运行时库；迁移用拷贝或 `DATABASE_URL` 指向外部库 |
+
+---
+
 ## 应用启动与外网访问
 
 - **启动方式**：`start_app.sh` 内联 Python 加载 `app/__init__.py` 得到 `app`，执行 `app.run(host="0.0.0.0", debug=True, port=PORT, use_reloader=False)`。绑定 `0.0.0.0` 表示监听本机所有网卡；端口由环境变量 `PORT` 决定，默认 `5000`。前端与 API 由同一 Flask 应用提供，模板在 `templates/`，静态在 `static/`，前端所有请求使用相对路径（如 `/api/...`、`/static/...`），无硬编码 localhost 或固定域名。
@@ -119,7 +182,7 @@
 
 - **代码获取**：Git clone 或 rsync 同步 `Workspaces/mergeKit_beta`（不含虚拟环境与大型模型目录）。
 - **环境**：在旧机使用 `conda env export -n mergenetic --no-builds > environment.yml` 导出当前运行环境；将 `environment.yml` 拷贝到新机仓库根，在新机执行 `conda env create -n mergenetic -f environment.yml`（已存在时可用 `conda env update -n mergenetic -f environment.yml`），确保新机与旧机依赖版本一致；`config.py` 中路径通过环境变量覆盖（见下）。
-- **配置清单**：`DATABASE_URL`、`LOCAL_MODELS_PATH`、`MERGEKIT_MODEL_POOL`、`PORT`、`MERGENETIC_PYTHON`、`MERGEKIT_EVAL_HF_CACHE`、`HF_DATASETS_CACHE`、`WORKER_TASK_TYPES`（双集群时使用）；项目内路径如 `MERGE_DIR`、`LOGS_DIR`、`RECIPES_DIR`、`TESTSET_REPO` 等默认相对 `PROJECT_ROOT`。
+- **配置清单**：以文档内「**最终环境参数清单**」一节为准；双集群时另加 `WORKER_TASK_TYPES` 与 `CUDA_VISIBLE_DEVICES`（规划项）。
 - **数据迁移顺序**：DB（拷贝 app.db 或迁至 PostgreSQL）→ merges/ → 模型目录（LOCAL_MODELS_PATH、MODEL_POOL_PATH）→ testset_repo（testsets.json 及已下载数据集）→ recipes/。
 - **部署命令**：单机 `./start_app.sh`；生产可用 gunicorn/uWSGI + systemd 或 supervisor；双集群时两台机分别设不同 `WORKER_TASK_TYPES`，共享同一 `DATABASE_URL` 与存储。
 - **迁移后校验**：执行 `scripts/backfill_db_from_files.py --compare`。
@@ -177,4 +240,5 @@ curl -s http://127.0.0.1:5000/api/history
 | 2025-03-10 | 目标新服务器内存更正为 128GB；Docker 小节补充目标机硬件摘要；双 worker 场景下 eval 并发建议改为按负载与内存观察调整。 |
 | 2025-03-10 | Docker 小节补充：建议当前设备先行构建冒烟、Git 与 `.gitignore` 约定；与 Docker 整仓迁移方案 §0 对齐。 |
 | 2025-03-10 | Docker：`Dockerfile` 位于 `mergeKit_beta/`，构建上下文切为 `Workspaces`；仓库根增加 `docker-compose.yml` 与 `.dockerignore`；`Packages` 改为运行时挂载；`modelmerge_visual` 缺失时镜像内仅占位目录，进化融合需挂载或 `VLM_SEARCH_DIR`。 |
+| 2026-03-04 | 根目录 `.gitignore` 增加 `EnterpriseQuestionAnsweringSystem/`；新增「最终环境参数清单」（应用环境变量、Compose 宿主机变量、规划项、勿提交运行时文件）。 |
 | 此前       | 端口统一 5000；文档收敛为 README/DEVELOPMENT/ROADMAP；lm_eval 0.4.11 + transformers 5.3.0 升级与适配。 |

@@ -2,6 +2,7 @@
 # 不忽略 mergeKit_beta 目录本身，仅忽略其下大文件（见下方）
 
 eval_outputs/
+EnterpriseQuestionAnsweringSystem/
 fusion/
 GCCL-Medical-LLM2-FlowerTune-main/
 locks/
