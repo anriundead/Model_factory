@@ -3,6 +3,8 @@
 
 eval_outputs/
 EnterpriseQuestionAnsweringSystem/
+eqa_2/
+eqa_test_ocr/
 fusion/
 GCCL-Medical-LLM2-FlowerTune-main/
 locks/

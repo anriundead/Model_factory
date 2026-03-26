@@ -1809,7 +1809,8 @@ def run_lm_eval_stream(
         task_control = {}
     os.makedirs(output_path, exist_ok=True)
 
-    task_name = ""  # 初始化为空字符串
+    # 保留调用方传入的任务名（例如 hellaswag）；仅在为空时走后续推断逻辑
+    task_name = (task_name or "").strip()
     # 获取任务组集合，用于验证（提前获取，避免重复初始化）
     task_groups_set = None
     try:
