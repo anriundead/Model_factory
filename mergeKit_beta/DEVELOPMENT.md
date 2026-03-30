@@ -4,6 +4,16 @@
 
 本文件仅描述 `Workspaces/mergeKit_beta` 的现状与约定，不覆盖仓库内其他子项目。
 
+## 开发与协作规则（人机共用）
+
+完整规则位于 **`.cursor/rules/`**（Cursor / AI 与人类开发者共用），索引：[`.cursor/rules/RULES_INDEX.md`](.cursor/rules/RULES_INDEX.md)。
+
+- **95% 把握前须追问**：对需求、路径、兼容性或破坏性操作存疑时，先向责任人澄清，直到对目标与验收有约 **95%** 把握，再定方案或改代码（详见 `AI_COLLABORATION.md`）。
+- **入口与分层**：仅通过 `start_app.sh` → `app/__init__.py:create_app()` 作为主入口；新逻辑进 `app/` 包，**禁止在 `app.py` 扩展**业务或并行 Worker（详见 `ARCHITECTURE_BOUNDARIES.md`）。
+- **接口 vs 数据**：`routes` 只做 HTTP 与编排调用；**新增**数据库访问走 `services` → `repositories`，不在路由中直连 `db.session`。
+- **Git 与工作流**：最小 diff、中文提交说明、勿提交本机路径快照与密钥（详见 `WORKFLOW_AND_GIT.md`）。
+- **删除与清理**：须用户二次确认（`DO_NOT_DELETE_FILES.md`）。
+
 ## 当前开发进度（已核验）
 
 ### 1) 融合与评估主链路
@@ -241,4 +251,5 @@ curl -s http://127.0.0.1:5000/api/history
 | 2025-03-10 | Docker 小节补充：建议当前设备先行构建冒烟、Git 与 `.gitignore` 约定；与 Docker 整仓迁移方案 §0 对齐。 |
 | 2025-03-10 | Docker：`Dockerfile` 位于 `mergeKit_beta/`，构建上下文切为 `Workspaces`；仓库根增加 `docker-compose.yml` 与 `.dockerignore`；`Packages` 改为运行时挂载；`modelmerge_visual` 缺失时镜像内仅占位目录，进化融合需挂载或 `VLM_SEARCH_DIR`。 |
 | 2026-03-04 | 根目录 `.gitignore` 增加 `EnterpriseQuestionAnsweringSystem/`；新增「最终环境参数清单」（应用环境变量、Compose 宿主机变量、规划项、勿提交运行时文件）。 |
+| 2026-03-30 | 新增人机共用开发规则：`.cursor/rules/` 下 `RULES_INDEX`、`ARCHITECTURE_BOUNDARIES`、`WORKFLOW_AND_GIT`、`AI_COLLABORATION`（含「95% 把握前须追问」）；DEVELOPMENT 增加「开发与协作规则」摘要与索引。 |
 | 此前       | 端口统一 5000；文档收敛为 README/DEVELOPMENT/ROADMAP；lm_eval 0.4.11 + transformers 5.3.0 升级与适配。 |
