@@ -34,6 +34,7 @@ mergeKit_beta/eval_workflow/
 mergeKit_beta/models_pool/
 mergeKit_beta/testset_download/
 mergeKit_beta/testset_repo/
+!mergeKit_beta/testset_repo/yaml/
 mergeKit_beta/yaml_template/
 
 # Python 与通用缓存（整仓库）
