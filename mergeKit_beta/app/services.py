@@ -1128,11 +1128,15 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                         else:
                             _data["model_paths"] = resolved_paths
                     if _result is None:
-                        script_path = os.path.join(self.config.PROJECT_ROOT, "scripts", "run_vlm_search_bridge.py")
-                        if not os.path.isfile(script_path):
+                        if not self.config.evolution_merge_entry_exists():
                             self.state.tasks[task_id]["status"] = "error"
-                            self.state.tasks[task_id]["message"] = "scripts/run_vlm_search_bridge.py 不存在"
-                            _result = {"status": "error", "error": "run_vlm_search_bridge.py 未找到"}
+                            miss = (
+                                "scripts/run_vlm_search_bridge.py 不存在"
+                                if getattr(self.config, "MERGEKIT_EVOLUTION_LEGACY_BRIDGE", False)
+                                else "evolution/runner.py 缺失（或未设置 MERGEKIT_EVOLUTION_LEGACY_BRIDGE）"
+                            )
+                            self.state.tasks[task_id]["message"] = miss
+                            _result = {"status": "error", "error": miss}
                         else:
                             import subprocess
                             merge_dir = os.path.join(self.state.merge_dir, task_id)
@@ -1143,9 +1147,10 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                             merge_manager._write_metadata(task_id, merge_dir, _evo_meta)
                             
                             task_start_time = time.time()
+                            _evo_argv, _evo_cwd = self.config.evolution_merge_popen_args(task_id)
                             proc = subprocess.Popen(
-                                [self.config.MERGENETIC_PYTHON, script_path, "--task-id", task_id],
-                                cwd=self.config.PROJECT_ROOT,
+                                _evo_argv,
+                                cwd=_evo_cwd,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT,
                                 text=True,

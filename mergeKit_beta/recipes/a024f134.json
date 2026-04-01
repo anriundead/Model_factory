@@ -1,0 +1,36 @@
+{
+  "task_id": "a024f134",
+  "output_dir_name": "Meditron3-Qwen2.5-7B_Qwen2.5-7B-Instruct_20260331-192114",
+  "custom_name": "debug-goodpair-8",
+  "model_paths": [
+    "/home/a/ServiceEndFiles/Models/Meditron3-Qwen2.5-7B",
+    "/home/a/ServiceEndFiles/Models/Qwen2.5-7B-Instruct"
+  ],
+  "parent_names": [
+    "Meditron3-Qwen2.5-7B",
+    "Qwen2.5-7B-Instruct"
+  ],
+  "best_genotype": [
+    0.390743353558069,
+    0.4229049526310821
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "college_medicine"
+  ],
+  "hf_subset_group": "",
+  "hf_split": "test",
+  "hf_split_final": "",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 2,
+  "n_iter": 1,
+  "max_samples": 8,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 1,
+  "eval_mode": "text",
+  "completed_at": "2026-03-31T19:21:19.288384",
+  "current_best_acc": 0.5,
+  "final_test_acc": null,
+  "final_test_duration": null
+}

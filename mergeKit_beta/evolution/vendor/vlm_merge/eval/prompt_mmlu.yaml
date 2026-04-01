@@ -1,0 +1,11 @@
+# MMLU-style multiple choice prompt (cais/mmlu: question, choices, answer 0-3)
+task_instructions:
+  - "Answer the following multiple choice question. Choose one option (A, B, C, or D)."
+multi_choice_example_format:
+  - |
+    Question: {}
+    Choices:
+    {}
+    Answer:
+temperature:
+  - 0

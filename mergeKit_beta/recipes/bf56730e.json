@@ -1,0 +1,36 @@
+{
+  "task_id": "bf56730e",
+  "output_dir_name": "Meditron3-Qwen2.5-7B_Qwen2.5-7B-Instruct_20260331-095200",
+  "custom_name": "进化融合-LLM-Meditron-Qwen25",
+  "model_paths": [
+    "/home/a/ServiceEndFiles/Models/Meditron3-Qwen2.5-7B",
+    "/home/a/ServiceEndFiles/Models/Qwen2.5-7B-Instruct"
+  ],
+  "parent_names": [
+    "Meditron3-Qwen2.5-7B",
+    "Qwen2.5-7B-Instruct"
+  ],
+  "best_genotype": [
+    0.9967321829600528,
+    0.28423548310846947
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "college_medicine"
+  ],
+  "hf_subset_group": "",
+  "hf_split": "test",
+  "hf_split_final": "",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 3,
+  "n_iter": 2,
+  "max_samples": 64,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 1,
+  "eval_mode": "text",
+  "completed_at": "2026-03-31T09:52:04.160571",
+  "current_best_acc": 0.2969,
+  "final_test_acc": null,
+  "final_test_duration": null
+}

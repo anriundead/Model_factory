@@ -306,11 +306,15 @@ def worker():
                     else:
                         _data["model_paths"] = resolved_paths
                 if _result is None:
-                    script_path = os.path.join(Config.PROJECT_ROOT, "scripts", "run_vlm_search_bridge.py")
-                    if not os.path.isfile(script_path):
+                    if not Config.evolution_merge_entry_exists():
                         tasks[task_id]["status"] = "error"
-                        tasks[task_id]["message"] = "scripts/run_vlm_search_bridge.py 不存在"
-                        _result = {"status": "error", "error": "run_vlm_search_bridge.py 未找到"}
+                        miss = (
+                            "scripts/run_vlm_search_bridge.py 不存在"
+                            if Config.MERGEKIT_EVOLUTION_LEGACY_BRIDGE
+                            else "evolution/runner.py 缺失（或设置 MERGEKIT_EVOLUTION_LEGACY_BRIDGE）"
+                        )
+                        tasks[task_id]["message"] = miss
+                        _result = {"status": "error", "error": miss}
                     else:
                         import subprocess
                         merge_dir = os.path.join(MERGE_DIR, task_id)
@@ -318,9 +322,10 @@ def worker():
                         progress_path = os.path.join(merge_dir, "progress.json")
                         meta_path = os.path.join(merge_dir, "metadata.json")
                         _mm._write_metadata(task_id, merge_dir, {"id": task_id, "type": "merge_evolutionary", "status": "running", **_data})
+                        _evo_argv, _evo_cwd = Config.evolution_merge_popen_args(task_id)
                         proc = subprocess.Popen(
-                            [Config.MERGENETIC_PYTHON, script_path, "--task-id", task_id],
-                            cwd=Config.PROJECT_ROOT,
+                            _evo_argv,
+                            cwd=_evo_cwd,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                             text=True,

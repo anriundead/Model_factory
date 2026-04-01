@@ -75,6 +75,30 @@ class Config:
         _default_mergenetic_python = "python"
     MERGENETIC_PYTHON = os.environ.get("MERGENETIC_PYTHON", _default_mergenetic_python)
 
+    # 进化融合：为真时使用 scripts/run_vlm_search_bridge.py 作为子进程入口；默认使用 python -m evolution.runner
+    _evo_legacy = os.environ.get("MERGEKIT_EVOLUTION_LEGACY_BRIDGE", "").strip().lower()
+    MERGEKIT_EVOLUTION_LEGACY_BRIDGE = _evo_legacy in ("1", "true", "yes")
+
+    @classmethod
+    def evolution_merge_entry_exists(cls) -> bool:
+        root = cls.PROJECT_ROOT
+        if cls.MERGEKIT_EVOLUTION_LEGACY_BRIDGE:
+            return os.path.isfile(os.path.join(root, "scripts", "run_vlm_search_bridge.py"))
+        init_py = os.path.join(root, "evolution", "__init__.py")
+        runner_py = os.path.join(root, "evolution", "runner.py")
+        return os.path.isfile(init_py) and os.path.isfile(runner_py)
+
+    @classmethod
+    def evolution_merge_popen_args(cls, task_id: str) -> tuple[list[str], str]:
+        """返回 (argv, cwd)，供 merge_evolutionary Worker subprocess.Popen 使用。"""
+        py = cls.MERGENETIC_PYTHON
+        root = cls.PROJECT_ROOT
+        tid = str(task_id).strip()
+        if cls.MERGEKIT_EVOLUTION_LEGACY_BRIDGE:
+            script = os.path.join(root, "scripts", "run_vlm_search_bridge.py")
+            return [py, script, "--task-id", tid], root
+        return [py, "-m", "evolution.runner", "--task-id", tid], root
+
     @classmethod
     def setup_environment(cls):
         """统一设置环境变量"""

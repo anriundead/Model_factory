@@ -19,7 +19,7 @@
 ### 1) 融合与评估主链路
 
 - 标准融合：`/api/merge` -> `app/services.py` -> `merge_manager.py:run_merge_task()`
-- 进化融合：`/api/merge_evolutionary` -> `app/services.py` -> `scripts/run_vlm_search_bridge.py`
+- 进化融合：`/api/merge_evolutionary` -> `app/services.py` -> 默认 `python -m evolution.runner`（实现于 `evolution/runner.py`）；设 `MERGEKIT_EVOLUTION_LEGACY_BRIDGE=1` 时仍走 `scripts/run_vlm_search_bridge.py` 薄入口
 - 评估任务：`/api/evaluate` -> `app/services.py` -> `merge_manager.py:run_eval_only_task()`
 - 配方复现：`/api/recipes/apply` -> `merge_manager.py:run_recipe_apply_task()`
 
@@ -70,7 +70,8 @@
 | `MERGENETIC_PYTHON` | 调用 mergenetic/子进程用的 Python | 未设时尝试固定 conda 路径，不存在则 `python`；`start_app.sh` 在激活 `mergenetic` 后会设为当前 `which python` |
 | `MERGEKIT_EVAL_HF_CACHE` | lm_eval 所用 HF 数据集缓存 | 未设为项目内 `cache/eval_datasets` |
 | `HF_DATASETS_CACHE` | HuggingFace `datasets` 缓存 | 未设为项目内 `cache/datasets` |
-| `VLM_SEARCH_DIR` | 进化融合 `run_vlm_search.py` 所在目录 | 未设为 `Workspaces/modelmerge_visual/VLM_merge_total/VLM_merge`（相对 `mergeKit_beta` 的上级） |
+| `VLM_SEARCH_DIR` | **可选**。进化算法默认已内置在 `evolution/vendor/vlm_merge`；仅在外置/对比调试时设此变量指向其他目录 | 不设则走内置；旧部署可继续指向 `modelmerge_visual/.../VLM_merge` |
+| `MERGEKIT_EVOLUTION_LEGACY_BRIDGE` | 为 `1`/`true`/`yes` 时子进程入口改为 `scripts/run_vlm_search_bridge.py` | 默认关闭，使用 `python -m evolution.runner` |
 | `NUMEXPR_MAX_THREADS` | numexpr 线程数 | 由 `Config.setup_environment` 设为 `64`（类内常量，非环境变量读取） |
 | `HF_ENDPOINT` | HuggingFace 端点 | 代码默认 `https://hf-mirror.com`，`setup_environment` 会写入 `os.environ` |
 
@@ -125,9 +126,9 @@ GPU：`gpus: all`，宿主机需 **nvidia-container-toolkit**。
 
 ## 使用注意事项
 
-### 1) 外部脚本依赖
+### 1) 进化算法路径
 
-进化融合依赖外部 `run_vlm_search.py`。当前阶段不内嵌重构，相关路径与参数必须保持可用，否则进化任务会失败。
+默认使用仓内 **`evolution/vendor/vlm_merge/run_vlm_search.py`**（与 `evolution.runner` 配套）。若需改用外置副本，设置 **`VLM_SEARCH_DIR`**；依赖环境仍为 **mergenetic / Ray / pymoo / torch** 等与算法一致。
 
 ### 2) 数据一致性约定
 
