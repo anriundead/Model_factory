@@ -1729,183 +1729,183 @@ class TestsetMixin(BaseService):
                 path = os.path.join(d, f)
                 tid = "local_" + os.path.splitext(f)[0]
             
-            # 检查是否已存在（避免覆盖 testsets.json 中已定义的，除非是 local 类型且我们想更新它）
-            # 但为了简单，先检查 id
-            if tid in testsets:
-                current_local_ids.add(tid)
-                # 如果已存在，检查是否需要更新（例如文件修改时间）
-                # 这里暂时略过，假设 id 碰撞即为同一个
-                continue
-            
-            try:
-                cfg = {}
-                # 仅对 yaml/json 尝试解析内容
-                if ext.lower() in [".yaml", ".yml"]:
-                    try:
-                        with open(path, "r", encoding="utf-8") as yf:
-                            cfg = yaml.safe_load(yf) or {}
-                    except Exception:
-                        pass
-                elif ext.lower() == ".json":
-                    try:
-                        with open(path, "r", encoding="utf-8") as jf:
-                            cfg = json.load(jf) or {}
-                    except Exception:
-                        pass
-
-                # 尝试从 YAML/JSON 或文件名解析信息
-                hf_dataset = cfg.get("dataset_path") or cfg.get("hf_dataset")
-                hf_subset = cfg.get("dataset_name") or cfg.get("hf_subset")
-                hf_split = cfg.get("dataset_split") or cfg.get("hf_split")
+                # 检查是否已存在（避免覆盖 testsets.json 中已定义的，除非是 local 类型且我们想更新它）
+                # 但为了简单，先检查 id
+                if tid in testsets:
+                    current_local_ids.add(tid)
+                    # 如果已存在，检查是否需要更新（例如文件修改时间）
+                    # 这里暂时略过，假设 id 碰撞即为同一个
+                    continue
                 
-                is_valid_dataset = False
-                
-                def has_template_vars(s):
-                    return s and ("{{" in str(s) or "}}" in str(s))
-
-                # Case A: Explicit config in YAML/JSON
-                if hf_dataset: 
-                    # 排除包含模板变量的 dataset_path
-                    if has_template_vars(hf_dataset):
-                        is_valid_dataset = False
-                    else:
-                        is_valid_dataset = True
-                
-                # Case B: Filename convention (e.g. openai___gsm8k...)
-                elif ("___" in f or "__" in f) and not hf_dataset:
-                    # Attempt to parse filename to extract dataset info
-                    try:
-                        # expected format: owner___dataset__subset.ext or owner___dataset.ext
-                        # or dataset__subset.ext
-                        name_part = os.path.splitext(f)[0]
-                        if "___" in name_part:
-                            parts = name_part.split("___")
-                            if len(parts) >= 2:
-                                hf_dataset = parts[0] + "/" + parts[1].split("__")[0]
-                                if "__" in parts[1]:
-                                    hf_subset = parts[1].split("__")[1]
-                                is_valid_dataset = True
-                        elif "__" in name_part:
-                             parts = name_part.split("__")
-                             if len(parts) >= 2:
-                                 hf_dataset = parts[0]
-                                 hf_subset = parts[1]
-                                 is_valid_dataset = True
-                    except Exception:
-                        pass
-                
-                # Case C: Data files (jsonl, parquet) are inherently datasets
-                elif ext.lower() in [".jsonl", ".parquet"]:
-                    is_valid_dataset = True
-                    # Try to infer dataset name from filename if not set
-                    if not hf_dataset:
-                        hf_dataset = os.path.splitext(f)[0]
-                
-                # Case D: YAML with 'tasks' (prompt template) but no explicit dataset_path? 
-                elif cfg.get("tasks") or cfg.get("samples") or cfg.get("test_cases"):
-                    # Check if extracted dataset path is valid
-                    if not hf_dataset and cfg.get("tasks"):
+                try:
+                    cfg = {}
+                    # 仅对 yaml/json 尝试解析内容
+                    if ext.lower() in [".yaml", ".yml"]:
                         try:
-                            # 尝试从 tasks 列表的第一个元素提取
-                            candidates = cfg["tasks"]
-                            if isinstance(candidates, list) and len(candidates) > 0:
-                                t0 = candidates[0]
-                                if isinstance(t0, dict) and t0.get("dataset_path"):
-                                    extracted_ds = t0.get("dataset_path")
-                                    if not has_template_vars(extracted_ds):
-                                        hf_dataset = extracted_ds
-                                        hf_subset = t0.get("dataset_name") or hf_subset
-                                        hf_split = t0.get("dataset_split") or hf_split
-                                        is_valid_dataset = True
-                        except:
+                            with open(path, "r", encoding="utf-8") as yf:
+                                cfg = yaml.safe_load(yf) or {}
+                        except Exception:
                             pass
-                    
-                    # 如果仍然没有 hf_dataset，但有 samples/test_cases，则认为是本地数据定义
-                    if not is_valid_dataset and (cfg.get("samples") or cfg.get("test_cases")):
+                    elif ext.lower() == ".json":
+                        try:
+                            with open(path, "r", encoding="utf-8") as jf:
+                                cfg = json.load(jf) or {}
+                        except Exception:
+                            pass
+
+                    # 尝试从 YAML/JSON 或文件名解析信息
+                    hf_dataset = cfg.get("dataset_path") or cfg.get("hf_dataset")
+                    hf_subset = cfg.get("dataset_name") or cfg.get("hf_subset")
+                    hf_split = cfg.get("dataset_split") or cfg.get("hf_split")
+                
+                    is_valid_dataset = False
+                
+                    def has_template_vars(s):
+                        return s and ("{{" in str(s) or "}}" in str(s))
+
+                    # Case A: Explicit config in YAML/JSON
+                    if hf_dataset: 
+                        # 排除包含模板变量的 dataset_path
+                        if has_template_vars(hf_dataset):
+                            is_valid_dataset = False
+                        else:
+                            is_valid_dataset = True
+                
+                    # Case B: Filename convention (e.g. openai___gsm8k...)
+                    elif ("___" in f or "__" in f) and not hf_dataset:
+                        # Attempt to parse filename to extract dataset info
+                        try:
+                            # expected format: owner___dataset__subset.ext or owner___dataset.ext
+                            # or dataset__subset.ext
+                            name_part = os.path.splitext(f)[0]
+                            if "___" in name_part:
+                                parts = name_part.split("___")
+                                if len(parts) >= 2:
+                                    hf_dataset = parts[0] + "/" + parts[1].split("__")[0]
+                                    if "__" in parts[1]:
+                                        hf_subset = parts[1].split("__")[1]
+                                    is_valid_dataset = True
+                            elif "__" in name_part:
+                                 parts = name_part.split("__")
+                                 if len(parts) >= 2:
+                                     hf_dataset = parts[0]
+                                     hf_subset = parts[1]
+                                     is_valid_dataset = True
+                        except Exception:
+                            pass
+                
+                    # Case C: Data files (jsonl, parquet) are inherently datasets
+                    elif ext.lower() in [".jsonl", ".parquet"]:
                         is_valid_dataset = True
+                        # Try to infer dataset name from filename if not set
                         if not hf_dataset:
                             hf_dataset = os.path.splitext(f)[0]
                 
-                if not hf_dataset:
-                    continue
-
-                testsets[tid] = {
-                    "testset_id": tid,
-                    "name": f,
-                    "hf_dataset": hf_dataset,
-                    "hf_subset": hf_subset,
-                    "hf_split": hf_split or "test",
-                    "sample_count": 0,
-                    "is_local": True,
-                    "local_path": path,
-                    "created_at": os.path.getctime(path),
-                    "notes": "本地发现的文件"
-                }
-                current_local_ids.add(tid)
-
-                # 尝试计算样本数
-                try:
-                    count = 0
-                    if ext.lower() in [".yaml", ".yml", ".json"]:
-                        # 尝试常见的字段
-                        candidates = cfg.get("samples") or cfg.get("test_cases") or cfg.get("data") or cfg.get("examples") or []
-                        if isinstance(candidates, list):
-                            count = len(candidates)
-                        # 如果是 list 类型的 root
-                        elif isinstance(cfg, list):
-                            count = len(cfg)
-                        
-                        # 如果没有直接的数据列表，尝试读取 tasks 配置 (针对 prompt template yaml)
-                        if count == 0 and cfg.get("tasks"):
-                            pass
-                    elif ext.lower() == ".jsonl":
-                        # Count lines for JSONL
-                        try:
-                            with open(path, "r", encoding="utf-8") as f:
-                                count = sum(1 for line in f if line.strip())
-                        except Exception:
-                            pass
-                    elif ext.lower() == ".parquet":
-                        try:
-                            # Attempt to use pyarrow for speed
-                            import pyarrow.parquet as pq
-                            meta = pq.read_metadata(path)
-                            count = meta.num_rows
-                        except Exception:
+                    # Case D: YAML with 'tasks' (prompt template) but no explicit dataset_path? 
+                    elif cfg.get("tasks") or cfg.get("samples") or cfg.get("test_cases"):
+                        # Check if extracted dataset path is valid
+                        if not hf_dataset and cfg.get("tasks"):
                             try:
-                                # Fallback to pandas
-                                import pandas as pd
-                                df = pd.read_parquet(path)
-                                count = len(df)
+                                # 尝试从 tasks 列表的第一个元素提取
+                                candidates = cfg["tasks"]
+                                if isinstance(candidates, list) and len(candidates) > 0:
+                                    t0 = candidates[0]
+                                    if isinstance(t0, dict) and t0.get("dataset_path"):
+                                        extracted_ds = t0.get("dataset_path")
+                                        if not has_template_vars(extracted_ds):
+                                            hf_dataset = extracted_ds
+                                            hf_subset = t0.get("dataset_name") or hf_subset
+                                            hf_split = t0.get("dataset_split") or hf_split
+                                            is_valid_dataset = True
+                            except:
+                                pass
+                        
+                        # 如果仍然没有 hf_dataset，但有 samples/test_cases，则认为是本地数据定义
+                        if not is_valid_dataset and (cfg.get("samples") or cfg.get("test_cases")):
+                            is_valid_dataset = True
+                            if not hf_dataset:
+                                hf_dataset = os.path.splitext(f)[0]
+                
+                    if not hf_dataset:
+                        continue
+
+                    testsets[tid] = {
+                        "testset_id": tid,
+                        "name": f,
+                        "hf_dataset": hf_dataset,
+                        "hf_subset": hf_subset,
+                        "hf_split": hf_split or "test",
+                        "sample_count": 0,
+                        "is_local": True,
+                        "local_path": path,
+                        "created_at": os.path.getctime(path),
+                        "notes": "本地发现的文件"
+                    }
+                    current_local_ids.add(tid)
+
+                    # 尝试计算样本数
+                    try:
+                        count = 0
+                        if ext.lower() in [".yaml", ".yml", ".json"]:
+                            # 尝试常见的字段
+                            candidates = cfg.get("samples") or cfg.get("test_cases") or cfg.get("data") or cfg.get("examples") or []
+                            if isinstance(candidates, list):
+                                count = len(candidates)
+                            # 如果是 list 类型的 root
+                            elif isinstance(cfg, list):
+                                count = len(cfg)
+                            
+                            # 如果没有直接的数据列表，尝试读取 tasks 配置 (针对 prompt template yaml)
+                            if count == 0 and cfg.get("tasks"):
+                                pass
+                        elif ext.lower() == ".jsonl":
+                            # Count lines for JSONL
+                            try:
+                                with open(path, "r", encoding="utf-8") as f:
+                                    count = sum(1 for line in f if line.strip())
                             except Exception:
                                 pass
-                    
-                    if count > 0:
-                        testsets[tid]["sample_count"] = count
-                    elif count == 0 and hf_dataset:
-                        # 如果是本地 config 指向远程数据集，尝试从已知的 testsets 中查找 sample_count
-                        # 查找逻辑：dataset + subset (strict match) -> dataset + subset (loose) -> dataset only
-                        candidates_source = [t for t in testsets.values() if t.get("testset_id") != tid]
+                        elif ext.lower() == ".parquet":
+                            try:
+                                # Attempt to use pyarrow for speed
+                                import pyarrow.parquet as pq
+                                meta = pq.read_metadata(path)
+                                count = meta.num_rows
+                            except Exception:
+                                try:
+                                    # Fallback to pandas
+                                    import pandas as pd
+                                    df = pd.read_parquet(path)
+                                    count = len(df)
+                                except Exception:
+                                    pass
                         
-                        match = None
-                        # 1. Exact match dataset + subset + split
-                        match = next((t for t in candidates_source if t.get("hf_dataset") == hf_dataset and t.get("hf_subset") == hf_subset and t.get("hf_split") == hf_split and t.get("sample_count", 0) > 0), None)
-                        
-                        # 2. Match dataset + subset
-                        if not match and hf_subset:
-                             match = next((t for t in candidates_source if t.get("hf_dataset") == hf_dataset and t.get("hf_subset") == hf_subset and t.get("sample_count", 0) > 0), None)
-                        
-                        # 3. Match dataset only (risky if subsets differ significantly, but better than 0)
-                        if not match:
-                             match = next((t for t in candidates_source if t.get("hf_dataset") == hf_dataset and t.get("sample_count", 0) > 0), None)
-                             
-                        if match:
-                             testsets[tid]["sample_count"] = match["sample_count"]
+                        if count > 0:
+                            testsets[tid]["sample_count"] = count
+                        elif count == 0 and hf_dataset:
+                            # 如果是本地 config 指向远程数据集，尝试从已知的 testsets 中查找 sample_count
+                            # 查找逻辑：dataset + subset (strict match) -> dataset + subset (loose) -> dataset only
+                            candidates_source = [t for t in testsets.values() if t.get("testset_id") != tid]
+                            
+                            match = None
+                            # 1. Exact match dataset + subset + split
+                            match = next((t for t in candidates_source if t.get("hf_dataset") == hf_dataset and t.get("hf_subset") == hf_subset and t.get("hf_split") == hf_split and t.get("sample_count", 0) > 0), None)
+                            
+                            # 2. Match dataset + subset
+                            if not match and hf_subset:
+                                 match = next((t for t in candidates_source if t.get("hf_dataset") == hf_dataset and t.get("hf_subset") == hf_subset and t.get("sample_count", 0) > 0), None)
+                            
+                            # 3. Match dataset only (risky if subsets differ significantly, but better than 0)
+                            if not match:
+                                 match = next((t for t in candidates_source if t.get("hf_dataset") == hf_dataset and t.get("sample_count", 0) > 0), None)
+                                 
+                            if match:
+                                 testsets[tid]["sample_count"] = match["sample_count"]
 
-                except Exception:
-                    pass
-            except Exception as e:
-                self.logger.warning("处理本地 testset 文件失败 %s: %s", f, e)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self.logger.warning("处理本地 testset 文件失败 %s: %s", f, e)
         
         # 清理已不存在的或变为无效的 local entries
         to_remove = []
