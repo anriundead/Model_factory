@@ -165,7 +165,7 @@ dependencies:
       - matplotlib==3.10.8
       - mbstrdecoder==1.1.4
       - mdurl==0.1.2
-      - mergekit==0.0.6
+      - mergekit==0.1.4
       - mergenetic==0.1.1
       - mistral-common==1.8.6
       - moocore==0.1.10

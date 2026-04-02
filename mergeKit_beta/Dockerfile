@@ -39,6 +39,7 @@ RUN sed -e '/lm-eval==0.4.11/d' \
     && conda env create -n mergenetic -f /tmp/environment.docker.yml \
     && conda run -n mergenetic pip install --upgrade \
         'huggingface-hub==1.5.0' 'transformers==5.3.0' 'lm_eval[hf]==0.4.11' \
+        'mergekit>=0.1.4' \
     && conda clean -afy \
     && rm -f /tmp/environment.yml /tmp/environment.docker.yml
 
