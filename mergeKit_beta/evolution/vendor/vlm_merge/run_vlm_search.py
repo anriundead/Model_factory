@@ -49,6 +49,7 @@ def ensure_text_architecture(model_paths: list[str]) -> None:
     """
     仅对 Qwen2/Qwen2.5-VL 相关模型修改 config.json 的 model_type/architectures，
     避免误将 Llama 等改为 qwen2。Llama 模型直接跳过。
+    若模型目录只读，则先复制 config.json 到临时目录再修改，最后用 os.replace 回写。
     """
     for path in model_paths:
         config_path = Path(path) / "config.json"
@@ -61,12 +62,23 @@ def ensure_text_architecture(model_paths: list[str]) -> None:
             if model_type not in ("qwen2", "qwen2_vl", "qwen2_5_vl"):
                 logger.info("[arch_fix] 跳过非 Qwen2 系模型 %s（model_type=%s）", path, model_type)
                 continue
-            # 仅对 Qwen2/VL 统一为 Qwen2ForCausalLM 以便兼容
             cfg["model_type"] = "qwen2"
             cfg["architectures"] = ["Qwen2ForCausalLM"]
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2, ensure_ascii=False)
-            logger.info("[arch_fix] patching architectures for %s -> Qwen2ForCausalLM", path)
+            try:
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=2, ensure_ascii=False)
+                logger.info("[arch_fix] patching architectures for %s -> Qwen2ForCausalLM", path)
+            except OSError:
+                import tempfile, shutil
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix=".json", dir="/tmp")
+                try:
+                    with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                        json.dump(cfg, f, indent=2, ensure_ascii=False)
+                    shutil.copy2(tmp_path, str(config_path))
+                    logger.info("[arch_fix] patching (via tmpfile) for %s -> Qwen2ForCausalLM", path)
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
         except Exception as e:
             logger.warning("[arch_fix] skip %s: %s", path, e)
 

@@ -13,12 +13,25 @@ services:
       - MERGEKIT_MODEL_POOL=/data/models_pool
       - DATABASE_URL=${DATABASE_URL:-}
       - VLM_SEARCH_DIR=${VLM_SEARCH_DIR:-}
+      - HF_ENDPOINT=https://hf-mirror.com
+      - HF_HUB_DISABLE_XET=1
       - HF_DATASETS_CACHE=/data/hf_datasets
       - MERGEKIT_EVAL_HF_CACHE=/data/eval_datasets
     volumes:
-      - ${HOST_MODELS:-../Models}:/data/Models:ro
+      - ${HOST_MODELS:-../Models}:/data/Models
       - ${HOST_MODEL_POOL:-../mergeKit/models_pool}:/data/models_pool
       - ${HOST_PACKAGES:-../Packages}:/app/ServiceEndFiles/Packages:ro
       - ${HOST_MERGES:-./mergeKit_beta/merges}:/app/ServiceEndFiles/Workspaces/mergeKit_beta/merges
       - ${HOST_APP_DB:-./mergeKit_beta/app.db}:/app/ServiceEndFiles/Workspaces/mergeKit_beta/app.db
-    gpus: all
+    dns:
+      - 223.5.5.5
+      - 8.8.8.8
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
