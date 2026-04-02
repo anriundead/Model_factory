@@ -18,7 +18,7 @@ services:
       - HF_DATASETS_CACHE=/data/hf_datasets
       - MERGEKIT_EVAL_HF_CACHE=/data/eval_datasets
     volumes:
-      - ${HOST_MODELS:-../Models}:/data/Models
+      - ${HOST_MODELS:-../Models}:/data/Models:ro
       - ${HOST_MODEL_POOL:-../mergeKit/models_pool}:/data/models_pool
       - ${HOST_PACKAGES:-../Packages}:/app/ServiceEndFiles/Packages:ro
       - ${HOST_MERGES:-./mergeKit_beta/merges}:/app/ServiceEndFiles/Workspaces/mergeKit_beta/merges

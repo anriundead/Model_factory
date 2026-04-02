@@ -45,42 +45,75 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def ensure_text_architecture(model_paths: list[str]) -> None:
+_shadow_dirs: list[str] = []
+
+
+def _cleanup_shadow_dirs():
+    for d in _shadow_dirs:
+        shutil.rmtree(d, ignore_errors=True)
+    _shadow_dirs.clear()
+
+
+import atexit as _atexit
+_atexit.register(_cleanup_shadow_dirs)
+
+
+def ensure_text_architecture(model_paths: list[str]) -> list[str]:
     """
-    仅对 Qwen2/Qwen2.5-VL 相关模型修改 config.json 的 model_type/architectures，
-    避免误将 Llama 等改为 qwen2。Llama 模型直接跳过。
-    若模型目录只读，则先复制 config.json 到临时目录再修改，最后用 os.replace 回写。
+    对 Qwen2-VL / Qwen2.5-VL 模型，创建 shadow 目录（symlink + 修补后的 config.json），
+    让 mergekit 按 Qwen2ForCausalLM 处理文本塔权重。
+    不修改原模型目录（兼容 :ro 只读挂载）。
+
+    Returns: 与 model_paths 等长的路径列表（未修补的保持原路径，修补的返回 shadow 路径）。
     """
+    result_paths = []
     for path in model_paths:
         config_path = Path(path) / "config.json"
         if not config_path.exists():
+            result_paths.append(path)
             continue
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             model_type = (cfg.get("model_type") or "").lower()
+
             if model_type not in ("qwen2", "qwen2_vl", "qwen2_5_vl"):
                 logger.info("[arch_fix] 跳过非 Qwen2 系模型 %s（model_type=%s）", path, model_type)
+                result_paths.append(path)
                 continue
+
+            current_arch = (cfg.get("architectures") or [None])[0]
+            if current_arch == "Qwen2ForCausalLM":
+                logger.info("[arch_fix] %s 已是 Qwen2ForCausalLM，无需修补", path)
+                result_paths.append(path)
+                continue
+
+            model_name = Path(path).name
+            shadow_dir = Path(tempfile.mkdtemp(prefix=f"arch_fix_{model_name}_"))
+            _shadow_dirs.append(str(shadow_dir))
+
+            for item in Path(path).iterdir():
+                if item.name == "config.json":
+                    continue
+                target = shadow_dir / item.name
+                target.symlink_to(item, target_is_directory=item.is_dir())
+
             cfg["model_type"] = "qwen2"
             cfg["architectures"] = ["Qwen2ForCausalLM"]
-            try:
-                with open(config_path, "w", encoding="utf-8") as f:
-                    json.dump(cfg, f, indent=2, ensure_ascii=False)
-                logger.info("[arch_fix] patching architectures for %s -> Qwen2ForCausalLM", path)
-            except OSError:
-                import tempfile, shutil
-                tmp_fd, tmp_path = tempfile.mkstemp(suffix=".json", dir="/tmp")
-                try:
-                    with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                        json.dump(cfg, f, indent=2, ensure_ascii=False)
-                    shutil.copy2(tmp_path, str(config_path))
-                    logger.info("[arch_fix] patching (via tmpfile) for %s -> Qwen2ForCausalLM", path)
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
+            rope = cfg.get("rope_scaling")
+            if isinstance(rope, dict) and rope.get("type") == "mrope":
+                del cfg["rope_scaling"]
+
+            with open(shadow_dir / "config.json", "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+            logger.info("[arch_fix] shadow %s -> Qwen2ForCausalLM (src: %s)", shadow_dir, path)
+            result_paths.append(str(shadow_dir))
         except Exception as e:
             logger.warning("[arch_fix] skip %s: %s", path, e)
+            result_paths.append(path)
+
+    return result_paths
 
 
 def _dataset_to_list_of_dicts(dataset) -> list[dict[str, Any]]:
@@ -636,7 +669,7 @@ def main():
         args.hf_split,
     )
 
-    ensure_text_architecture(args.model_paths)
+    args.model_paths = ensure_text_architecture(args.model_paths)
 
     dtype_map = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
     torch_dtype = dtype_map.get(args.dtype, torch.bfloat16)
