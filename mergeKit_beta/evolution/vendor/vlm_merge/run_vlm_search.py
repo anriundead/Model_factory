@@ -60,12 +60,14 @@ _atexit.register(_cleanup_shadow_dirs)
 
 def ensure_text_architecture(model_paths: list[str]) -> list[str]:
     """
-    对 Qwen2-VL / Qwen2.5-VL 模型，创建 shadow 目录（symlink + 修补后的 config.json），
-    让 mergekit 按 Qwen2ForCausalLM 处理文本塔权重。
+    对 Qwen2-VL / Qwen2.5-VL 模型，创建 shadow 目录（symlink + 修补后的 config.json +
+    仅文本 tensor 的 index），让 mergekit 按 Qwen2ForCausalLM 处理文本塔权重。
     不修改原模型目录（兼容 :ro 只读挂载）。
 
     Returns: 与 model_paths 等长的路径列表（未修补的保持原路径，修补的返回 shadow 路径）。
     """
+    VISUAL_PREFIXES = ("visual", "model.visual", "model.vision_tower", "model.mm_projector")
+
     result_paths = []
     for path in model_paths:
         config_path = Path(path) / "config.json"
@@ -77,8 +79,8 @@ def ensure_text_architecture(model_paths: list[str]) -> list[str]:
                 cfg = json.load(f)
             model_type = (cfg.get("model_type") or "").lower()
 
-            if model_type not in ("qwen2", "qwen2_vl"):
-                logger.info("[arch_fix] 跳过模型 %s（model_type=%s，mergekit 原生支持或非目标）", path, model_type)
+            if model_type not in ("qwen2", "qwen2_vl", "qwen2_5_vl"):
+                logger.info("[arch_fix] 跳过非 Qwen2 系模型 %s（model_type=%s）", path, model_type)
                 result_paths.append(path)
                 continue
 
@@ -93,7 +95,7 @@ def ensure_text_architecture(model_paths: list[str]) -> list[str]:
             _shadow_dirs.append(str(shadow_dir))
 
             for item in Path(path).iterdir():
-                if item.name == "config.json":
+                if item.name in ("config.json", "model.safetensors.index.json"):
                     continue
                 target = shadow_dir / item.name
                 target.symlink_to(item, target_is_directory=item.is_dir())
@@ -103,9 +105,26 @@ def ensure_text_architecture(model_paths: list[str]) -> list[str]:
             rope = cfg.get("rope_scaling")
             if isinstance(rope, dict) and rope.get("type") == "mrope":
                 del cfg["rope_scaling"]
+            for vl_key in [k for k in cfg if any(
+                w in k.lower() for w in ("vision", "visual", "image", "video", "mrope", "mm_")
+            )]:
+                del cfg[vl_key]
 
             with open(shadow_dir / "config.json", "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+            idx_path = Path(path) / "model.safetensors.index.json"
+            if idx_path.exists():
+                idx = json.loads(idx_path.read_text())
+                text_wm = {
+                    k: v for k, v in idx.get("weight_map", {}).items()
+                    if not any(k.startswith(p) for p in VISUAL_PREFIXES)
+                }
+                new_idx = {"metadata": idx.get("metadata", {}), "weight_map": text_wm}
+                with open(shadow_dir / "model.safetensors.index.json", "w") as f:
+                    json.dump(new_idx, f, indent=2)
+                logger.info("[arch_fix] shadow index: %d/%d tensors (text only)",
+                            len(text_wm), len(idx.get("weight_map", {})))
 
             logger.info("[arch_fix] shadow %s -> Qwen2ForCausalLM (src: %s)", shadow_dir, path)
             result_paths.append(str(shadow_dir))
