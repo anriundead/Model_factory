@@ -58,11 +58,8 @@ def ensure_text_architecture(model_paths: list[str]) -> None:
             with open(config_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             model_type = (cfg.get("model_type") or "").lower()
-            if "llama" in model_type:
-                logger.info("[arch_fix] 跳过Llama模型 %s，不修改config（model_type=%s）", path, model_type)
-                continue
-            if "qwen2" not in model_type and "qwen" not in model_type:
-                logger.info("[arch_fix] 跳过非 Qwen 模型 %s（model_type=%s）", path, model_type)
+            if model_type not in ("qwen2", "qwen2_vl", "qwen2_5_vl"):
+                logger.info("[arch_fix] 跳过非 Qwen2 系模型 %s（model_type=%s）", path, model_type)
                 continue
             # 仅对 Qwen2/VL 统一为 Qwen2ForCausalLM 以便兼容
             cfg["model_type"] = "qwen2"
