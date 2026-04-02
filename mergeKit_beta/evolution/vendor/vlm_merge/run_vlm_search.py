@@ -77,8 +77,8 @@ def ensure_text_architecture(model_paths: list[str]) -> list[str]:
                 cfg = json.load(f)
             model_type = (cfg.get("model_type") or "").lower()
 
-            if model_type not in ("qwen2", "qwen2_vl", "qwen2_5_vl"):
-                logger.info("[arch_fix] 跳过非 Qwen2 系模型 %s（model_type=%s）", path, model_type)
+            if model_type not in ("qwen2", "qwen2_vl"):
+                logger.info("[arch_fix] 跳过模型 %s（model_type=%s，mergekit 原生支持或非目标）", path, model_type)
                 result_paths.append(path)
                 continue
 
