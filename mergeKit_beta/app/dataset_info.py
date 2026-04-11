@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import os
 import glob
 import json
+import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
@@ -10,12 +11,55 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 class DataRequest:
     hf_dataset: str
     hf_subset: str | None = None
+    testset_id: str | None = None  # 可选：用于读/写 TestSet 上 hf_info 缓存
 
 
 class DatasetInfoService:
+    _FILE_CACHE_TTL = 86400 * 7  # 7 天
+
     def __init__(self, config):
         self.config = config
         self._memo = {}
+
+    def _hf_meta_cache_path(self) -> str:
+        root = getattr(self.config, "PROJECT_ROOT", None) or os.getcwd()
+        d = os.path.join(root, "cache")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        return os.path.join(d, "hf_info_meta.json")
+
+    def _read_file_meta_cache(self, key: str) -> dict | None:
+        path = self._hf_meta_cache_path()
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                store = json.load(f)
+            ent = (store or {}).get(key)
+            if not ent or not isinstance(ent, dict):
+                return None
+            if time.time() - float(ent.get("ts", 0)) > self._FILE_CACHE_TTL:
+                return None
+            return ent.get("data")
+        except Exception:
+            return None
+
+    def _write_file_meta_cache(self, key: str, data: dict) -> None:
+        path = self._hf_meta_cache_path()
+        try:
+            store = {}
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    store = json.load(f) or {}
+            if not isinstance(store, dict):
+                store = {}
+            store[key] = {"ts": time.time(), "data": data}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(store, f, ensure_ascii=False)
+        except Exception:
+            pass
 
     @property
     def cache_candidates(self):
@@ -26,6 +70,27 @@ class DatasetInfoService:
             os.environ.get("HF_DATASETS_CACHE", None),
             default_hf_cache,
         ]
+
+    def invalidate_hf_info_cache(self, hf_dataset: str, hf_subset: str | None = None) -> None:
+        """清除内存与磁盘 hf_info 缓存条目。"""
+        hf_dataset = (hf_dataset or "").strip()
+        if not hf_dataset:
+            return
+        sub = (hf_subset or "").strip()
+        key = f"{hf_dataset}|{sub}"
+        self._memo.pop(key, None)
+        path = self._hf_meta_cache_path()
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                store = json.load(f) or {}
+            if isinstance(store, dict) and key in store:
+                del store[key]
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(store, f, ensure_ascii=False)
+        except Exception:
+            pass
 
     def _parse_readme_dataset_info(self, text: str):
         lines = text.splitlines()
@@ -349,8 +414,36 @@ class DatasetInfoService:
         entry = self._memo.get(key)
         if entry:
             ts, data = entry
-            if (data or {}).get("status") == "success" and (ts and (ts + 900) > __import__("time").time()):
+            if (data or {}).get("status") == "success" and (ts and (ts + 900) > time.time()):
                 return data
+
+        # 磁盘长期缓存（重启后仍可用）
+        disk_hit = self._read_file_meta_cache(key)
+        if disk_hit and (disk_hit or {}).get("status") == "success":
+            self._memo[key] = (time.time(), disk_hit)
+            return disk_hit
+
+        # DB 中 TestSet 行缓存的 configs/splits
+        testset_id = (getattr(req, "testset_id", None) or "").strip()
+        if testset_id:
+            try:
+                from flask import has_app_context
+                if has_app_context():
+                    from app.extensions import db
+                    from app.models import TestSet
+                    row = db.session.get(TestSet, testset_id)
+                    if row and row.cached_configs and row.cached_splits:
+                        db_hit = {
+                            "status": "success",
+                            "hf_dataset": hf_dataset,
+                            "configs": list(row.cached_configs),
+                            "splits": list(row.cached_splits),
+                            "source": "db_cache",
+                        }
+                        self._memo[key] = (time.time(), db_hit)
+                        return db_hit
+            except Exception:
+                pass
 
         try:
             from datasets import load_dataset_builder, load_dataset  # 兼容旧导入，不强制使用
@@ -440,7 +533,17 @@ class DatasetInfoService:
             "splits": splits,
         }
         try:
-            self._memo[key] = (__import__("time").time(), result)
+            self._memo[key] = (time.time(), result)
+            self._write_file_meta_cache(key, result)
+            if testset_id:
+                from flask import has_app_context
+                if has_app_context():
+                    from app.repositories import testset_update_hf_cache
+                    testset_update_hf_cache(
+                        testset_id,
+                        cached_configs=list(configs or []),
+                        cached_splits=list(splits or []),
+                    )
         except Exception:
             pass
         return result

@@ -155,8 +155,20 @@ class TestSet(db.Model):
     question_type = db.Column(db.String(64), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    # hf_info 缓存：减少子集/split 下拉重复探测 Hub
+    cached_configs = db.Column(db.JSON, nullable=True)
+    cached_splits = db.Column(db.JSON, nullable=True)
 
     def to_dict(self):
+        hf_key = (self.hf_dataset or "").strip().lower().rstrip("/")
+        notes = (self.notes or "").lower()
+        is_vlm_benchmark = False
+        if hf_key.startswith("lmms-lab/"):
+            is_vlm_benchmark = True
+        elif hf_key in ("m-a-p/cmmmu", "cmmmu/cmmmu"):
+            is_vlm_benchmark = True
+        elif "vlm" in notes:
+            is_vlm_benchmark = True
         d = {
             "testset_id": self.id,
             "id": self.id,
@@ -171,9 +183,14 @@ class TestSet(db.Model):
             "sample_count": self.sample_count,
             "is_local": self.is_local,
             "local_path": self.local_path,
+            "is_vlm_benchmark": is_vlm_benchmark,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+        if self.cached_configs is not None:
+            d["cached_configs"] = self.cached_configs
+        if self.cached_splits is not None:
+            d["cached_splits"] = self.cached_splits
         if self.yaml_template_path:
             d["yaml_template_path"] = self.yaml_template_path
         if self.created_by:

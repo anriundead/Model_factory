@@ -63,6 +63,19 @@ CMMMU_SUBSET_GROUPS = [
 ]
 
 
+# 历史 DB/UI 曾用简称，与 MMLU_SUBSET_GROUPS 的 id 不一致，在此映射到展开列表
+MMLU_LEGACY_GROUP_SUBSETS = {
+    "biology": [s for g in MMLU_SUBSET_GROUPS if g["id"] == "biology_medicine" for s in g["subsets"]],
+    "society": [
+        "econometrics", "high_school_geography", "high_school_government_and_politics",
+        "high_school_macroeconomics", "high_school_microeconomics", "high_school_psychology",
+        "human_sexuality", "professional_psychology", "public_relations", "security_studies",
+        "sociology", "us_foreign_policy",
+    ],
+    "law": ["international_law", "jurisprudence", "professional_law"],
+}
+
+
 def resolve_hf_subsets(dataset_type: str, subset_group_or_single: str) -> list:
     if dataset_type == "cmmmu":
         for g in CMMMU_SUBSET_GROUPS:
@@ -71,18 +84,53 @@ def resolve_hf_subsets(dataset_type: str, subset_group_or_single: str) -> list:
         if subset_group_or_single in CMMMU_SUBSETS:
             return [subset_group_or_single]
     else:
+        key = (subset_group_or_single or "").strip()
+        if key in MMLU_LEGACY_GROUP_SUBSETS:
+            return list(MMLU_LEGACY_GROUP_SUBSETS[key])
         for g in MMLU_SUBSET_GROUPS:
             if g["id"] == subset_group_or_single:
                 return list(g["subsets"])
         if subset_group_or_single in MMLU_SUBSETS:
             return [subset_group_or_single]
-    
+
     # If not a group and not a known subset for the dataset type, return empty or filter
     # User complained about irrelevant labels, so we should be strict.
     return []
 
 
 def register_routes(app, state, services, dataset_service):
+    @app.route("/healthz")
+    def healthz():
+        # 进程存活探针：不做重依赖检查，避免误伤可用性
+        return jsonify({"ok": True}), 200
+
+    @app.route("/readyz")
+    def readyz():
+        # 最小就绪探针：DB 可连接 + merges 目录可读写
+        details = {"db": None, "merge_dir": None}
+        ok = True
+        try:
+            from sqlalchemy import text
+            from .extensions import db
+
+            db.session.execute(text("SELECT 1"))
+            details["db"] = "ok"
+        except Exception as e:
+            ok = False
+            details["db"] = f"error: {str(e)[:240]}"
+        try:
+            merge_dir = getattr(state, "merge_dir", None) or getattr(state, "config", None).merge_dir
+            os.makedirs(merge_dir, exist_ok=True)
+            p = os.path.join(merge_dir, f".readyz_{uuid.uuid4().hex}.tmp")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(p)
+            details["merge_dir"] = "ok"
+        except Exception as e:
+            ok = False
+            details["merge_dir"] = f"error: {str(e)[:240]}"
+        return (jsonify({"ok": ok, "details": details}), 200 if ok else 503)
+
     @app.route("/")
     def index():
         return render_template("index.html") if os.path.isdir(app.template_folder) else ("<p>mergeKit_beta</p><p>请将 static 与 templates 从 mergeKit_alpha 拷贝到本目录。</p>", 200)
@@ -454,9 +502,13 @@ def register_routes(app, state, services, dataset_service):
             "hf_split_final": (data.get("hf_split_final") or "").strip() or None,
             "pop_size": max(2, min(128, int(data.get("pop_size", 20)))),
             "n_iter": max(1, min(50, int(data.get("n_iter", 15)))),
+            # 可选：快测/门禁参数（runner/run_vlm_search 会读取 metadata.json）
+            "max_evals": max(0, int(data.get("max_evals", 0) or 0)),
+            "skip_final_eval": bool(data.get("skip_final_eval", False)),
+            "batch_size": max(1, int(data.get("batch_size", 4) or 4)),
             "max_samples": max(4, min(512, int(data.get("max_samples", 64)))),
             "dtype": data.get("dtype", "bfloat16"),
-            "ray_num_gpus": int(data.get("ray_num_gpus", 1)),
+            "ray_num_gpus": int(data.get("ray_num_gpus", 4)),
             "created_at": created_at,
         }
         merge_dir = os.path.join(state.merge_dir, task_id)
@@ -569,11 +621,12 @@ def register_routes(app, state, services, dataset_service):
             "hf_subset": hf_subset,
             "hf_split": hf_split,
             "lm_eval_task": lm_eval_task or None,
+            "num_gpus": int(data.get("num_gpus", 0)),
         }
         state.logger.info(
-            "[API] 提交评估任务 task_id=%s model_path=%s dataset=%s testset_id=%s hf_dataset=%s hf_subset=%s",
+            "[API] 提交评估任务 task_id=%s model_path=%s dataset=%s testset_id=%s hf_dataset=%s hf_subset=%s num_gpus=%s",
             task_id, model_path, task_data.get("dataset"), task_data.get("testset_id"),
-            task_data.get("hf_dataset"), task_data.get("hf_subset"),
+            task_data.get("hf_dataset"), task_data.get("hf_subset"), task_data.get("num_gpus"),
         )
         with state.scheduler_lock:
             state.tasks[task_id] = task_data
@@ -1159,6 +1212,60 @@ def register_routes(app, state, services, dataset_service):
         services.save_testsets_dict(testsets)
         return jsonify({"status": "success", "testset_id": testset_id, "testset": entry})
 
+    @app.route("/api/testset/cmmmu/scan", methods=["POST"])
+    def api_testset_cmmmu_scan():
+        """
+        扫描/补全 CMMMU 子集为 testset 条目，便于前端按子域选择评测。
+        默认使用 m-a-p/CMMMU，split= test（评测时可在前端改为 val）。
+        """
+        data = request.json or {}
+        hf_dataset = (data.get("hf_dataset") or "m-a-p/CMMMU").strip() or "m-a-p/CMMMU"
+        split = (data.get("hf_split") or "test").strip() or "test"
+        subsets = list(CMMMU_SUBSETS)
+        # 允许只补指定子集
+        only = data.get("only_subsets")
+        if isinstance(only, list) and only:
+            subsets = [s for s in subsets if s in set(str(x) for x in only)]
+
+        # 用 testset_list(refresh=1) 获取更全量视图（包含 DB 同步/本地扫描结果），确保 scan 幂等
+        current_list = services.testset_list(refresh=True) or []
+        existing = set()
+        for t in current_list:
+            if not t:
+                continue
+            if (t.get("hf_dataset") or "").strip().lower() == hf_dataset.lower().strip():
+                existing.add(((t.get("hf_subset") or "").strip().lower()))
+
+        testsets = services.load_testsets_dict() or {}
+
+        created = []
+        cache_dir = getattr(state.config, "HF_DATASETS_CACHE", None) or os.environ.get("HF_DATASETS_CACHE")
+        for sub in subsets:
+            if sub.strip().lower() in existing:
+                continue
+            testset_id = str(uuid.uuid4())
+            n, actual_split, actual_subset = services.resolve_dataset_sample_count(hf_dataset, sub, split, cache_dir)
+            entry = {
+                "testset_id": testset_id,
+                "name": f"CMMMU ({sub})",
+                "hf_dataset": hf_dataset,
+                "hf_subset": actual_subset or sub,
+                "hf_split": actual_split or split,
+                "lm_eval_task": "cmmmu",
+                "yaml_template_path": "",
+                "sample_count": int(n or 0),
+                "created_at": time.time(),
+                "created_by": "system",
+                "notes": "auto-scan: CMMMU subset",
+                "question_type": "未知",
+            }
+            testsets[testset_id] = entry
+            created.append(entry)
+
+        if created:
+            services.save_testsets_dict(testsets)
+        return jsonify({"status": "success", "created": created, "created_count": len(created), "total": len(subsets)})
+
     @app.route("/api/testset/<testset_id>")
     def api_testset_get(testset_id):
         refresh = request.args.get("refresh", "0") in ("1", "true", "yes")
@@ -1188,6 +1295,64 @@ def register_routes(app, state, services, dataset_service):
             "testset": testset,
             "leaderboard": lb_sorted,
         })
+
+    @app.route("/api/testset/dedup", methods=["POST"])
+    def api_testset_dedup():
+        """
+        去重 testsets：按 (hf_dataset, hf_subset) 小写键分组，保留 1 条，其余删除。
+        优先保留被 evaluation_results 引用的 testset；否则保留最早 created_at 的那条。
+        """
+        from app.extensions import db
+        from app.models import TestSet, EvaluationResult
+
+        data = request.json or {}
+        # 可选：只对某个数据集去重
+        only_dataset = (data.get("hf_dataset") or "").strip().lower().rstrip("/")
+
+        rows = db.session.query(TestSet).all()
+        groups = {}
+        for t in rows:
+            ds = (t.hf_dataset or "").strip().lower().rstrip("/")
+            sub = (t.hf_subset or "").strip().lower()
+            if only_dataset and ds != only_dataset:
+                continue
+            key = (ds, sub)
+            groups.setdefault(key, []).append(t)
+
+        removed = []
+        removed_ids = []
+        for (ds, sub), items in groups.items():
+            if len(items) <= 1:
+                continue
+
+            # 被评测结果引用的优先保留
+            keep = None
+            referenced = set(r[0] for r in db.session.query(EvaluationResult.testset_id).filter(EvaluationResult.testset_id.isnot(None)).all())
+            for it in items:
+                if it.id in referenced:
+                    keep = it
+                    break
+            if keep is None:
+                # 保留 created_at 最早的（created_at 为空时放最后）
+                keep = sorted(items, key=lambda x: (x.created_at is None, x.created_at))[0]
+
+            for it in items:
+                if it.id == keep.id:
+                    continue
+                removed.append({
+                    "id": it.id,
+                    "name": it.name,
+                    "hf_dataset": it.hf_dataset,
+                    "hf_subset": it.hf_subset,
+                    "hf_split": it.hf_split,
+                })
+                removed_ids.append(it.id)
+                db.session.delete(it)
+
+        if removed_ids:
+            db.session.commit()
+
+        return jsonify({"status": "success", "removed": removed, "removed_count": len(removed)})
 
     @app.route("/api/test_history")
     def api_test_history():
@@ -1219,19 +1384,6 @@ def register_routes(app, state, services, dataset_service):
             normalized.append(item)
         return jsonify({"status": "success", "history": normalized})
 
-    @app.route("/api/mmlu_subsets")
-    def api_mmlu_subsets():
-        return jsonify({"status": "success", "subsets": MMLU_SUBSETS})
-
-    @app.route("/api/cmmmu_subsets")
-    def api_cmmmu_subsets():
-        return jsonify({
-            "status": "success",
-            "subsets": CMMMU_SUBSETS,
-            "count": len(CMMMU_SUBSETS),
-            "note": "不选子集或选「全部」时，评估将优先使用 cmmmu_*；若环境无该任务，将回退到 mmmu_val_* 兼容任务",
-        })
-
     @app.route("/api/model_is_vlm")
     def api_model_is_vlm():
         path = request.args.get("path") or (request.json or {}).get("path") if request.is_json else None
@@ -1245,7 +1397,31 @@ def register_routes(app, state, services, dataset_service):
         hf_dataset = (data.get("hf_dataset") or "").strip()
         if not hf_dataset:
             return jsonify({"status": "error", "message": "hf_dataset 必填"}), 400
-        info = dataset_service.get_info(DataRequest(hf_dataset=hf_dataset, hf_subset=(data.get("hf_subset") or "").strip() or None))
+        tsid = (data.get("testset_id") or data.get("testsetId") or "").strip() or None
+        info = dataset_service.get_info(
+            DataRequest(
+                hf_dataset=hf_dataset,
+                hf_subset=(data.get("hf_subset") or "").strip() or None,
+                testset_id=tsid,
+            )
+        )
+        if info.get("status") != "success":
+            return jsonify(info), 500
+        return jsonify(info)
+
+    @app.route("/api/dataset/refresh_cache", methods=["POST"])
+    def api_dataset_refresh_cache():
+        """清除 hf_info 磁盘/内存缓存并重新探测（用于手动刷新子集/split）。"""
+        data = request.json or {}
+        hf_dataset = (data.get("hf_dataset") or "").strip()
+        if not hf_dataset:
+            return jsonify({"status": "error", "message": "hf_dataset 必填"}), 400
+        hf_subset = (data.get("hf_subset") or "").strip() or None
+        dataset_service.invalidate_hf_info_cache(hf_dataset, hf_subset)
+        tsid = (data.get("testset_id") or "").strip() or None
+        info = dataset_service.get_info(
+            DataRequest(hf_dataset=hf_dataset, hf_subset=hf_subset, testset_id=tsid)
+        )
         if info.get("status") != "success":
             return jsonify(info), 500
         return jsonify(info)
@@ -1561,6 +1737,7 @@ def register_routes(app, state, services, dataset_service):
 
         # 多路径查找 CSV：兼容不同版本的 run_vlm_search 输出位置
         csv_candidates = [
+            os.path.join(task_dir, "vlm_search_results", "evolution_stream.csv"),
             os.path.join(task_dir, "vlm_search_results", "vlm_search.csv"),
             os.path.join(task_dir, "vlm_search_results", "vlm_search", "vlm_search.csv"),
             os.path.join(task_dir, "search_results.csv"),

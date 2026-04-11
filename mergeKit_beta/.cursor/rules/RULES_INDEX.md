@@ -4,6 +4,7 @@
 
 | 文件 | 摘要 |
 |------|------|
+| [SYSTEM_STATUS.md](SYSTEM_STATUS.md) | **Agent 必读**：系统现状、功能清单、已知问题、待开发项（每次会话起点） |
 | [DO_NOT_DELETE_FILES.md](DO_NOT_DELETE_FILES.md) | 删除/移动/批量清理须用户二次确认 |
 | [ARCHITECTURE_BOUNDARIES.md](ARCHITECTURE_BOUNDARIES.md) | 应用入口、routes/services/repositories/merge_manager 分层职责 |
 | [WORKFLOW_AND_GIT.md](WORKFLOW_AND_GIT.md) | 变更范围、Git 提交、勿提交清单、联调原则 |

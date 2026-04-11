@@ -1,3 +1,4 @@
+import logging
 import os
 
 from flask import Flask
@@ -31,13 +32,28 @@ def create_app():
         try:
             from flask_migrate import upgrade
             upgrade()
-        except Exception as e:
+        except BaseException as e:
             import logging
             logger = logging.getLogger("mergeKit_beta")
             logger.warning("启动时自动迁移跳过: %s", e)
             # Docker/新环境若未携带 migrations/env.py，回退为直接建表，避免服务因无表而不可用
             db.create_all()
             logger.warning("迁移不可用，已执行 db.create_all() 作为回退")
+        # SQLite 增量列：TestSet.cached_configs / cached_splits（无 Alembic 迁移时）
+        try:
+            from sqlalchemy import inspect, text
+
+            uri = str(app.config.get("SQLALCHEMY_DATABASE_URI") or "")
+            if "sqlite" in uri.lower():
+                insp = inspect(db.engine)
+                cols = {c["name"] for c in insp.get_columns("testsets")}
+                with db.engine.begin() as conn:
+                    if "cached_configs" not in cols:
+                        conn.execute(text("ALTER TABLE testsets ADD COLUMN cached_configs TEXT"))
+                    if "cached_splits" not in cols:
+                        conn.execute(text("ALTER TABLE testsets ADD COLUMN cached_splits TEXT"))
+        except Exception as ex:
+            logging.getLogger("mergeKit_beta").warning("testsets 表增量列检查跳过: %s", ex)
         if not getattr(_admin, "_views_registered", False):
             from .admin import register_admin_views
             register_admin_views(_admin)
@@ -69,4 +85,8 @@ def create_app():
     return app
 
 
-app = create_app()
+# CLI 脚本（如 scripts/report_local_model_pairing.py）在 import 子模块前设置 MERGEKIT_CLI_SCRIPT=1，避免此处启动 Flask 与 Worker。
+if os.environ.get("MERGEKIT_CLI_SCRIPT") == "1":
+    app = None
+else:
+    app = create_app()

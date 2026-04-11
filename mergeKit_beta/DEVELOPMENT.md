@@ -6,10 +6,10 @@
 
 ## 开发与协作规则（人机共用）
 
-完整规则位于 **`.cursor/rules/`**（Cursor / AI 与人类开发者共用），索引：[`.cursor/rules/RULES_INDEX.md`](.cursor/rules/RULES_INDEX.md)。
+完整规则位于 `**.cursor/rules/**`（Cursor / AI 与人类开发者共用），索引：`[.cursor/rules/RULES_INDEX.md](.cursor/rules/RULES_INDEX.md)`。
 
 - **95% 把握前须追问**：对需求、路径、兼容性或破坏性操作存疑时，先向责任人澄清，直到对目标与验收有约 **95%** 把握，再定方案或改代码（详见 `AI_COLLABORATION.md`）。
-- **入口与分层**：仅通过 `start_app.sh` → `app/__init__.py:create_app()` 作为主入口；新逻辑进 `app/` 包，**禁止在 `app.py` 扩展**业务或并行 Worker（详见 `ARCHITECTURE_BOUNDARIES.md`）。
+- **入口与分层**：仅通过 `start_app.sh` → `app/__init__.py:create_app()` 作为主入口；新逻辑进 `app/` 包，**禁止在 `app.py.legacy`（已归档单体入口）扩展**业务或并行 Worker（详见 `ARCHITECTURE_BOUNDARIES.md`）。
 - **接口 vs 数据**：`routes` 只做 HTTP 与编排调用；**新增**数据库访问走 `services` → `repositories`，不在路由中直连 `db.session`。
 - **Git 与工作流**：最小 diff、中文提交说明、勿提交本机路径快照与密钥（详见 `WORKFLOW_AND_GIT.md`）。
 - **删除与清理**：须用户二次确认（`DO_NOT_DELETE_FILES.md`）。
@@ -53,7 +53,7 @@
 - 重启入口：`./restart_app.sh`
 - 标准端口：`5000`
 - 模块化应用入口：`app/__init__.py:create_app()`
-- `app.py`：仅兼容回退，不作为主入口继续扩展
+- `app.py.legacy`：旧单体入口已归档（重命名自 `app.py`），不作为主入口；勿在其中扩展
 
 ## 最终环境参数清单
 
@@ -61,19 +61,21 @@
 
 ### 1) 应用进程（`config.py` / `start_app.sh`）
 
-| 变量 | 含义 | 默认或未设时 |
-|------|------|----------------|
-| `PORT` | HTTP 端口 | `5000`（`start_app.sh` 与 `app.py` 回退一致） |
-| `LOCAL_MODELS_PATH` | 基座模型根目录（前端列表、路径解析） | 代码默认 `/home/a/ServiceEndFiles/Models`；**新机务必设为实际路径**；`start_app.sh` 在未设置时也会导出同一默认（建议改为仅依赖环境或删除硬编码） |
-| `MERGEKIT_MODEL_POOL` | 融合模型池目录 | 未设时为「项目上级」`mergeKit/models_pool` 的规范化绝对路径 |
-| `DATABASE_URL` | SQLAlchemy 连接串 | 未设时为 `sqlite:///<PROJECT_ROOT>/app.db` |
-| `MERGENETIC_PYTHON` | 调用 mergenetic/子进程用的 Python | 未设时尝试固定 conda 路径，不存在则 `python`；`start_app.sh` 在激活 `mergenetic` 后会设为当前 `which python` |
-| `MERGEKIT_EVAL_HF_CACHE` | lm_eval 所用 HF 数据集缓存 | 未设为项目内 `cache/eval_datasets` |
-| `HF_DATASETS_CACHE` | HuggingFace `datasets` 缓存 | 未设为项目内 `cache/datasets` |
-| `VLM_SEARCH_DIR` | **可选**。进化算法默认已内置在 `evolution/vendor/vlm_merge`；仅在外置/对比调试时设此变量指向其他目录 | 不设则走内置；旧部署可继续指向 `modelmerge_visual/.../VLM_merge` |
-| `MERGEKIT_EVOLUTION_LEGACY_BRIDGE` | 为 `1`/`true`/`yes` 时子进程入口改为 `scripts/run_vlm_search_bridge.py` | 默认关闭，使用 `python -m evolution.runner` |
-| `NUMEXPR_MAX_THREADS` | numexpr 线程数 | 由 `Config.setup_environment` 设为 `64`（类内常量，非环境变量读取） |
-| `HF_ENDPOINT` | HuggingFace 端点 | 代码默认 `https://hf-mirror.com`，`setup_environment` 会写入 `os.environ` |
+
+| 变量                                 | 含义                                                                  | 默认或未设时                                                                                             |
+| ---------------------------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `PORT`                             | HTTP 端口                                                             | `5000`（`start_app.sh` 与历史 `app.py.legacy` 回退一致）                                                    |
+| `LOCAL_MODELS_PATH`                | 基座模型根目录（前端列表、路径解析）                                                  | 代码默认 `/home/a/ServiceEndFiles/Models`；**新机务必设为实际路径**；`start_app.sh` 在未设置时也会导出同一默认（建议改为仅依赖环境或删除硬编码） |
+| `MERGEKIT_MODEL_POOL`              | 融合模型池目录                                                             | 未设时为「项目上级」`mergeKit/models_pool` 的规范化绝对路径                                                          |
+| `DATABASE_URL`                     | SQLAlchemy 连接串                                                      | 未设时为 `sqlite:///<PROJECT_ROOT>/app.db`                                                             |
+| `MERGENETIC_PYTHON`                | 调用 mergenetic/子进程用的 Python                                          | 未设时尝试固定 conda 路径，不存在则 `python`；`start_app.sh` 在激活 `mergenetic` 后会设为当前 `which python`               |
+| `MERGEKIT_EVAL_HF_CACHE`           | lm_eval 所用 HF 数据集缓存                                                 | 未设为项目内 `cache/eval_datasets`                                                                       |
+| `HF_DATASETS_CACHE`                | HuggingFace `datasets` 缓存                                           | 未设为项目内 `cache/datasets`                                                                            |
+| `VLM_SEARCH_DIR`                   | **可选**。进化算法默认已内置在 `evolution/vendor/vlm_merge`；仅在外置/对比调试时设此变量指向其他目录 | 不设则走内置；旧部署可继续指向 `modelmerge_visual/.../VLM_merge`                                                  |
+| `MERGEKIT_EVOLUTION_LEGACY_BRIDGE` | 为 `1`/`true`/`yes` 时子进程入口改为 `scripts/run_vlm_search_bridge.py`      | 默认关闭，使用 `python -m evolution.runner`                                                               |
+| `NUMEXPR_MAX_THREADS`              | numexpr 线程数                                                         | 由 `Config.setup_environment` 设为 `64`（类内常量，非环境变量读取）                                                 |
+| `HF_ENDPOINT`                      | HuggingFace 端点                                                      | 代码默认 `https://hf-mirror.com`，`setup_environment` 会写入 `os.environ`                                  |
+
 
 以下路径**无单独环境变量**，默认相对 `mergeKit_beta`（`PROJECT_ROOT`）：`merges/`、`logs/merge/`、`testset_repo/`、`recipes/`、`cache/`。
 
@@ -81,41 +83,81 @@
 
 容器内环境（`environment`）：
 
-| 变量 | compose 中示例值 | 说明 |
-|------|------------------|------|
-| `PORT` | `5000` | 与端口映射一致 |
-| `LOCAL_MODELS_PATH` | `/data/Models` | 需与卷挂载一致 |
-| `MERGEKIT_MODEL_POOL` | `/data/models_pool` | 需与卷挂载一致 |
-| `DATABASE_URL` | `${DATABASE_URL:-}` | 空则走容器内默认 SQLite 路径；生产可注入 PostgreSQL 等 |
-| `VLM_SEARCH_DIR` | `${VLM_SEARCH_DIR:-}` | 进化融合必填时挂载脚本树或显式设置 |
-| `HF_DATASETS_CACHE` | `/data/hf_datasets` | 建议持久化卷或大盘路径 |
-| `MERGEKIT_EVAL_HF_CACHE` | `/data/eval_datasets` | 评测数据集缓存 |
+
+| 变量                       | compose 中示例值          | 说明                                    |
+| ------------------------ | --------------------- | ------------------------------------- |
+| `PORT`                   | `5000`                | 与端口映射一致                               |
+| `LOCAL_MODELS_PATH`      | `/data/Models`        | 需与卷挂载一致                               |
+| `MERGEKIT_MODEL_POOL`    | `/data/models_pool`   | 需与卷挂载一致                               |
+| `DATABASE_URL`           | `${DATABASE_URL:-}`   | 空则走容器内默认 SQLite 路径；生产可注入 PostgreSQL 等 |
+| `VLM_SEARCH_DIR`         | `${VLM_SEARCH_DIR:-}` | 进化融合必填时挂载脚本树或显式设置                     |
+| `HF_DATASETS_CACHE`      | `/data/hf_datasets`   | 建议持久化卷或大盘路径                           |
+| `MERGEKIT_EVAL_HF_CACHE` | `/data/eval_datasets` | 评测数据集缓存                               |
+
+**text 进化融合（vLLM 张量并行 + Ray）** 相关（`evolution/vendor/vlm_merge/run_vlm_search.py`，由 `evolution.runner` 子进程拉起；**不**影响 Flask 主进程与 `merge_manager` 的 lm_eval 路径）：
+
+| 变量 | 说明 |
+|------|------|
+| `MERGEKIT_VLLM_TP_SUBPROCESS` | 默认等价开启：`TP>1` 时每轮 vLLM 评测在**独立子进程**执行，避免同 Ray actor 内第二轮 `LLM()` 触发 c10d/TCPStore 长时间卡住。设为 `0`/`false`/`off` 可回滚为**进程内** vLLM（仍有已知第二轮风险，仅建议排障对比）。 |
+| `MERGEKIT_VLLM_SUBPROCESS_TIMEOUT_S` | 子进程评测超时秒数，默认 `1200`；超时将抛错并可触发既有 `_eval_with_fallback` 降级 transformers。 |
+| `MERGEKIT_RAY_SINGLE_NODE_LOOPBACK` | 为 `1` 时 `ray.init` 使用 `_node_ip_address=127.0.0.1`（**仅单机 Docker**）。**多机 Ray 集群勿开**。 |
+| `MERGEKIT_RAY_NODE_IP_ADDRESS` | 显式指定 Ray 节点 IP（多机或自定义网络时优先于 loopback）。 |
+| `MERGEKIT_RAY_POOL_RUNTIME_ENV` | 为 `1` 时 Ray `Pool` 的 `runtime_env` 注入 `GLOO_SOCKET_IFNAME=lo`（可选补充，与子进程方案独立）。 |
+| `MERGEKIT_VLLM_TP_SERIALIZE` | 已有：为 `1` 时 TP>1 下仅 1 个 Ray worker，串行 eval（稳定性兜底）。 |
+| `MERGEKIT_VLLM_ENABLE` / `MERGEKIT_EVOLUTION_TP2` | 已有：关 vLLM 或关进化侧 TP2 时的深度降级。 |
+| `MERGEKIT_EVOLUTION_MIN_FREE_GB` | 进化 Runner 选 TP、**以及** TP=1 时 Ray 并行裁剪（见下）共用的「单卡空闲显存下限」GiB；未设时回退 `MERGEKIT_EVAL_MIN_FREE_GB`，再默认 `12`。 |
+| `MERGEKIT_MAX_TASK_DURATION_S` | 全局任务墙钟上限（秒），由 `config.Config` 读入；Runner 用 **monotonic** 计时，超时会 terminate 子进程。Compose 侧可设为多天以适配长跑（见仓库根 `docker-compose.yml` / `.env`）。 |
+
+**Ray 并行显存裁剪（`evolution/runner.py`，给其他 Agent）**：当 `tp_size=1` 且 `ray_num_gpus>1` 时，Runner 不再假设「任意 N 张卡都能各跑一个 worker」。会统计空闲 ≥ `MERGEKIT_EVOLUTION_MIN_FREE_GB` 的卡数，将 **`--ray-num-gpus` 降为 min(请求, 达标数)**，并在必要时仅向子进程暴露达标卡（`CUDA_VISIBLE_DEVICES`），避免在余量不足的 GPU 上调度导致 OOM。详见 [`evolution/contracts.md`](evolution/contracts.md) 中「Ray 并行度与显存」一节；`metadata.json` 中可查 `ray_num_gpus_effective`、`evolution_cuda_visible_devices`、`ray_cap_reason`。
+
+**进度单写者（方案 B）**：Runner 向子进程注入 `MERGEKIT_RUNNER_OWNS_PROGRESS=1`，`run_vlm_search.py` 不再覆盖 `progress.json`，仅可选写 `progress_mergenetic_debug.json`，避免 Ray worker 局部 `step` 冲掉前端/API 的全局步数。见 `contracts.md`「进度文件」。
+
+`start_app.sh` 与 **`MERGEKIT_DOCKER_HOSTS_LOOPBACK_FIX`**（及 `MERGEKIT_RAY_SINGLE_NODE_LOOPBACK` 联动）见下文「容器内 `/etc/hosts` 可选修复」。
+
+> 安全提示：`HF_TOKEN` 等凭据**禁止**写入版本库默认值。需要访问私有仓库或避免限流时，请在宿主机环境或 `.env` 文件注入，并确保不提交到 Git。
+
+#### 容器内 `/etc/hosts` 可选修复（hostname → 127.0.0.1）
+
+`start_app.sh` 仅在以下条件之一成立且**未**显式 `MERGEKIT_DOCKER_HOSTS_LOOPBACK_FIX=0` 时改写 `/etc/hosts`（去掉原 hostname 映射再追加 `127.0.0.1 <hostname>`）：
+
+- `MERGEKIT_DOCKER_HOSTS_LOOPBACK_FIX=1`，或
+- `MERGEKIT_RAY_SINGLE_NODE_LOOPBACK=1`（与单机 loopback 联动）。
+
+默认不开启上述变量时**不改** `/etc/hosts`，避免多机场景误伤。
+
 
 宿主机侧卷变量（`volumes`，均在 **Workspaces** 目录下解析）：
 
-| 变量 | 默认 | 挂载到容器 |
-|------|------|------------|
-| `HOST_MODELS` | `../Models` | `:/data/Models:ro` |
-| `HOST_MODEL_POOL` | `../mergeKit/models_pool` | `:/data/models_pool` |
-| `HOST_PACKAGES` | `../Packages` | `:/app/ServiceEndFiles/Packages:ro` |
-| `HOST_MERGES` | `./mergeKit_beta/merges` | 融合输出 |
-| `HOST_APP_DB` | `./mergeKit_beta/app.db` | **必须为文件**；不存在先 `touch` |
 
-GPU：`gpus: all`，宿主机需 **nvidia-container-toolkit**。
+| 变量                | 默认                        | 挂载到容器                               |
+| ----------------- | ------------------------- | ----------------------------------- |
+| `HOST_MODELS`     | `../Models`               | `:/data/Models:ro`                  |
+| `HOST_MODEL_POOL` | `../mergeKit/models_pool` | `:/data/models_pool`                |
+| `HOST_PACKAGES`   | `../Packages`             | `:/app/ServiceEndFiles/Packages:ro` |
+| `HOST_MERGES`     | `./mergeKit_beta/merges`  | 融合输出                                |
+
+
+`**app.db`**：随目录卷 `./mergeKit_beta` 一并挂载，**不再**使用单独的 `HOST_APP_DB` 文件挂载（避免与目录挂载冲突产生 0-byte 宿主文件）。
+
+GPU：**docker-compose v1** 需在 `docker-compose.yml` 中设置 `runtime: nvidia` 与 `NVIDIA_VISIBLE_DEVICES=all`；宿主机需 **nvidia-container-toolkit**。`deploy.resources` 仅 compose v2+ 生效。
 
 ### 3) 规划项（文档已描述，代码尚未统一读取）
 
-| 变量 | 用途 |
-|------|------|
-| `WORKER_TASK_TYPES` | 双 worker / 双机任务分片（逗号分隔任务类型），见上文「单机双 worker 与双集群」 |
-| `CUDA_VISIBLE_DEVICES` | 多卡机器上为不同进程绑定 GPU（shell 或 systemd 环境） |
+
+| 变量                     | 用途                                               |
+| ---------------------- | ------------------------------------------------ |
+| `WORKER_TASK_TYPES`    | 双 worker / 双机任务分片（逗号分隔任务类型），见上文「单机双 worker 与双集群」 |
+| `CUDA_VISIBLE_DEVICES` | 多卡机器上为不同进程绑定 GPU（shell 或 systemd 环境）             |
+
 
 ### 4) 不建议纳入版本库的运行时文件
 
-| 路径/文件 | 说明 |
-|-----------|------|
+
+| 路径/文件                                       | 说明                                  |
+| ------------------------------------------- | ----------------------------------- |
 | `mergeKit_beta/model_repo/data/models.json` | 常含本机绝对路径与目录快照，宜 `.gitignore` 或仅本地保留 |
-| `mergeKit_beta/app.db` | 运行时库；迁移用拷贝或 `DATABASE_URL` 指向外部库 |
+| `mergeKit_beta/app.db`                      | 运行时库；迁移用拷贝或 `DATABASE_URL` 指向外部库    |
+
 
 ---
 
@@ -128,7 +170,9 @@ GPU：`gpus: all`，宿主机需 **nvidia-container-toolkit**。
 
 ### 1) 进化算法路径
 
-默认使用仓内 **`evolution/vendor/vlm_merge/run_vlm_search.py`**（与 `evolution.runner` 配套）。若需改用外置副本，设置 **`VLM_SEARCH_DIR`**；依赖环境仍为 **mergenetic / Ray / pymoo / torch** 等与算法一致。
+默认使用仓内 `**evolution/vendor/vlm_merge/run_vlm_search.py`**（与 `evolution.runner` 配套）。若需改用外置副本，设置 `**VLM_SEARCH_DIR**`；依赖环境仍为 **mergenetic / Ray / pymoo / torch / vLLM** 等与算法一致。
+
+**text 模式 + `MERGEKIT_EVOLUTION_TP2` + vLLM `tensor_parallel_size>1`**：默认每轮评测通过子进程执行 vLLM（`MERGEKIT_VLLM_TP_SUBPROCESS`，见「最终环境参数清单」Docker 小节表格）；总墙钟会因重复加载合并模型而增加，但可避免 Docker+Ray 下第二轮评测 c10d/TCPStore 卡死。**单机 Docker** 建议在 compose 中增加 `MERGEKIT_RAY_SINGLE_NODE_LOOPBACK=1`（并视需要 `MERGEKIT_DOCKER_HOSTS_LOOPBACK_FIX=1`）；**多机 Ray** 勿开 loopback，改用 `MERGEKIT_RAY_NODE_IP_ADDRESS` 等。**禁止**在 Flask 或 `merge_manager` 顶层全局设置 `MASTER_ADDR`/`MASTER_PORT`（与评测子进程隔离约定一致）。
 
 ### 2) 数据一致性约定
 
@@ -141,7 +185,7 @@ GPU：`gpus: all`，宿主机需 **nvidia-container-toolkit**。
 - 文档漂移：通过精简文档与单一规范修复
 - 双写偏差：以 DB 为主源治理，文件作为回退
 - 入口分叉：统一到 `start_app.sh` + `create_app()`
-- 扩展边界：新增或修改功能仅进入 `app/` 模块体系（routes/services/repositories 等），禁止在 `app.py` 增加新路由或业务逻辑；`app.py` 仅保留兼容回退
+- 扩展边界：新增或修改功能仅进入 `app/` 模块体系（routes/services/repositories 等），禁止在 `app.py.legacy` 增加新路由或业务逻辑
 
 ### 4) 模型兼容性说明（融合前）
 
@@ -178,7 +222,7 @@ GPU：`gpus: all`，宿主机需 **nvidia-container-toolkit**。
 以下为短期/中期/后期开发的操作级参考，具体以 ROADMAP 与当前分支为准。
 
 - **短期 1.1（/api/status DB 优先）**：在 `app/repositories/__init__.py` 新增 `task_get_by_id(task_id)`；在 `app/routes.py` 的 `get_status` 中当任务不在内存时先查 DB，用 Task 组 JSON 并可选以 `status_from_disk` 补 result/evolution_progress/eval_progress。
-- **短期 1.2（不在 app.py 扩展）**：见上文风险控制「扩展边界」；可选在 `app.py` 文件头注释注明仅兼容回退。
+- **短期 1.2（不在 app.py.legacy 扩展）**：见上文风险控制「扩展边界」。
 - **短期 3.1/3.2（可追踪与日志）**：见上文「可追踪与日志」；在 `app/services.py` 的 worker 相关 except 与 logger 中补全 task_id/model_id/testset_id。
 - **中期（单机双 worker / 双集群）**：见下节「单机双 worker 与双集群」；实现 `task_claim_next(worker_task_types)`、tasks 表 `priority_order`、提交时必写 DB、Worker 按 `WORKER_TASK_TYPES` 从 DB 消费，单机可起两线程分别跑融合类型与 eval_only。
 - **后期（新服务器迁移）**：见下节「新服务器迁移与部署」。
@@ -220,7 +264,7 @@ GPU：`gpus: all`，宿主机需 **nvidia-container-toolkit**。
   - **建议先在当前开发机**完成 `environment.yml` 导出、`Dockerfile` / `.dockerignore`（及可选 compose）编写，并在本机 `docker build` 做一次冒烟，再迁到新服务器；详见 Cursor 计划「Docker 整仓迁移方案」§0（当前设备先行与 Git）。
   - 在新机安装 Docker 与 nvidia-container-toolkit，在 `Workspaces` 根目录构建：`docker build -f mergeKit_beta/Dockerfile -t mergekit-beta .` 或 `docker compose build`。
   - 同步 `Models/`、`merges/`、`app.db`、`testset_repo/`、`recipes/` 至新机指定路径，通过 `-v` 或 docker-compose `volumes` 挂载到容器内。
-  - **`app.db` 挂载注意**：`HOST_APP_DB` 对应宿主机路径必须是「文件」，不能是目录；若文件不存在，先执行 `touch ./mergeKit_beta/app.db`。若历史上误挂载成目录（如 `./mergeKit_beta/app.db/`），需先 `docker compose down`，再 `rm -rf ./mergeKit_beta/app.db && touch ./mergeKit_beta/app.db`，否则容器内 SQLite 会报 `unable to open database file` 或 `no such table`。
+  - `**app.db`**：位于 bind mount 的 `mergeKit_beta/` 目录下，由应用创建/写入；迁移前可复制整个 `app.db` 或从容器 `docker cp` 导出。
   - 使用 `docker run --gpus all -p 5000:5000 ... mergekit-beta` 或 `docker compose up` 启动，验证 Web 与融合/评估任务是否正常。
   - 日常开发仍按照上文「新服务器迁移与部署」在宿主机激活 `mergenetic` 环境并运行 `./start_app.sh`；需要对比或复现时，使用基于同一 `environment.yml` 构建的 Docker 镜像启动服务。
 - **Git 版本管理**：强烈建议将代码与 `environment.yml`、Docker 相关文件纳入 Git，大目录（Models、大体量 Datasets、日志、缓存、`.env` 等）用 `.gitignore` 排除；便于新机 `git clone` 与回滚。Docker 构建不依赖 Git，但迁移与协作强烈依赖版本管理。
@@ -244,13 +288,17 @@ curl -s http://127.0.0.1:5000/api/history
 
 ## 文档变更历史
 
-| 日期       | 变更摘要 |
-|------------|----------|
+
+| 日期         | 变更摘要                                                                                                                                                                                                                                                              |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 2025-03-04 | DB 主源收敛：Phase A–E 落地（TestSet/EvaluationResult/Task/Model 双写消除或补全，metadata 统一写入，基座模型启动扫描，一致性校验与回填脚本）；测试集补全逻辑（读列表/写评测时从文件或 EvaluationResult 补全并回写）；数据层能力中补充脚本 `check_db_file_consistency.py`、`backfill_db_from_files.py` 说明；Navicat 连接文档新增外网映射、Y: 盘、Samba、方案二及变更历史。 |
-| 2025-03-04 | 新增「应用启动与外网访问」「可追踪与日志」「开发步骤细化（参考）」「单机双 worker 与双集群」「新服务器迁移与部署」「Docker 构建与迁移到新服务器」；风险控制中增加扩展边界（不在 app.py 扩展）；迁移与 Docker 章节强调以 environment.yml 作为统一环境标准。 |
-| 2025-03-10 | 目标新服务器内存更正为 128GB；Docker 小节补充目标机硬件摘要；双 worker 场景下 eval 并发建议改为按负载与内存观察调整。 |
-| 2025-03-10 | Docker 小节补充：建议当前设备先行构建冒烟、Git 与 `.gitignore` 约定；与 Docker 整仓迁移方案 §0 对齐。 |
-| 2025-03-10 | Docker：`Dockerfile` 位于 `mergeKit_beta/`，构建上下文切为 `Workspaces`；仓库根增加 `docker-compose.yml` 与 `.dockerignore`；`Packages` 改为运行时挂载；`modelmerge_visual` 缺失时镜像内仅占位目录，进化融合需挂载或 `VLM_SEARCH_DIR`。 |
-| 2026-03-04 | 根目录 `.gitignore` 增加 `EnterpriseQuestionAnsweringSystem/`；新增「最终环境参数清单」（应用环境变量、Compose 宿主机变量、规划项、勿提交运行时文件）。 |
-| 2026-03-30 | 新增人机共用开发规则：`.cursor/rules/` 下 `RULES_INDEX`、`ARCHITECTURE_BOUNDARIES`、`WORKFLOW_AND_GIT`、`AI_COLLABORATION`（含「95% 把握前须追问」）；DEVELOPMENT 增加「开发与协作规则」摘要与索引。 |
-| 此前       | 端口统一 5000；文档收敛为 README/DEVELOPMENT/ROADMAP；lm_eval 0.4.11 + transformers 5.3.0 升级与适配。 |
+| 2025-03-04 | 新增「应用启动与外网访问」「可追踪与日志」「开发步骤细化（参考）」「单机双 worker 与双集群」「新服务器迁移与部署」「Docker 构建与迁移到新服务器」；风险控制中增加扩展边界（不在 app.py 扩展）；迁移与 Docker 章节强调以 environment.yml 作为统一环境标准。                                                                                                             |
+| 2025-03-10 | 目标新服务器内存更正为 128GB；Docker 小节补充目标机硬件摘要；双 worker 场景下 eval 并发建议改为按负载与内存观察调整。                                                                                                                                                                                          |
+| 2025-03-10 | Docker 小节补充：建议当前设备先行构建冒烟、Git 与 `.gitignore` 约定；与 Docker 整仓迁移方案 §0 对齐。                                                                                                                                                                                             |
+| 2025-03-10 | Docker：`Dockerfile` 位于 `mergeKit_beta/`，构建上下文切为 `Workspaces`；仓库根增加 `docker-compose.yml` 与 `.dockerignore`；`Packages` 改为运行时挂载；`modelmerge_visual` 缺失时镜像内仅占位目录，进化融合需挂载或 `VLM_SEARCH_DIR`。                                                                           |
+| 2026-03-04 | 根目录 `.gitignore` 增加 `EnterpriseQuestionAnsweringSystem/`；新增「最终环境参数清单」（应用环境变量、Compose 宿主机变量、规划项、勿提交运行时文件）。                                                                                                                                                         |
+| 2026-03-30 | 新增人机共用开发规则：`.cursor/rules/` 下 `RULES_INDEX`、`ARCHITECTURE_BOUNDARIES`、`WORKFLOW_AND_GIT`、`AI_COLLABORATION`（含「95% 把握前须追问」）；DEVELOPMENT 增加「开发与协作规则」摘要与索引。                                                                                                          |
+| 2026-04-04 | Docker：`docker-compose.yml` 增加 `runtime: nvidia` 与 `NVIDIA_VISIBLE_DEVICES`；移除单独 `app.db` 文件卷；单体入口重命名为 `app.py.legacy`；Compose 宿主机变量表更新。                                                                                                                          |
+| 此前         | 端口统一 5000；文档收敛为 README/DEVELOPMENT/ROADMAP；lm_eval 0.4.11 + transformers 5.3.0 升级与适配。                                                                                                                                                                             |
+
+

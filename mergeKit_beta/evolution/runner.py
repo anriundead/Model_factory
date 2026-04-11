@@ -7,6 +7,7 @@
 成功后将输出命名为「父模型1_父模型2_结束时间戳」，并写入 fusion_info.json 与 README.md。
 """
 import argparse
+import csv as csv_std
 import json
 import logging
 import os
@@ -49,6 +50,321 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("evolution.runner")
+
+def _lock_file(path: str, timeout_s: int, log: logging.Logger):
+    """
+    任务级 GPU 锁：避免同一容器内多个 GPU 重任务并发互相挤占。
+    只约束本容器内任务；无法约束宿主机常驻进程（如 ollama），因此仍需显存阈值筛选。
+    """
+    import time
+    import fcntl
+
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    f = open(path, "w", encoding="utf-8")
+    deadline = time.time() + max(0, int(timeout_s))
+    while True:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            f.write(str(os.getpid()))
+            f.flush()
+            log.debug("GPU 锁持有 PID=%s path=%s", os.getpid(), path)
+            return f
+        except BlockingIOError:
+            if time.time() >= deadline:
+                f.close()
+                raise TimeoutError(f"GPU 锁等待超时: {path}")
+            time.sleep(0.5)
+
+
+def _pick_tp2_pairs_or_fallback(log: logging.Logger) -> tuple[list[tuple[int, int]], str]:
+    """
+    选择可用的 NVLink 卡对；若不足两对，则降级为 1 对（TP=2 单 actor）；若都不可用则返回空。
+    """
+    from core.gpu_topology import env_int, parse_nvlink_pairs, select_free_pairs
+
+    topo = (os.environ.get("MERGEKIT_EVOLUTION_TOPOLOGY") or os.environ.get("MERGEKIT_TOPOLOGY") or "01,23").strip()
+    min_free_gb = env_int("MERGEKIT_EVOLUTION_MIN_FREE_GB", 12)
+    min_free_mib = int(min_free_gb * 1024)
+    try:
+        pairs = parse_nvlink_pairs(topo)
+    except Exception as e:
+        log.warning("拓扑配置无效（%s），回退默认 01,23: %s", topo, e)
+        pairs = [(0, 1), (2, 3)]
+
+    ok = select_free_pairs(pairs=pairs, min_free_mib=min_free_mib)
+    if len(ok) >= 2:
+        return ok[:2], f"选用 2 对卡对（TP=2 x2 actor），min_free={min_free_gb}GiB topo={topo}"
+    if len(ok) == 1:
+        return ok, f"仅 1 对卡对满足空闲显存阈值，降级为 TP=2 x1 actor，min_free={min_free_gb}GiB topo={topo}"
+    return [], f"无卡对满足空闲显存阈值，min_free={min_free_gb}GiB topo={topo}"
+
+
+def _write_metadata_safe(task_id: str, task_dir: str, meta: dict, log: logging.Logger) -> None:
+    """尽量用 merge_manager._write_metadata 写回；失败则直接覆盖 metadata.json。"""
+    meta_path = os.path.join(task_dir, "metadata.json")
+    try:
+        from merge_manager import _write_metadata  # type: ignore
+
+        _write_metadata(task_id, task_dir, meta)
+        return
+    except Exception as e:
+        log.debug("merge_manager._write_metadata 不可用，改用直接写文件: %s", e)
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("写回 metadata.json 失败（可忽略，但将影响可复现性）: %s", e)
+
+
+def _parse_cuda_visible_devices() -> list[int] | None:
+    v = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    if not v:
+        return None
+    out: list[int] = []
+    for tok in v.split(","):
+        t = tok.strip()
+        if not t:
+            continue
+        try:
+            out.append(int(t))
+        except ValueError:
+            return None
+    return out or None
+
+
+def _decide_tp_and_batch(
+    *,
+    meta: dict,
+    log: logging.Logger,
+) -> tuple[int, list[tuple[int, int]], int, dict]:
+    """
+    决策 TP（1/2）与初始 batch_size。
+
+    约定：MERGEKIT_EVOLUTION_TP2=auto|1|0
+    - auto（默认）：基于显存余量选择 TP=1（优先并行）；不满足则尝试 TP=2；仍不满足则 TP=1 + 降 batch。
+    - 1：强制 TP=2
+    - 0：强制 TP=1
+
+    返回：(tp_size, chosen_pairs, batch_size_initial, decision_meta_patch)
+    """
+    from core.gpu_topology import env_int, query_gpus
+
+    # 阈值：优先 MERGEKIT_EVOLUTION_MIN_FREE_GB，其次 MERGEKIT_EVAL_MIN_FREE_GB，最后默认 12GiB
+    min_free_gb = env_int("MERGEKIT_EVOLUTION_MIN_FREE_GB", env_int("MERGEKIT_EVAL_MIN_FREE_GB", 12))
+    vis = _parse_cuda_visible_devices()
+    gpus = query_gpus()
+    if vis is not None:
+        gpus = [g for g in gpus if g.index in set(vis)]
+    free_gib = [round(g.mem_free_mib / 1024.0, 2) for g in gpus]
+    has_single_ok = any(g.mem_free_mib >= int(min_free_gb * 1024) for g in gpus)
+
+    tp2_switch = (os.environ.get("MERGEKIT_EVOLUTION_TP2") or "auto").strip().lower()
+    if tp2_switch in ("1", "true", "yes", "on"):
+        tp2_mode = "forced_on"
+    elif tp2_switch in ("0", "false", "no", "off"):
+        tp2_mode = "forced_off"
+    else:
+        tp2_mode = "auto"
+
+    # 默认 batch（允许 metadata 里指定；否则与 run_vlm_search 当前默认保持一致）
+    batch_size = int(meta.get("batch_size") or 4)
+    batch_size = max(1, batch_size)
+
+    chosen_pairs: list[tuple[int, int]] = []
+    tp_size = 1
+    reason = "single_gpu_has_enough_vram" if has_single_ok else "low_free_vram"
+
+    if tp2_mode == "forced_on":
+        chosen_pairs, _ = _pick_tp2_pairs_or_fallback(log)
+        tp_size = 2 if chosen_pairs else 1
+        reason = "forced_tp2" if chosen_pairs else "forced_tp2_but_no_pairs"
+    elif tp2_mode == "forced_off":
+        tp_size = 1
+        chosen_pairs = []
+        reason = "forced_tp1"
+        if not has_single_ok:
+            # 按计划：单卡显存不足时，仅降 batch 继续任务
+            batch_size = min(batch_size, 2)
+            reason = "batch_reduced_due_to_low_free"
+    else:
+        # auto：优先 TP=1（最大化并行）；显存不足再尝试 TP=2
+        if has_single_ok:
+            tp_size = 1
+            chosen_pairs = []
+            reason = "single_gpu_has_enough_vram"
+        else:
+            chosen_pairs, _ = _pick_tp2_pairs_or_fallback(log)
+            if chosen_pairs:
+                tp_size = 2
+                reason = "fallback_to_tp2_due_to_low_free"
+            else:
+                tp_size = 1
+                chosen_pairs = []
+                batch_size = min(batch_size, 2)
+                reason = "batch_reduced_due_to_low_free"
+
+    patch = {
+        "evolution_tp2_mode": tp2_mode,
+        "chosen_tp_size": int(tp_size),
+        "tp2_pairs": ";".join(f"{a},{b}" for a, b in chosen_pairs) if chosen_pairs else "",
+        "gpu_free_gib_snapshot": free_gib,
+        "tp_decision_reason": reason,
+        "eval_batch_size_initial": int(batch_size),
+    }
+    return tp_size, chosen_pairs, batch_size, patch
+
+
+def _cap_ray_num_gpus_for_parallel_eval(
+    *,
+    ray_num_gpus: int,
+    tp_size: int,
+    log: logging.Logger,
+) -> tuple[int, str | None, dict]:
+    """
+    TP=1 且多 worker 并行时：仅「空闲显存 >= min_free_gb」的卡才应承接 Ray worker。
+    否则会出现「请求 4 并行但 0/1 号卡仅 ~10GiB 空闲」仍被调度，进而在 merge+eval 时 OOM。
+
+    返回：(effective_ray_num_gpus, 子进程 CUDA_VISIBLE_DEVICES 或 None, 写入 metadata 的补丁 dict)
+    """
+    from core.gpu_topology import env_int, query_gpus
+
+    patch: dict = {}
+    if tp_size != 1 or ray_num_gpus <= 1:
+        return ray_num_gpus, None, patch
+
+    min_free_gb = env_int("MERGEKIT_EVOLUTION_MIN_FREE_GB", env_int("MERGEKIT_EVAL_MIN_FREE_GB", 12))
+    min_mib = int(min_free_gb * 1024)
+    vis = _parse_cuda_visible_devices()
+    try:
+        gpus = query_gpus()
+    except Exception as e:
+        log.warning("[ray] query_gpus 失败，跳过 ray 并行数裁剪: %s", e)
+        return ray_num_gpus, None, patch
+    if vis is not None:
+        gpus = [g for g in gpus if g.index in set(vis)]
+    if not gpus:
+        return ray_num_gpus, None, patch
+
+    eligible = sorted([g for g in gpus if g.mem_free_mib >= min_mib], key=lambda g: -g.mem_free_mib)
+    if not eligible:
+        log.warning(
+            "[ray] 无 GPU 满足空闲 >= %s GiB，将 ray_num_gpus %s 降为 1",
+            min_free_gb,
+            ray_num_gpus,
+        )
+        patch["ray_num_gpus_effective"] = 1
+        patch["ray_cap_reason"] = "no_gpu_meets_min_free"
+        return 1, None, patch
+
+    eff = min(ray_num_gpus, len(eligible))
+    picked = eligible[:eff]
+    subset_needed = len(eligible) < len(gpus) or eff < ray_num_gpus
+    if not subset_needed:
+        return eff, None, patch
+
+    cvd = ",".join(str(g.index) for g in picked)
+    log.warning(
+        "[ray] 空闲>=%s GiB 的卡 %s/%s 张；ray_num_gpus %s -> %s；子进程 CUDA_VISIBLE_DEVICES=%s",
+        min_free_gb,
+        len(eligible),
+        len(gpus),
+        ray_num_gpus,
+        eff,
+        cvd,
+    )
+    patch["ray_num_gpus_effective"] = eff
+    patch["evolution_cuda_visible_devices"] = cvd
+    patch["ray_cap_reason"] = "vram_eligible_subset"
+    return eff, cvd, patch
+
+
+def _count_evolution_csv_data_rows(csv_path: str) -> int:
+    """统计 evolution_stream CSV 的数据行数（不含表头）。"""
+    if not os.path.isfile(csv_path):
+        return 0
+    try:
+        with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
+            r = csv_std.reader(f)
+            next(r, None)  # header
+            return sum(1 for _ in r)
+    except Exception:
+        return 0
+
+
+def _rebuild_evolution_csv_from_log(
+    subprocess_log_path: str,
+    csv_path: str,
+    log: logging.Logger,
+) -> int:
+    """
+    从 subprocess_output.log 解析 [eval] 行重写 evolution_stream.csv，
+    与主循环中 generation 检测逻辑保持一致。
+    """
+    eval_pat = re.compile(
+        r"\[eval\]\s+step=(\d+)\s+acc=([\d.]+)(?:\s+best_acc=([\d.]+))?"
+    )
+    geno_pat = re.compile(r"genotype=\[([\d.,\s\-eE+]+)\]")
+    if not os.path.isfile(subprocess_log_path):
+        log.warning("无法从日志重建 CSV：日志不存在 %s", subprocess_log_path)
+        return 0
+    try:
+        with open(subprocess_log_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except Exception as e:
+        log.warning("读取子进程日志失败，无法重建 CSV: %s", e)
+        return 0
+
+    eval_count = 0
+    max_acc_seen = 0.0
+    current_gen = 0
+    prev_within_gen_step = 0
+    rows_out: list[list] = []
+
+    for line in lines:
+        m = eval_pat.search(line)
+        if not m:
+            continue
+        within_gen_step = int(m.group(1))
+        acc_val = float(m.group(2))
+        best_acc_val = float(m.group(3)) if m.group(3) else acc_val
+
+        if within_gen_step <= prev_within_gen_step and eval_count > 0:
+            current_gen += 1
+        elif eval_count == 0:
+            current_gen = 1
+        prev_within_gen_step = within_gen_step
+
+        eval_count += 1
+        max_acc_seen = max(max_acc_seen, acc_val, best_acc_val)
+
+        genotype: list[float] = []
+        gm = geno_pat.search(line)
+        if gm:
+            try:
+                genotype = [float(x.strip()) for x in gm.group(1).split(",")]
+            except (ValueError, TypeError):
+                pass
+        g1 = genotype[0] if len(genotype) > 0 else 0.0
+        g2 = genotype[1] if len(genotype) > 1 else 0.0
+        rows_out.append(
+            [eval_count, acc_val, g1, g2, current_gen, max_acc_seen]
+        )
+
+    if not rows_out:
+        log.warning("日志中未解析到 [eval] 行，跳过 CSV 重建")
+        return 0
+
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, "w", newline="", encoding="utf-8") as cf:
+        w = csv_std.writer(cf)
+        w.writerow(
+            ["step", "objective_1", "genotype_1", "genotype_2", "generation", "best_acc"]
+        )
+        for row in rows_out:
+            w.writerow([str(v).replace("\x00", "") for v in row])
+    log.info("已从子进程日志重建 evolution_stream.csv，共 %d 行", len(rows_out))
+    return len(rows_out)
 
 
 class TestsetYamlResolver:
@@ -328,6 +644,7 @@ def main():
     hf_split_final = (meta.get("hf_split_final") or "").strip() or (None if hf_split == "test" else "test")
     pop_size = int(meta.get("pop_size", 20))
     n_iter = int(meta.get("n_iter", 15))
+    max_evals = int(meta.get("max_evals") or 0)
     max_samples = int(meta.get("max_samples", 64))
     dtype = meta.get("dtype") or "bfloat16"
     ray_num_gpus = int(meta.get("ray_num_gpus") or 1)
@@ -344,6 +661,12 @@ def main():
     logger.info("数据集: %s, 子集: %s, 分割: %s, 最终分割: %s", hf_dataset, hf_subsets, hf_split, hf_split_final or "(同训练)")
     logger.info("参数: pop_size=%s, n_iter=%s, max_samples=%s", pop_size, n_iter, max_samples)
     logger.info("精度: %s, GPU并行数: %s", dtype, ray_num_gpus)
+    # max_evals（快测门禁）：为保证“硬上限”严格生效，强制串行评估（Ray 并行会导致 termination 超额调度）
+    if max_evals > 0 and ray_num_gpus > 1:
+        logger.info("[max_evals] max_evals=%s：为保证严格上限，强制 ray_num_gpus=1（串行）", max_evals)
+        ray_num_gpus = 1
+        meta["ray_num_gpus_effective"] = 1
+        _write_metadata_safe(task_id, merge_dir, meta, logger)
     logger.info("输出目录: %s", final_vlm_output)
     logger.info("进度文件: %s", progress_path)
     logger.info("Runner 日志: %s", bridge_log_path)
@@ -410,11 +733,55 @@ def main():
         logger.error("run_vlm_search.py 不存在: %s (可设置 VLM_SEARCH_DIR)", RUN_VLM_SEARCH_PY)
         sys.exit(1)
 
+    # 任务级 GPU 锁（默认启用）：避免同容器并发任务互相挤占显存
+    lock_timeout_s = int(float(os.environ.get("MERGEKIT_GPU_LOCK_TIMEOUT_S", "30") or 30))
+    lock_path = (os.environ.get("MERGEKIT_GPU_LOCK_PATH") or "/tmp/mergekit_gpu.lock").strip()
+    lock_fp = None
+    try:
+        lock_fp = _lock_file(lock_path, lock_timeout_s, logger)
+        logger.info("已获得 GPU 锁: %s", lock_path)
+    except TimeoutError as e:
+        # 不强制失败：按“保证完成”策略继续，但会在 TP2 选择时更可能触发降级
+        logger.warning("GPU 锁获取超时，将继续执行并允许降级: %s", e)
+
     python_cmd = (getattr(Config, "MERGENETIC_PYTHON", None) or "").strip() or "python"
+
+    # TP 策略：MERGEKIT_EVOLUTION_TP2=auto|1|0（默认 auto）
+    tp_size, chosen_pairs, eval_batch_size, decision_patch = _decide_tp_and_batch(meta=meta, log=logger)
+    meta.update(decision_patch)
+    _write_metadata_safe(task_id, merge_dir, meta, logger)
+    logger.info(
+        "[tp] mode=%s tp_size=%s pairs=%s free_gib=%s batch_init=%s reason=%s",
+        meta.get("evolution_tp2_mode"),
+        tp_size,
+        meta.get("tp2_pairs", ""),
+        meta.get("gpu_free_gib_snapshot", []),
+        eval_batch_size,
+        meta.get("tp_decision_reason"),
+    )
+    if tp_size > 1 and chosen_pairs:
+        visible = sorted({i for a, b in chosen_pairs for i in (a, b)})
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in visible)
+        os.environ["MERGEKIT_EVOLUTION_TP2_PAIRS"] = ";".join(f"{a},{b}" for a, b in chosen_pairs)
+        ray_num_gpus = 2 * len(chosen_pairs)
+
+    # TP=1：避免在「未达 min_free_gb」的卡上与用户请求的 ray_num_gpus 叠床架屋导致 OOM（见 feb497dc 类任务）
+    ray_cuda_visible_for_child: str | None = None
+    if tp_size == 1 and ray_num_gpus > 1:
+        new_n, cvd, cap_patch = _cap_ray_num_gpus_for_parallel_eval(
+            ray_num_gpus=ray_num_gpus, tp_size=tp_size, log=logger
+        )
+        ray_num_gpus = new_n
+        ray_cuda_visible_for_child = cvd
+        if cap_patch:
+            meta.update(cap_patch)
+            _write_metadata_safe(task_id, merge_dir, meta, logger)
+
     cmd = [
         python_cmd,
         RUN_VLM_SEARCH_PY,
         "--ray-num-gpus", str(ray_num_gpus),
+        "--tp-size", str(tp_size),
         "--model-paths", *model_paths,
         "--eval-mode", eval_mode,
         "--hf-dataset", hf_dataset,
@@ -432,12 +799,14 @@ def main():
         "--prompt-yaml", prompt_yaml,
         "--pop-size", str(pop_size),
         "--n-iter", str(n_iter),
+        "--max-evals", str(int(meta.get("max_evals") or 0)),
         "--max-samples", str(max_samples),
         "--dtype", dtype,
         "--device", "cuda",
         "--final-vlm-output", final_vlm_output,
         "--progress-file", progress_path,
         "--results-dir", results_dir,
+        "--batch-size", str(eval_batch_size),
     ])
     # 双 split：若指定了最终评测 split，传参给 run_vlm_search（脚本需支持 --hf-split-final 与 --final-acc-file）
     final_acc_file = os.path.join(merge_dir, "final_test_acc.json")
@@ -450,12 +819,21 @@ def main():
     logger.debug("命令: %s", " ".join(cmd))
     logger.info("工作目录: %s", VLM_SEARCH_DIR)
 
-    # 子进程继承当前环境（含 HF_ENDPOINT 镜像、HF_DATASETS_CACHE），便于使用已下载数据集
+    # 子进程环境：继承当前进程 + Config 白名单合并（HF/MERGEKIT/可选 NCCL），避免与 merge_manager 路径混用全局污染
     env = os.environ.copy()
-    if getattr(Config, "HF_ENDPOINT", None):
-        env["HF_ENDPOINT"] = Config.HF_ENDPOINT
-    if getattr(Config, "HF_DATASETS_CACHE", None):
-        env["HF_DATASETS_CACHE"] = Config.HF_DATASETS_CACHE
+    try:
+        patch = Config.evolution_subprocess_env_patch()
+        env.update(patch)
+    except Exception as e:
+        logger.warning("evolution_subprocess_env_patch 失败，回退仅 HF 键: %s", e)
+        if getattr(Config, "HF_ENDPOINT", None):
+            env["HF_ENDPOINT"] = Config.HF_ENDPOINT
+        if getattr(Config, "HF_DATASETS_CACHE", None):
+            env["HF_DATASETS_CACHE"] = Config.HF_DATASETS_CACHE
+    # 由 runner 独占写 merges/<task_id>/progress.json；子进程仅可写 progress_mergenetic_debug.json
+    env["MERGEKIT_RUNNER_OWNS_PROGRESS"] = "1"
+    if ray_cuda_visible_for_child:
+        env["CUDA_VISIBLE_DEVICES"] = ray_cuda_visible_for_child
     try:
         proc = subprocess.Popen(
             cmd,
@@ -496,14 +874,21 @@ def main():
         gen_start_times = {}
         gen_durations = {}
         eval_times = []           # 最近评估耗时，用于 ETA
+        merge_step_times: list[float] = []  # 从子进程 [eval] 行解析出的 merge=..s
+        eval_step_times: list[float] = []   # 从子进程 [eval] 行解析出的 eval=..s
         eval_start_time = None    # 当前评估开始时间
-        start_time = time_module.time()
+        # 子进程读循环起点：超时与 total_task_time 用 monotonic，避免系统时间回拨/校时导致误判
+        task_start_mono = time_module.monotonic()
+        task_duration_limit_s = float(
+            getattr(Config, "MERGEKIT_MAX_TASK_DURATION_S", 14400) or 14400
+        )
         total_expected_steps = max(1, pop_size * n_iter)
 
         # ── 准备 CSV：每步追加，前端/3D 图可用 ──
         csv_dir = os.path.join(merge_dir, "vlm_search_results")
         os.makedirs(csv_dir, exist_ok=True)
-        csv_path = os.path.join(csv_dir, "vlm_search.csv")
+        # 使用独立文件名，避免 mergenetic Searcher 结束时 to_csv(vlm_search.csv) 覆盖流式写入
+        csv_path = os.path.join(csv_dir, "evolution_stream.csv")
         csv_file = open(csv_path, "w", newline="", encoding="utf-8")
         csv_writer = csv_mod.writer(csv_file)
         csv_writer.writerow(["step", "objective_1", "genotype_1", "genotype_2", "generation", "best_acc"])
@@ -524,10 +909,46 @@ def main():
 
         try:
             while True:
+                # 全局超时门禁：防止子进程卡死长期占用 GPU（墙钟用 monotonic，与 MERGEKIT_MAX_TASK_DURATION_S 对齐）
+                elapsed_mono = time_module.monotonic() - task_start_mono
+                if elapsed_mono > task_duration_limit_s:
+                    logger.error(
+                        "任务超时: elapsed=%.1fs > limit=%.0fs，将终止 run_vlm_search 子进程 (PID=%s)",
+                        elapsed_mono,
+                        task_duration_limit_s,
+                        getattr(proc, "pid", None),
+                    )
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        with open(progress_path, "w", encoding="utf-8") as f:
+                            json.dump(
+                                {
+                                    "status": "error",
+                                    "message": "任务超时，已终止子进程",
+                                    "timeout_elapsed_seconds": round(elapsed_mono, 2),
+                                    "timeout_limit_seconds": int(task_duration_limit_s),
+                                },
+                                f,
+                                ensure_ascii=False,
+                                indent=2,
+                            )
+                    except Exception:
+                        pass
+                    # 清理大目录（保留日志/元数据）
+                    for dn in ("vlm_search_results", "final_vlm", "output"):
+                        try:
+                            shutil.rmtree(os.path.join(merge_dir, dn), ignore_errors=True)
+                        except Exception:
+                            pass
+                    sys.exit(1)
                 line = proc.stdout.readline() if proc.stdout else ""
                 if not line and proc.poll() is not None:
                     break
                 if line:
+                    line = line.replace('\x00', '')
                     out_lines.append(line)
                     sys.stdout.write(line)
                     sys.stdout.flush()
@@ -549,6 +970,19 @@ def main():
                     within_gen_step = int(eval_match.group(1))
                     acc_val = float(eval_match.group(2))
                     best_acc_val = float(eval_match.group(3)) if eval_match.group(3) else acc_val
+                    # 可选：解析 run_vlm_search.py 新增的分拆计时字段（merge/eval）
+                    m_merge = re.search(r"merge=([\d.]+)s", line)
+                    m_eval = re.search(r"eval=([\d.]+)s", line)
+                    if m_merge:
+                        try:
+                            merge_step_times.append(float(m_merge.group(1)))
+                        except Exception:
+                            pass
+                    if m_eval:
+                        try:
+                            eval_step_times.append(float(m_eval.group(1)))
+                        except Exception:
+                            pass
 
                     # 检测代切换：代内 step 回退到 1 说明新一代开始
                     if within_gen_step <= prev_within_gen_step and eval_count > 0:
@@ -584,7 +1018,8 @@ def main():
                     # ── 追加 CSV 行 ──
                     g1 = genotype[0] if len(genotype) > 0 else 0.0
                     g2 = genotype[1] if len(genotype) > 1 else 0.0
-                    csv_writer.writerow([eval_count, acc_val, g1, g2, current_gen, max_acc_seen])
+                    row_vals = [eval_count, acc_val, g1, g2, current_gen, max_acc_seen]
+                    csv_writer.writerow([str(v).replace('\x00', '') for v in row_vals])
                     csv_file.flush()
                     csv_rows_written += 1
 
@@ -607,6 +1042,9 @@ def main():
                     prog["step"] = eval_count
                     prog["current_step"] = eval_count
                     prog["current"] = eval_count
+                    # Ray 并行下 [eval] 行内 step 为“worker 内部计数”，仅作展示用途，不能作为全局进度
+                    prog["within_gen_step"] = within_gen_step
+                    prog["eval_count_global"] = eval_count
                     prog["total"] = display_total_steps
                     prog["total_expected_steps"] = display_total_steps
                     prog["percent"] = percent
@@ -625,6 +1063,12 @@ def main():
                         remaining = max(0, display_total_steps - eval_count)
                         prog["eta_seconds"] = avg_eval * remaining
                         prog["estimated_completion"] = time_module.time() + prog["eta_seconds"]
+                    if merge_step_times:
+                        recent_m = merge_step_times[-min(5, len(merge_step_times)):]
+                        prog["avg_merge_time"] = sum(recent_m) / len(recent_m)
+                    if eval_step_times:
+                        recent_e = eval_step_times[-min(5, len(eval_step_times)):]
+                        prog["avg_eval_time"] = sum(recent_e) / len(recent_e)
                     if 1 in gen_durations:
                         prog["first_gen_time"] = gen_durations[1]
                     try:
@@ -647,11 +1091,26 @@ def main():
 
         finally:
             csv_file.close()
-            subprocess_log_file.close()
-            logger.info("子进程输出已保存到: %s", subprocess_log_path)
+        subprocess_log_file.close()
+        logger.info("子进程输出已保存到: %s", subprocess_log_path)
+        try:
+            if lock_fp is not None:
+                lock_fp.close()
+        except Exception:
+            pass
             logger.info("CSV 已写入 %d 行到 %s", csv_rows_written, csv_path)
 
         proc.wait()
+
+        # 兜底：mergenetic 结束时可能写空 vlm_search.csv；若流式 evolution_stream 行数不足则从日志重建
+        n_csv = _count_evolution_csv_data_rows(csv_path)
+        if csv_rows_written > 0 and n_csv < csv_rows_written:
+            logger.warning(
+                "evolution_stream.csv 数据行 %d 少于预期 %d，从子进程日志重建",
+                n_csv,
+                csv_rows_written,
+            )
+            _rebuild_evolution_csv_from_log(subprocess_log_path, csv_path, logger)
 
         # 最终一代结束
         if current_gen > 0 and current_gen in gen_start_times and current_gen not in gen_durations:
@@ -671,12 +1130,39 @@ def main():
                 prog["percent"] = 100
                 prog["eta_seconds"] = 0
                 prog["estimated_completion"] = time_module.time()
-                prog["total_task_time"] = time_module.time() - start_time
+                prog["total_task_time"] = time_module.monotonic() - task_start_mono
+                if merge_step_times:
+                    prog["total_merge_time"] = float(sum(merge_step_times))
+                if eval_step_times:
+                    prog["total_eval_time"] = float(sum(eval_step_times))
+                if "total_task_time" in prog and ("total_merge_time" in prog or "total_eval_time" in prog):
+                    prog["total_overhead_time"] = float(
+                        (prog.get("total_task_time") or 0)
+                        - (prog.get("total_merge_time") or 0)
+                        - (prog.get("total_eval_time") or 0)
+                    )
                 prog["current_best"] = max(max_acc_seen, prog.get("current_best", 0) or 0)
                 prog["global_best"] = prog["current_best"]
                 if gen_durations:
                     prog["gen_durations"] = gen_durations
                 _flush_progress(prog)
+                # 同步一份 timings 到 metadata，作为单一可追溯来源
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as mf:
+                        meta2 = json.load(mf)
+                    meta2["timings"] = {
+                        "total_task_time": prog.get("total_task_time"),
+                        "total_merge_time": prog.get("total_merge_time"),
+                        "total_eval_time": prog.get("total_eval_time"),
+                        "total_overhead_time": prog.get("total_overhead_time"),
+                        "avg_step_time": prog.get("avg_step_time"),
+                        "avg_merge_time": prog.get("avg_merge_time"),
+                        "avg_eval_time": prog.get("avg_eval_time"),
+                        "step_count": eval_count,
+                    }
+                    _write_metadata_safe(task_id, merge_dir, meta2, logger)
+                except Exception as e:
+                    logger.debug("同步 timings 到 metadata 失败（可忽略）: %s", e)
         except Exception as e:
             logger.warning("更新最终进度失败: %s", e)
 
@@ -698,7 +1184,19 @@ def main():
             sys.exit(1)
 
         # 外部最终评测 (可选)：失败不阻断主流程，仅记录日志
-        if proc.returncode == 0 and hf_split_final and hf_split_final != hf_split:
+        # 可选跳过：用于 smoke/快测，避免 final 评测拖慢墙钟
+        _skip_final = bool(meta.get("skip_final_eval", False)) or (
+            (os.environ.get("MERGEKIT_SKIP_FINAL_EVAL") or "").strip().lower() in ("1", "true", "yes", "on")
+        )
+        if _skip_final and proc.returncode == 0 and hf_split_final and hf_split_final != hf_split:
+            logger.info("[final] skip_final_eval=true，跳过最终评测 (eval_final.py)")
+            # 写占位文件，供 _do_success_path 读取并在 fusion_info/recipe 中可见
+            try:
+                with open(final_acc_file, "w", encoding="utf-8") as f:
+                    json.dump({"final_test_acc": "skipped", "skipped": True}, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning("写入 final_test_acc.json 占位失败（可忽略）: %s", e)
+        if (not _skip_final) and proc.returncode == 0 and hf_split_final and hf_split_final != hf_split:
             logger.info("执行外部最终评测 (eval_final.py)...")
             eval_cmd = [
                 python_cmd,
@@ -739,6 +1237,18 @@ def main():
         except Exception as e:
             logger.exception("收尾步骤异常: %s", e)
             _ensure_metadata_success(meta_path, logger, message="任务完成（收尾步骤部分失败，模型在 final_vlm）")
+
+        # progress.json 终态与 metadata success 对齐，避免前端仍显示 running
+        try:
+            with open(progress_path, "r", encoding="utf-8") as pf:
+                prog_done = json.load(pf)
+            prog_done["status"] = "completed"
+            prog_done["percent"] = 100
+            prog_done["eta_seconds"] = 0
+            prog_done["message"] = "任务完成"
+            _flush_progress(prog_done)
+        except Exception as e_done:
+            logger.warning("写入 progress 终态 completed 失败: %s", e_done)
 
         logger.info("=" * 80)
         logger.info("进化 Runner 结束（成功）")

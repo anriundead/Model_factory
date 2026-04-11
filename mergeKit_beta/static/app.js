@@ -444,7 +444,7 @@ async function executeMergeTask() {
         dataset: datasetType, 
         hf_dataset: datasetType, // 兼容后端逻辑
         hf_subset: datasetSubset,
-        hf_split: 'test' // 默认使用 test split
+        hf_split: (document.getElementById('standard-hf-split') && document.getElementById('standard-hf-split').value) || 'test',
     };
     if (modelPaths.length === state.selectedModels.length) {
         payload.model_paths = modelPaths;
@@ -640,6 +640,7 @@ function setupStandardDatasetUI() {
         
         // 初始加载 (默认为 MMLU)
         loadStandardSubsets('mmlu');
+        setupStandardSplitDropdown();
         
         // 点击外部关闭
         document.addEventListener('click', (e) => {
@@ -648,6 +649,32 @@ function setupStandardDatasetUI() {
             }
         });
     }
+}
+
+function setupStandardSplitDropdown() {
+    const trigger = document.getElementById('standard-split-trigger');
+    const optionsUl = document.getElementById('standard-split-options');
+    const hidden = document.getElementById('standard-hf-split');
+    const triggerText = document.getElementById('standard-split-text');
+    if (!trigger || !optionsUl || !hidden) return;
+    const wrapper = trigger.closest('.ios-select-wrapper');
+    trigger.addEventListener('click', (e) => {
+        e.stopPropagation();
+        wrapper.classList.toggle('active');
+        optionsUl.classList.toggle('open');
+    });
+    optionsUl.querySelectorAll('.ios-option').forEach(opt => {
+        opt.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const val = opt.dataset.value;
+            optionsUl.querySelectorAll('.ios-option').forEach(x => x.classList.remove('selected'));
+            opt.classList.add('selected');
+            hidden.value = val;
+            if (triggerText) triggerText.textContent = val;
+            optionsUl.classList.remove('open');
+            wrapper.classList.remove('active');
+        });
+    });
 }
 
 // --- 新增：加载标准融合子集 ---
@@ -1283,6 +1310,44 @@ async function checkVlmAndSwitchDataset() {
 
 let evolutionaryCustomDataset = null;
 
+function evolutionaryPresetRefetchSplits(hfDataset, subsetGroupId) {
+    const splitOpts = document.getElementById('evolutionary-split-options');
+    if (!splitOpts || !hfDataset) return;
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 5000);
+    fetch('/api/dataset/hf_info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hf_dataset: hfDataset, hf_subset: subsetGroupId || undefined }),
+        signal: ctrl.signal,
+    })
+        .then((r) => r.json())
+        .then((data) => {
+            clearTimeout(tid);
+            if (data.status !== 'success' || !data.splits || !data.splits.length) return;
+            const cur = (document.getElementById('evolutionary-hf-split') || {}).value || 'validation';
+            splitOpts.innerHTML = '';
+            data.splits.forEach((s) => {
+                const li = document.createElement('li');
+                const v = s === 'val' ? 'validation' : s;
+                const pick = v === cur || s === cur;
+                li.className = 'ios-option' + (pick ? ' selected' : '');
+                li.dataset.value = v;
+                li.innerHTML = '<span class="opt-name">' + s + '</span>';
+                li.addEventListener('click', function () {
+                    splitOpts.querySelectorAll('.ios-option').forEach((x) => x.classList.remove('selected'));
+                    this.classList.add('selected');
+                    const h = document.getElementById('evolutionary-hf-split');
+                    const t = document.getElementById('evolutionary-split-text');
+                    if (h) h.value = this.dataset.value;
+                    if (t) t.textContent = this.querySelector('.opt-name').textContent;
+                });
+                splitOpts.appendChild(li);
+            });
+        })
+        .catch(() => clearTimeout(tid));
+}
+
 function setupEvolutionarySplitDropdown() {
     const trigger = document.getElementById('evolutionary-split-trigger');
     const optionsUl = document.getElementById('evolutionary-split-options');
@@ -1320,11 +1385,15 @@ function setupEvolutionaryDatasetFetch() {
         btn.disabled = true;
         btn.textContent = '拉取中...';
         try {
+            const ctrl = new AbortController();
+            const tid = setTimeout(() => ctrl.abort(), 5000);
             const res = await fetch('/api/dataset/hf_info', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ hf_dataset: name })
+                body: JSON.stringify({ hf_dataset: name }),
+                signal: ctrl.signal,
             });
+            clearTimeout(tid);
             const data = await res.json();
             if (data.status !== 'success') {
                 alert(data.message || '拉取失败');
@@ -1436,6 +1505,11 @@ function setupEvolutionaryDatasetTypeSwitch() {
             if (triggerText) triggerText.textContent = val;
             subsetOptionsUl.classList.remove('open');
             subsetWrapper.classList.remove('active');
+            if (!evolutionaryCustomDataset) {
+                const dt = document.getElementById('evolutionary-dataset-type')?.value || 'mmlu';
+                const hfd = dt === 'cmmmu' ? 'm-a-p/CMMMU' : 'cais/mmlu';
+                evolutionaryPresetRefetchSplits(hfd, val);
+            }
         });
     }
 }

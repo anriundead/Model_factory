@@ -93,6 +93,126 @@ function onDatasetSourceChange(value) {
 let testsetsList = [];
 let activeRepoFetchKey = null;
 const TESTSETS_CACHE_KEY = 'testsets_cache_v3';
+const HF_INFO_SESS_KEY = 'hf_info_sess_v1';
+const HF_INFO_FETCH_MS = 5000;
+
+function _hfInfoSessLoad(ds, sub, tsid) {
+    try {
+        const k = (ds || '') + '|' + (sub || '') + '|' + (tsid || '');
+        const raw = sessionStorage.getItem(HF_INFO_SESS_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        const e = obj[k];
+        if (e && e.data && e.ts && (Date.now() - e.ts) < 3600000) return e.data;
+    } catch (err) {}
+    return null;
+}
+function _hfInfoSessSave(ds, sub, tsid, data) {
+    try {
+        const k = (ds || '') + '|' + (sub || '') + '|' + (tsid || '');
+        const raw = sessionStorage.getItem(HF_INFO_SESS_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        obj[k] = { ts: Date.now(), data };
+        sessionStorage.setItem(HF_INFO_SESS_KEY, JSON.stringify(obj));
+    } catch (err) {}
+}
+
+function applyHfInfoToEvalSubsetSplitUI(d, subsetVal, splitVal, t, fetchKey) {
+    const subsetUl = document.getElementById('eval-subset-options');
+    const splitUl = document.getElementById('eval-split-options');
+    const subsetTrigger = document.getElementById('eval-subset-trigger');
+    const splitTrigger = document.getElementById('eval-split-trigger');
+    const subsetWrapper = subsetTrigger.closest('.ios-select-wrapper');
+    const splitWrapper = splitTrigger.closest('.ios-select-wrapper');
+    subsetWrapper.classList.remove('loading');
+    splitWrapper.classList.remove('loading');
+    if (activeRepoFetchKey !== fetchKey ||
+        (document.getElementById('eval-testset-id').value || '') !== (t.testset_id || '') ||
+        (document.getElementById('eval-hf-dataset').value || '') !== (t.hf_dataset || '')) {
+        return false;
+    }
+    if (d.status !== 'success') return false;
+    if (d.configs && d.configs.length) {
+        const configs = d.configs.slice();
+        const configsSet = new Set(configs);
+        if (subsetVal && !configsSet.has(subsetVal)) configs.unshift(subsetVal);
+        const nextSubset = subsetVal || (configs[0] || 'all');
+        subsetUl.innerHTML = configs.map(c => '<li class="ios-option' + (c === nextSubset ? ' selected' : '') + '" data-value="' + c + '">' + c + '</li>').join('');
+        subsetTrigger.querySelector('.selected-text').textContent = nextSubset || 'all';
+        document.getElementById('eval-subset').value = nextSubset;
+    } else {
+        const nextSubset = subsetVal || 'all';
+        subsetUl.innerHTML = '<li class="ios-option' + (nextSubset === 'all' ? ' selected' : '') + '" data-value="all">all</li>' + (subsetVal && subsetVal !== 'all' ? '<li class="ios-option selected" data-value="' + subsetVal + '">' + subsetVal + '</li>' : '');
+        subsetTrigger.querySelector('.selected-text').textContent = nextSubset;
+        document.getElementById('eval-subset').value = nextSubset;
+    }
+    if (d.splits && d.splits.length) {
+        const splits = d.splits.slice();
+        if (splitVal && !splits.includes(splitVal)) splits.unshift(splitVal);
+        let nextSplit = splitVal;
+        if (!nextSplit) nextSplit = splits.includes('test') ? 'test' : splits[0];
+        splitUl.innerHTML = splits.map(s => '<li class="ios-option' + (s === nextSplit ? ' selected' : '') + '" data-value="' + s + '">' + s + '</li>').join('');
+        splitTrigger.querySelector('.selected-text').textContent = nextSplit;
+        document.getElementById('eval-split').value = nextSplit;
+    } else {
+        let defaultSplitsHtml = '<li class="ios-option' + (splitVal === 'all' ? ' selected' : '') + '" data-value="all">all</li>';
+        defaultSplitsHtml += '<li class="ios-option' + (splitVal === 'train' ? ' selected' : '') + '" data-value="train">train</li>';
+        defaultSplitsHtml += '<li class="ios-option' + (splitVal === 'validation' ? ' selected' : '') + '" data-value="validation">validation</li>';
+        defaultSplitsHtml += '<li class="ios-option' + (splitVal === 'test' ? ' selected' : '') + '" data-value="test">test</li>';
+        splitUl.innerHTML = defaultSplitsHtml;
+        if (splitVal && !['all', 'train', 'validation', 'test'].includes(splitVal)) {
+            splitUl.innerHTML = '<li class="ios-option selected" data-value="' + splitVal + '">' + splitVal + '</li>' + splitUl.innerHTML;
+        }
+        splitTrigger.querySelector('.selected-text').textContent = splitVal || 'all';
+        document.getElementById('eval-split').value = splitVal || 'all';
+    }
+    return true;
+}
+
+function evalRefetchSplitsOnly(hfDataset, hfSubset, testsetId, currentSplitVal) {
+    const splitUl = document.getElementById('eval-split-options');
+    const splitTrigger = document.getElementById('eval-split-trigger');
+    const splitWrapper = splitTrigger.closest('.ios-select-wrapper');
+    const fetchKey = (testsetId || '') + '|' + hfDataset + '|sub:' + (hfSubset || '');
+    activeRepoFetchKey = fetchKey;
+    splitTrigger.querySelector('.selected-text').innerHTML = '<span class="loading-text"><span class="loading-dots"></span> 更新分割...</span>';
+    splitWrapper.classList.add('loading');
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HF_INFO_FETCH_MS);
+    fetch('/api/dataset/hf_info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            hf_dataset: hfDataset,
+            hf_subset: hfSubset || undefined,
+            testset_id: testsetId || undefined,
+        }),
+        signal: controller.signal,
+    })
+        .then(r => r.json())
+        .then(d => {
+            clearTimeout(timeoutId);
+            splitWrapper.classList.remove('loading');
+            if (activeRepoFetchKey !== fetchKey) return;
+            _hfInfoSessSave(hfDataset, hfSubset, testsetId, d);
+            if (d.status !== 'success' || !d.splits || !d.splits.length) {
+                splitTrigger.querySelector('.selected-text').textContent = currentSplitVal || 'test';
+                return;
+            }
+            const splits = d.splits.slice();
+            let next = currentSplitVal;
+            if (!next || !splits.includes(next)) next = splits.includes('test') ? 'test' : splits[0];
+            splitUl.innerHTML = splits.map(s => '<li class="ios-option' + (s === next ? ' selected' : '') + '" data-value="' + s + '">' + s + '</li>').join('');
+            splitTrigger.querySelector('.selected-text').textContent = next;
+            document.getElementById('eval-split').value = next;
+        })
+        .catch(() => {
+            clearTimeout(timeoutId);
+            splitWrapper.classList.remove('loading');
+            if (activeRepoFetchKey !== fetchKey) return;
+            splitTrigger.querySelector('.selected-text').textContent = currentSplitVal || 'test';
+        });
+}
+
 function loadTestsetsCache() {
     try {
         const raw = sessionStorage.getItem(TESTSETS_CACHE_KEY);
@@ -152,7 +272,12 @@ function renderTestsetRepoOptions() {
             li.dataset.hfDataset = t.hf_dataset || '';
             li.dataset.hfSubset = t.hf_subset || '';
             li.dataset.hfSplit = t.hf_split || 'train';
-            li.innerHTML = '<span class="opt-name">' + (t.name || t.hf_dataset || t.testset_id) + '</span>';
+            const name = (t.name || t.hf_dataset || t.testset_id);
+            const isVlmBench = !!t.is_vlm_benchmark;
+            const badge = isVlmBench
+                ? '<span class="testset-type-badge vlm">VLM</span>'
+                : '<span class="testset-type-badge llm">LLM</span>';
+            li.innerHTML = '<span class="opt-name">' + name + '</span>' + badge;
             li.addEventListener('click', () => selectRepoTestset(t));
             ul.appendChild(li);
         });
@@ -160,6 +285,10 @@ function renderTestsetRepoOptions() {
         document.getElementById('eval-repo-trigger').querySelector('.selected-text').textContent = selectedTestset ? (selectedTestset.name || selectedTestset.hf_dataset || selectedTestset.testset_id) : '请选择测试集';
         document.getElementById('eval-testset-id').value = nextSelectedId;
         document.getElementById('eval-hf-dataset').value = selectedTestset ? (selectedTestset.hf_dataset || '') : '';
+        try {
+            const hint = document.getElementById('vlm-compat-hint');
+            if (hint) hint.style.display = (selectedTestset && selectedTestset.is_vlm_benchmark) ? 'block' : 'none';
+        } catch (e) {}
         if (selectedTestset && nextSelectedId && nextSelectedId !== prevSelectedId) {
             fillSubsetSplitFromTestset(selectedTestset);
         }
@@ -169,6 +298,12 @@ function selectRepoTestset(t) {
     document.getElementById('eval-repo-trigger').querySelector('.selected-text').textContent = t.name || t.hf_dataset || t.testset_id;
     document.getElementById('eval-testset-id').value = t.testset_id || '';
     document.getElementById('eval-hf-dataset').value = t.hf_dataset || '';
+    try {
+        const hint = document.getElementById('vlm-compat-hint');
+        if (hint) {
+            hint.style.display = t && t.is_vlm_benchmark ? 'block' : 'none';
+        }
+    } catch (e) {}
     fillSubsetSplitFromTestset(t);
     document.querySelectorAll('#eval-repo-options .ios-option').forEach((o, i) => o.classList.toggle('selected', o.dataset.testsetId === (t.testset_id || '')));
     document.getElementById('eval-repo-options').classList.remove('open');
@@ -190,7 +325,18 @@ function fillSubsetSplitFromTestset(t) {
     if (t.hf_dataset) {
         const fetchKey = (t.testset_id || '') + '|' + (t.hf_dataset || '');
         activeRepoFetchKey = fetchKey;
-        // 显示加载进度条
+
+        let instant = null;
+        if (t.cached_configs && t.cached_splits && t.cached_configs.length && t.cached_splits.length) {
+            instant = { status: 'success', configs: t.cached_configs, splits: t.cached_splits };
+        } else {
+            instant = _hfInfoSessLoad(t.hf_dataset, subsetVal, t.testset_id);
+        }
+        if (instant && instant.status === 'success') {
+            applyHfInfoToEvalSubsetSplitUI(instant, subsetVal, splitVal, t, fetchKey);
+            return;
+        }
+
         subsetTrigger.querySelector('.selected-text').innerHTML = '<span class="loading-text"><span class="loading-dots"></span> 加载子集中...</span>';
         splitTrigger.querySelector('.selected-text').innerHTML = '<span class="loading-text"><span class="loading-dots"></span> 加载分割中...</span>';
         subsetWrapper.classList.add('loading');
@@ -199,76 +345,32 @@ function fillSubsetSplitFromTestset(t) {
         splitUl.innerHTML = '';
         
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000);
-        fetch('/api/dataset/hf_info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hf_dataset: t.hf_dataset, hf_subset: subsetVal || undefined }), signal: controller.signal })
+        const timeoutId = setTimeout(() => controller.abort(), HF_INFO_FETCH_MS);
+        fetch('/api/dataset/hf_info', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                hf_dataset: t.hf_dataset,
+                hf_subset: subsetVal || undefined,
+                testset_id: t.testset_id || undefined,
+            }),
+            signal: controller.signal,
+        })
             .then(r => r.json())
             .then(d => {
                 clearTimeout(timeoutId);
-                subsetWrapper.classList.remove('loading');
-                splitWrapper.classList.remove('loading');
-                if (activeRepoFetchKey !== fetchKey ||
-                    (document.getElementById('eval-testset-id').value || '') !== (t.testset_id || '') ||
-                    (document.getElementById('eval-hf-dataset').value || '') !== (t.hf_dataset || '')) {
-                    setDefaultSubsetSplit(subsetVal, splitVal);
-                    return;
-                }
-                
-                if (d.status === 'success') {
-                    // 更新子集下拉框
-                    if (d.configs && d.configs.length) {
-                        const configs = d.configs.slice();
-                        const configsSet = new Set(configs);
-                        if (subsetVal && !configsSet.has(subsetVal)) {
-                            configs.unshift(subsetVal);
-                        }
-                        const nextSubset = subsetVal || (configs[0] || 'all');
-                        subsetUl.innerHTML = configs.map(c => '<li class="ios-option' + (c === nextSubset ? ' selected' : '') + '" data-value="' + c + '">' + c + '</li>').join('');
-                        subsetTrigger.querySelector('.selected-text').textContent = nextSubset || 'all';
-                        document.getElementById('eval-subset').value = nextSubset;
-                    } else {
-                        // 没有 configs 时设置默认值
-                        const nextSubset = subsetVal || 'all';
-                        subsetUl.innerHTML = '<li class="ios-option' + (nextSubset === 'all' ? ' selected' : '') + '" data-value="all">all</li>' + (subsetVal && subsetVal !== 'all' ? '<li class="ios-option selected" data-value="' + subsetVal + '">' + subsetVal + '</li>' : '');
-                        subsetTrigger.querySelector('.selected-text').textContent = nextSubset;
-                        document.getElementById('eval-subset').value = nextSubset;
-                    }
-                    // 更新 split 下拉框
-                    if (d.splits && d.splits.length) {
-                        const splits = d.splits.slice();
-                        if (splitVal && !splits.includes(splitVal)) {
-                            splits.unshift(splitVal);
-                        }
-                        let nextSplit = splitVal;
-                        if (!nextSplit) {
-                            nextSplit = splits.includes('test') ? 'test' : splits[0];
-                        }
-                        splitUl.innerHTML = splits.map(s => '<li class="ios-option' + (s === nextSplit ? ' selected' : '') + '" data-value="' + s + '">' + s + '</li>').join('');
-                        splitTrigger.querySelector('.selected-text').textContent = nextSplit;
-                        document.getElementById('eval-split').value = nextSplit;
-                    } else {
-                        // 默认 splits
-                        let defaultSplitsHtml = '<li class="ios-option' + (splitVal === 'all' ? ' selected' : '') + '" data-value="all">all</li>';
-                        defaultSplitsHtml += '<li class="ios-option' + (splitVal === 'train' ? ' selected' : '') + '" data-value="train">train</li>';
-                        defaultSplitsHtml += '<li class="ios-option' + (splitVal === 'validation' ? ' selected' : '') + '" data-value="validation">validation</li>';
-                        defaultSplitsHtml += '<li class="ios-option' + (splitVal === 'test' ? ' selected' : '') + '" data-value="test">test</li>';
-                        splitUl.innerHTML = defaultSplitsHtml;
-                        if (splitVal && !['all', 'train', 'validation', 'test'].includes(splitVal)) {
-                            splitUl.innerHTML = '<li class="ios-option selected" data-value="' + splitVal + '">' + splitVal + '</li>' + splitUl.innerHTML;
-                        }
-                        splitTrigger.querySelector('.selected-text').textContent = splitVal || 'all';
-                        document.getElementById('eval-split').value = splitVal || 'all';
-                    }
-                } else {
-                    // API 返回失败，使用默认值
+                _hfInfoSessSave(t.hf_dataset, subsetVal, t.testset_id, d);
+                if (!applyHfInfoToEvalSubsetSplitUI(d, subsetVal, splitVal, t, fetchKey)) {
                     setDefaultSubsetSplit(subsetVal, splitVal);
                 }
             })
             .catch(() => {
                 clearTimeout(timeoutId);
                 if (activeRepoFetchKey !== fetchKey) return;
-                // API 调用失败，移除加载状态并使用默认值
                 subsetWrapper.classList.remove('loading');
                 splitWrapper.classList.remove('loading');
+                subsetTrigger.querySelector('.selected-text').textContent = '加载超时，已用默认值';
+                splitTrigger.querySelector('.selected-text').textContent = '加载超时，已用默认值';
                 setDefaultSubsetSplit(subsetVal, splitVal);
             });
     } else {
@@ -345,7 +447,7 @@ async function selectCustomHfDataset(hfId) {
     document.getElementById('eval-custom-subset-split').style.display = 'block';
     try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        const timeoutId = setTimeout(() => controller.abort(), HF_INFO_FETCH_MS);
         const res = await fetch('/api/dataset/hf_info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hf_dataset: hfId }), signal: controller.signal });
         const data = await res.json();
         clearTimeout(timeoutId);
@@ -718,12 +820,14 @@ async function startEvaluation() {
 
     const source = document.getElementById('eval-dataset-source').value;
     const sampling = document.getElementById('eval-sampling').value;
+    const numGpus = parseInt(document.getElementById('eval-num-gpus')?.value || '0', 10);
     const payload = {
         model_path: evalState.selectedModel.path,
         model_name: evalState.selectedModel.name,
         task_type: 'eval_only',
         limit: limit,
-        sampling: sampling
+        sampling: sampling,
+        num_gpus: numGpus
     };
     if (source === 'builtin') {
         payload.dataset = document.getElementById('eval-dataset').value;
@@ -737,6 +841,22 @@ async function startEvaluation() {
                 resolvedTestsetId = match.testset_id;
             }
         }
+        // 前端兼容性校验：VLM 基准必须选 VLM 模型
+        try {
+            const picked = testsetsList.find(t => t && (t.testset_id || '') === (resolvedTestsetId || ''));
+            const testsetIsVlm = !!(picked && picked.is_vlm_benchmark);
+            const modelIsVlm = !!(evalState.selectedModel && evalState.selectedModel.is_vlm);
+            if (testsetIsVlm && !modelIsVlm) {
+                showToast('该测试集为 VLM 基准，请选择带视觉塔的模型（如 Qwen2.5-VL）', 'warning');
+                startBtn.disabled = false;
+                startBtn.innerText = '开始测试';
+                clearBtn.innerText = '清空';
+                return;
+            }
+            if (!testsetIsVlm && modelIsVlm) {
+                showToast('当前使用 VLM 模型运行 LLM 基准，将走文本评测管线。', 'info');
+            }
+        } catch (e) {}
         payload.testset_id = resolvedTestsetId || null;
         payload.hf_dataset = rawHfDataset || null;
         payload.hf_subset = document.getElementById('eval-subset').value || null;
@@ -1082,6 +1202,12 @@ function initDropdowns() {
             wrapper.querySelector('.ios-select-options').classList.remove('open');
             wrapper.querySelectorAll('.ios-option').forEach(o => o.classList.remove('selected'));
             opt.classList.add('selected');
+            if (input && input.id === 'eval-subset') {
+                const hfDataset = (document.getElementById('eval-hf-dataset') || {}).value;
+                const tsid = (document.getElementById('eval-testset-id') || {}).value;
+                const curSplit = (document.getElementById('eval-split') || {}).value || 'test';
+                if (hfDataset) evalRefetchSplitsOnly(hfDataset, val, tsid, curSplit);
+            }
         });
     });
 
@@ -1090,4 +1216,33 @@ function initDropdowns() {
             el.classList.remove('open');
         });
     });
+}
+
+function _ensureToastContainer() {
+    let el = document.getElementById('toast-container');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'toast-container';
+        el.className = 'toast-container';
+        document.body.appendChild(el);
+    }
+    return el;
+}
+
+function showToast(message, type) {
+    const container = _ensureToastContainer();
+    const toast = document.createElement('div');
+    toast.className = 'toast ' + (type || 'info');
+    toast.textContent = message || '';
+    container.appendChild(toast);
+    setTimeout(() => {
+        try {
+            toast.style.transition = 'all 0.2s ease';
+            toast.style.opacity = '0';
+            toast.style.transform = 'translateY(-6px)';
+        } catch (e) {}
+    }, 2600);
+    setTimeout(() => {
+        try { toast.remove(); } catch (e) {}
+    }, 3000);
 }

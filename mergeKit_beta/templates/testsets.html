@@ -237,6 +237,7 @@
                 const name = t.name || t.hf_dataset || t.testset_id;
                 const hf = t.hf_dataset || 'Local';
                 const count = (t.sample_count !== undefined && t.sample_count !== null) ? t.sample_count : 0;
+                const isVlmBench = !!t.is_vlm_benchmark;
                 const delay = Math.min(i * 0.05, 0.5) + 's';
                 
                 return `
@@ -246,6 +247,7 @@
                             <div class="testset-name" title="${name}">${name}</div>
                             <div class="testset-meta">
                                 <span class="meta-tag" title="${hf}">${hf}</span>
+                                ${isVlmBench ? '<span class="testset-type-badge vlm">VLM</span>' : '<span class="testset-type-badge llm">LLM</span>'}
                                 <span class="meta-dot">•</span>
                                 <span class="meta-count">${count} 条数据</span>
                             </div>

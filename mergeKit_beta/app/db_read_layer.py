@@ -77,7 +77,7 @@ def get_leaderboard_from_db():
         return None
 
 
-def get_model_repo_list_from_db(merge_metadata_by_path_fn):
+def get_model_repo_list_from_db(merge_metadata_by_path_fn, merge_dir: str | None = None):
     """
     模型列表（与 model_repo_list 同结构）。
     merge_metadata_by_path_fn(path) 返回 metadata 或 None，用于补全 parent_models/recipe/dataset。
@@ -91,28 +91,85 @@ def get_model_repo_list_from_db(merge_metadata_by_path_fn):
         for m in rows:
             path = (m.get("path") or "").strip().rstrip("/")
             name = m.get("name") or ""
-            meta = merge_metadata_by_path_fn(path) if path and merge_metadata_by_path_fn else None
+            task_id = (m.get("task_id") or "").strip()
+
+            meta = None
+            fusion_info = None
+            if merge_dir and task_id:
+                try:
+                    meta_path = os.path.join(str(merge_dir), task_id, "metadata.json")
+                    if os.path.isfile(meta_path):
+                        import json
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                except Exception:
+                    meta = None
+
+                try:
+                    fi_path = os.path.join(str(merge_dir), task_id, "output", "fusion_info.json")
+                    if os.path.isfile(fi_path):
+                        import json
+                        with open(fi_path, "r", encoding="utf-8") as f:
+                            fusion_info = json.load(f)
+                except Exception:
+                    fusion_info = None
+
+            if not fusion_info and path:
+                fi_direct = os.path.join(path, "fusion_info.json")
+                if os.path.isfile(fi_direct):
+                    try:
+                        import json
+                        with open(fi_direct, "r", encoding="utf-8") as f:
+                            fusion_info = json.load(f)
+                    except Exception:
+                        fusion_info = None
+
+            if not meta:
+                meta = merge_metadata_by_path_fn(path) if path and merge_metadata_by_path_fn else None
             parent_models = []
             recipe = {}
             dataset = {}
-            if meta:
-                parent_models = [os.path.basename(p) for p in (meta.get("model_paths") or [])]
+            if fusion_info and isinstance(fusion_info, dict):
+                parent_models = [str(p) for p in (fusion_info.get("parent_names") or []) if p]
                 recipe = {
-                    "weights": (meta.get("recipe") or {}).get("weights"),
-                    "method": (meta.get("recipe") or {}).get("method"),
-                    "dtype": (meta.get("recipe") or {}).get("dtype"),
-                    "library": (meta.get("recipe") or {}).get("library"),
+                    "weights": fusion_info.get("best_genotype"),
+                    "method": "evolutionary",
+                    "dtype": fusion_info.get("dtype"),
+                    "library": "mergenetic",
+                    "pop_size": fusion_info.get("pop_size"),
+                    "n_iter": fusion_info.get("n_iter"),
+                    "max_samples": fusion_info.get("max_samples"),
                 }
                 dataset = {
-                    "hf_dataset": meta.get("hf_dataset"),
-                    "hf_subset": meta.get("hf_subset"),
-                    "hf_subsets": meta.get("hf_subsets"),
-                    "hf_split": meta.get("hf_split"),
+                    "hf_dataset": fusion_info.get("hf_dataset"),
+                    "hf_subset": fusion_info.get("hf_subset"),
+                    "hf_subsets": fusion_info.get("hf_subsets"),
+                    "hf_split": fusion_info.get("hf_split"),
                 }
+
+            if meta and isinstance(meta, dict):
+                if not parent_models:
+                    parent_models = [os.path.basename(p) for p in (meta.get("model_paths") or [])]
+                if not dataset:
+                    dataset = {
+                        "hf_dataset": meta.get("hf_dataset"),
+                        "hf_subset": meta.get("hf_subset"),
+                        "hf_subsets": meta.get("hf_subsets"),
+                        "hf_split": meta.get("hf_split"),
+                    }
+                # 兼容非进化融合（可能有 meta["recipe"]）
+                if (not recipe) and isinstance(meta.get("recipe"), dict):
+                    recipe = {
+                        "weights": (meta.get("recipe") or {}).get("weights"),
+                        "method": (meta.get("recipe") or {}).get("method"),
+                        "dtype": (meta.get("recipe") or {}).get("dtype"),
+                        "library": (meta.get("recipe") or {}).get("library"),
+                    }
             out.append({
                 "path": path,
                 "name": name,
                 "model_id": m.get("id"),
+                "task_id": task_id or None,
                 "is_base": False,
                 "parent_models": parent_models,
                 "recipe": recipe,

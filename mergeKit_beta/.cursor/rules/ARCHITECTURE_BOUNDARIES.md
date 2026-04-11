@@ -5,7 +5,7 @@
 ## 应用入口
 
 - **唯一推荐**：`./start_app.sh` → `app/__init__.py:create_app()` → 注册 `routes`、启动 `Services` 内 Worker。
-- **`app.py`**：仅保留历史兼容；**禁止**在其中新增业务路由、Worker 分支或与 `app/services.py` 并行的任务执行逻辑。新功能一律进入 `app/` 包（`routes` / `services` / `repositories` 等）。
+- **`app.py.legacy`**（原 `app.py` 归档）：仅作只读历史参考；**禁止**在其中新增业务路由、Worker 分支或与 `app/services.py` 并行的任务执行逻辑。新功能一律进入 `app/` 包（`routes` / `services` / `repositories` 等）。
 
 ## 接口层（HTTP）
 

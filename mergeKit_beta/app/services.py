@@ -3,6 +3,7 @@ import importlib
 import os
 import shutil
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -741,10 +742,11 @@ class HistoryMixin(BaseService):
             return None
 
     def _sync_evolution_csv_to_db(self, task_id):
-        """读取 vlm_search_results/vlm_search.csv 并批量写入 evolution_steps 表。"""
+        """读取 evolution_stream.csv（或兼容旧 vlm_search.csv）并批量写入 evolution_steps 表。"""
         import csv as csv_mod
         from app.repositories import evolution_steps_bulk_insert
         csv_candidates = [
+            os.path.join(self.state.merge_dir, task_id, "vlm_search_results", "evolution_stream.csv"),
             os.path.join(self.state.merge_dir, task_id, "vlm_search_results", "vlm_search.csv"),
             os.path.join(self.state.merge_dir, task_id, "vlm_search_results", "vlm_search", "vlm_search.csv"),
             os.path.join(self.state.merge_dir, task_id, "search_results.csv"),
@@ -1038,6 +1040,30 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
         except Exception as e:
             self.logger.warning("[worker] DB evaluation_result_insert 失败: %s", e)
 
+    def _post_task_gpu_cleanup(self, task_id: str) -> None:
+        """任务结束后（无论成功/失败/异常）统一释放 Python 侧 GPU 显存与 Ray 实例。
+        只做 cache 清理，不终止 Flask 进程或其他正常运行的子进程。"""
+        import gc
+        try:
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+            # 若 Ray 被本次任务初始化且现已无活跃 worker，则关闭以释放 CUDA 上下文
+            try:
+                import ray
+                if ray.is_initialized():
+                    ray.shutdown()
+            except Exception:
+                pass
+            self.logger.debug("[worker] GPU 显存清理完成 task_id=%s", task_id)
+        except Exception as cleanup_err:
+            self.logger.warning("[worker] GPU 清理异常（不影响主流程）task_id=%s: %s", task_id, cleanup_err)
+
     def worker(self):
         print("--- 任务处理 Worker 已启动 ---")
         while True:
@@ -1305,6 +1331,7 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                     self.state.tasks[task_id]["message"] = "系统内部错误: %s" % str(e)
                     self._db_update_completion(task_id, "error", data.get("type", "merge"), None)
             finally:
+                self._post_task_gpu_cleanup(task_id)
                 self.state.task_queue.task_done()
 
 
@@ -1342,10 +1369,13 @@ class ModelRepoMixin(ModelCompatibilityMixin):
     def merge_metadata_by_output_path(self, output_path: str):
         if not output_path or not os.path.isdir(self.state.merge_dir):
             return None
-        output_path = os.path.abspath(output_path)
+        output_path = os.path.realpath(os.path.abspath(output_path))
         for tid in os.listdir(self.state.merge_dir):
-            out_dir = os.path.abspath(os.path.join(self.state.merge_dir, tid, "output"))
-            if out_dir != output_path:
+            out_dir = os.path.join(self.state.merge_dir, tid, "output")
+            if not os.path.lexists(out_dir):
+                continue
+            # output 常为指向命名产物目录的符号链接：须用 realpath 与已注册 path 比较
+            if os.path.realpath(os.path.abspath(out_dir)) != output_path:
                 continue
             meta_path = os.path.join(self.state.merge_dir, tid, "metadata.json")
             if not os.path.isfile(meta_path):
@@ -1364,7 +1394,7 @@ class ModelRepoMixin(ModelCompatibilityMixin):
             try:
                 with app.app_context():
                     from app.db_read_layer import get_model_repo_list_from_db
-                    data = get_model_repo_list_from_db(self.merge_metadata_by_output_path)
+                    data = get_model_repo_list_from_db(self.merge_metadata_by_output_path, getattr(self.state, "merge_dir", None))
                     if data is not None and len(data) > 0:
                         return data
             except Exception:
@@ -1441,16 +1471,57 @@ class ModelRepoMixin(ModelCompatibilityMixin):
                     m = {
                         "path": path,
                         "name": name,
+                        "task_id": tid,
                         "is_base": False,
                         "parent_models": [os.path.basename(p) for p in (meta.get("model_paths") or [])],
                         "recipe": {},
                         "dataset": {},
                     }
-                    merge_meta = self.merge_metadata_by_output_path(path)
-                    if merge_meta:
-                        m["parent_models"] = [os.path.basename(p) for p in (merge_meta.get("model_paths") or [])]
-                        m["recipe"] = {"weights": None, "method": None, "dtype": None, "library": None}
-                        m["dataset"] = {"hf_dataset": merge_meta.get("hf_dataset"), "hf_subset": merge_meta.get("hf_subset"), "hf_subsets": merge_meta.get("hf_subsets"), "hf_split": merge_meta.get("hf_split")}
+                    fusion_info = None
+                    fi_path = os.path.join(path, "fusion_info.json")
+                    if os.path.isfile(fi_path):
+                        try:
+                            with open(fi_path, "r", encoding="utf-8") as f:
+                                fusion_info = json.load(f)
+                        except Exception:
+                            fusion_info = None
+                    if fusion_info and isinstance(fusion_info, dict):
+                        pn = [str(p) for p in (fusion_info.get("parent_names") or []) if p]
+                        if pn:
+                            m["parent_models"] = pn
+                        m["recipe"] = {
+                            "weights": fusion_info.get("best_genotype"),
+                            "method": "evolutionary",
+                            "dtype": fusion_info.get("dtype"),
+                            "library": "mergenetic",
+                            "pop_size": fusion_info.get("pop_size"),
+                            "n_iter": fusion_info.get("n_iter"),
+                            "max_samples": fusion_info.get("max_samples"),
+                        }
+                        m["dataset"] = {
+                            "hf_dataset": fusion_info.get("hf_dataset"),
+                            "hf_subset": fusion_info.get("hf_subset"),
+                            "hf_subsets": fusion_info.get("hf_subsets"),
+                            "hf_split": fusion_info.get("hf_split"),
+                        }
+                    else:
+                        merge_meta = self.merge_metadata_by_output_path(path)
+                        if merge_meta:
+                            m["parent_models"] = [os.path.basename(p) for p in (merge_meta.get("model_paths") or [])]
+                            mr = merge_meta.get("recipe")
+                            if isinstance(mr, dict):
+                                m["recipe"] = {
+                                    "weights": mr.get("weights"),
+                                    "method": mr.get("method"),
+                                    "dtype": mr.get("dtype"),
+                                    "library": mr.get("library"),
+                                }
+                            m["dataset"] = {
+                                "hf_dataset": merge_meta.get("hf_dataset"),
+                                "hf_subset": merge_meta.get("hf_subset"),
+                                "hf_subsets": merge_meta.get("hf_subsets"),
+                                "hf_split": merge_meta.get("hf_split"),
+                            }
                     out.append(m)
                 except Exception:
                     continue
@@ -1482,7 +1553,7 @@ class ModelRepoMixin(ModelCompatibilityMixin):
                         path = os.path.abspath(path).rstrip("/")
                         meta = self.merge_metadata_by_output_path(path)
                         name = (m.get("name") or (meta.get("custom_name") if meta else None) or os.path.basename(path))
-                        task_id = meta.get("id") if meta else None
+                        task_id = (m.get("task_id") or (meta.get("id") if meta else None))
                         parent_model_ids = (meta.get("model_paths") or []) if meta else []
                         model_register(path=path, name=name or "merged", source="merged", task_id=task_id, parent_model_ids=parent_model_ids)
                         synced += 1
@@ -1590,17 +1661,8 @@ class TestsetMixin(BaseService):
         except Exception as e:
             self.logger.warning("[save_testsets_dict] 文件缓存写入失败: %s", e)
 
-    def resolve_dataset_sample_count(self, hf_dataset, hf_subset, hf_split, cache_dir):
-        if not (hf_dataset or "").strip():
-            return 0, None, None
-        hf_dataset = (hf_dataset or "").strip()
-        if hf_dataset.lower() == "unknown":
-            return 0, None, None
-        # cais/mmlu 子集名与 HF config 不一致时映射为实际 config 名（与 run_vlm_search_bridge 一致）
-        hf_subset = (hf_subset or "").strip()
-        if hf_subset and "mmlu" in hf_dataset.lower():
-            _MMLU_ALIAS = {"high_school_government": "high_school_government_and_politics"}
-            hf_subset = _MMLU_ALIAS.get(hf_subset, hf_subset)
+    def _resolve_single_config_sample_count(self, hf_dataset, hf_subset, hf_split, cache_dir):
+        """单个 HF config 的样本数（builder 元数据）；失败返回 0,None,None。"""
         try:
             from datasets import load_dataset_builder, get_dataset_config_names
             subset_candidates = []
@@ -1615,7 +1677,9 @@ class TestsetMixin(BaseService):
                     pass
             for subset_name in subset_candidates:
                 try:
-                    builder = load_dataset_builder(hf_dataset, name=subset_name or None, trust_remote_code=True, cache_dir=cache_dir)
+                    builder = load_dataset_builder(
+                        hf_dataset, name=subset_name or None, trust_remote_code=True, cache_dir=cache_dir
+                    )
                     splits = getattr(builder.info, "splits", None) or {}
                     if splits:
                         preferred = []
@@ -1624,11 +1688,119 @@ class TestsetMixin(BaseService):
                         preferred.extend(["test", "validation", "dev", "val", "train"])
                         for split_name in preferred:
                             if split_name in splits:
-                                return int(getattr(splits[split_name], "num_examples", 0) or 0), split_name, subset_name
+                                return (
+                                    int(getattr(splits[split_name], "num_examples", 0) or 0),
+                                    split_name,
+                                    subset_name,
+                                )
                         first_key = list(splits.keys())[0]
-                        return int(getattr(splits[first_key], "num_examples", 0) or 0), first_key, subset_name
+                        return (
+                            int(getattr(splits[first_key], "num_examples", 0) or 0),
+                            first_key,
+                            subset_name,
+                        )
                 except Exception:
                     continue
+        except Exception as e:
+            self.logger.debug("single config sample count failed: %s", e)
+        return 0, None, None
+
+    def _resolve_sample_count_via_load_dataset(self, hf_dataset, hf_subset, hf_split, cache_dir):
+        """用 load_dataset 实际行数计数（较慢，作 builder 失败时的兜底）。"""
+        try:
+            from datasets import load_dataset
+        except Exception:
+            return 0, None, None
+        sub = (hf_subset or "").strip() or None
+        split_name = (hf_split or "").strip().split("[")[0].strip() or "test"
+        try:
+            ds = load_dataset(
+                hf_dataset,
+                name=sub,
+                split=split_name,
+                trust_remote_code=True,
+                cache_dir=cache_dir,
+            )
+            n = len(ds)
+            return int(n), split_name, sub
+        except Exception:
+            try:
+                ds = load_dataset(hf_dataset, name=sub, trust_remote_code=True, cache_dir=cache_dir)
+                if hasattr(ds, "keys"):
+                    for sk in ("test", "validation", "val", "train"):
+                        if sk in ds:
+                            return int(len(ds[sk])), sk, sub
+                    k0 = list(ds.keys())[0]
+                    return int(len(ds[k0])), k0, sub
+            except Exception as e:
+                self.logger.debug("load_dataset count failed: %s", e)
+        return 0, None, None
+
+    def resolve_dataset_sample_count(self, hf_dataset, hf_subset, hf_split, cache_dir):
+        if not (hf_dataset or "").strip():
+            return 0, None, None
+        hf_dataset = (hf_dataset or "").strip()
+        if hf_dataset.lower() == "unknown":
+            return 0, None, None
+        hf_subset_key = (hf_subset or "").strip()
+        _MMLU_ALIAS = {"high_school_government": "high_school_government_and_politics"}
+        ds_lower = hf_dataset.lower()
+
+        # 组级子集（MMLU / CMMMU）：展开后累加各 config 的 num_examples
+        expanded = None
+        try:
+            from app.routes import resolve_hf_subsets
+
+            if "mmlu" in ds_lower and hf_subset_key:
+                expanded = resolve_hf_subsets("mmlu", hf_subset_key)
+                if expanded:
+                    expanded = [_MMLU_ALIAS.get(s, s) for s in expanded]
+            elif "cmmmu" in ds_lower and hf_subset_key:
+                expanded = resolve_hf_subsets("cmmmu", hf_subset_key)
+        except Exception as e:
+            self.logger.debug("resolve_hf_subsets import/use failed: %s", e)
+
+        if expanded:
+            total = 0
+            first_split = None
+            used_subset = hf_subset_key
+            for sub in expanded:
+                n, sp, _ = self._resolve_single_config_sample_count(hf_dataset, sub, hf_split, cache_dir)
+                if n <= 0:
+                    n2, sp2, _ = self._resolve_sample_count_via_load_dataset(hf_dataset, sub, hf_split, cache_dir)
+                    n, sp = n2, sp2 or sp
+                total += n
+                if first_split is None and sp:
+                    first_split = sp
+            if total > 0:
+                return total, first_split, used_subset
+
+        # 单 config（含别名）
+        hf_one = hf_subset_key
+        if hf_one and "mmlu" in ds_lower:
+            hf_one = _MMLU_ALIAS.get(hf_one, hf_one)
+        n, sp, sn = self._resolve_single_config_sample_count(hf_dataset, hf_one, hf_split, cache_dir)
+        if n > 0:
+            return n, sp, sn or hf_one
+        n2, sp2, sn2 = self._resolve_sample_count_via_load_dataset(hf_dataset, hf_one, hf_split, cache_dir)
+        if n2 > 0:
+            return n2, sp2, sn2 or hf_one
+        try:
+            from datasets import get_dataset_config_names
+
+            if not hf_one:
+                subset_candidates = [None]
+                try:
+                    configs = get_dataset_config_names(hf_dataset, trust_remote_code=True) or []
+                    subset_candidates.extend([c for c in configs if c])
+                except Exception:
+                    pass
+                for subset_name in subset_candidates:
+                    n, sp, sn = self._resolve_single_config_sample_count(
+                        hf_dataset, subset_name, hf_split, cache_dir
+                    )
+                    if n > 0:
+                        return n, sp, sn
         except Exception as e:
             self.logger.debug("testset count metadata failed: %s", e)
         return 0, None, None
@@ -1970,6 +2142,59 @@ class TestsetMixin(BaseService):
             self.save_testsets_dict(testsets)
         return entry
 
+    def _schedule_testset_count_refresh(self, entries_snapshot: list):
+        """后台补全 sample_count=0 的测试集，不阻塞列表 API。"""
+        app = getattr(self, "app", None)
+        if not app or not entries_snapshot:
+            return
+
+        def run():
+            with app.app_context():
+                try:
+                    from app.repositories import testset_get_by_id, testset_upsert
+
+                    cache_dir = getattr(self.config, "HF_DATASETS_CACHE", None) or os.environ.get(
+                        "HF_DATASETS_CACHE"
+                    )
+                    for d in entries_snapshot:
+                        tid = d.get("id") or d.get("testset_id")
+                        if not tid:
+                            continue
+                        row = testset_get_by_id(tid)
+                        hf_dataset = (row.hf_dataset if row else d.get("hf_dataset")) or ""
+                        hf_subset = row.hf_subset if row else d.get("hf_subset")
+                        hf_split = row.hf_split if row else d.get("hf_split")
+                        if not (hf_dataset or "").strip():
+                            continue
+                        n, sp, _ = self.resolve_dataset_sample_count(
+                            hf_dataset, hf_subset, hf_split, cache_dir
+                        )
+                        if n > 0:
+                            testset_upsert(
+                                testset_id=tid,
+                                name=(row.name if row else d.get("name")) or str(tid),
+                                hf_dataset=hf_dataset,
+                                hf_subset=hf_subset,
+                                hf_split=sp or hf_split,
+                                lm_eval_task=row.lm_eval_task if row else d.get("lm_eval_task"),
+                                benchmark_config=row.benchmark_config if row else d.get("benchmark_config"),
+                                version=row.version if row else d.get("version"),
+                                sample_count=n,
+                                is_local=row.is_local if row else bool(d.get("is_local")),
+                                local_path=row.local_path if row else d.get("local_path"),
+                                yaml_template_path=row.yaml_template_path if row else d.get("yaml_template_path"),
+                                created_by=row.created_by if row else d.get("created_by"),
+                                notes=row.notes if row else d.get("notes"),
+                                question_type=row.question_type if row else d.get("question_type"),
+                                type=row.type if row else d.get("type"),
+                                cached_configs=row.cached_configs if row else d.get("cached_configs"),
+                                cached_splits=row.cached_splits if row else d.get("cached_splits"),
+                            )
+                except Exception as e:
+                    self.logger.debug("async testset count refresh failed: %s", e)
+
+        threading.Thread(target=run, daemon=True).start()
+
     def testset_list(self, refresh=True):
         # 以 DB 为主：有 DB 数据时直接返回，否则回退到文件并可选同步到 DB
         app = getattr(self, "app", None)
@@ -2011,6 +2236,8 @@ class TestsetMixin(BaseService):
                                         notes=entry.get("notes"),
                                         question_type=entry.get("question_type"),
                                         type=entry.get("type"),
+                                        cached_configs=entry.get("cached_configs"),
+                                        cached_splits=entry.get("cached_splits"),
                                     )
                                 else:
                                     enrich = testset_enrich_from_eval_result(r.id)
@@ -2025,6 +2252,15 @@ class TestsetMixin(BaseService):
                                             hf_split=enrich.get("hf_split"),
                                         )
                             out.append(d)
+                        if refresh:
+                            zeros = [
+                                dict(x)
+                                for x in out
+                                if int(x.get("sample_count") or 0) == 0
+                                and (x.get("hf_dataset") or "").strip()
+                            ]
+                            if zeros:
+                                self._schedule_testset_count_refresh(zeros)
                         return out
             except Exception as e:
                 self.logger.debug("[testset_list] DB 查询失败，回退文件: %s", e)
@@ -2039,14 +2275,27 @@ class TestsetMixin(BaseService):
                         self.save_testsets_dict(testsets)
             except Exception:
                 pass
-        return self.refresh_testsets_counts(testsets) if refresh else list(testsets.values())
+        lst = list(testsets.values())
+        if refresh:
+            zeros = [
+                dict(e)
+                for e in lst
+                if int(e.get("sample_count") or 0) == 0 and (e.get("hf_dataset") or "").strip()
+            ]
+            if zeros and app:
+                self._schedule_testset_count_refresh(zeros)
+            return lst
+        return lst
 
     def infer_lm_eval_task(self, hf_dataset, hf_subset):
         if not (hf_dataset or "").strip():
             return ""
         key = (hf_dataset or "").strip().lower()
         if key in ("cais/mmlu", "mmlu") and (hf_subset or "").strip():
-            return "mmlu_" + (hf_subset or "").strip().replace("-", "_")
+            subset = (hf_subset or "").strip().replace("-", "_")
+            if subset == "biology":
+                return "mmlu_college_biology"
+            return "mmlu_" + subset
         if key in ("m-a-p/cmmmu", "cmmmu/cmmmu"):
             # 交给 merge_manager 按本机已注册任务动态解析，避免写死到不存在的子任务名
             return "cmmmu"
@@ -2173,6 +2422,51 @@ class RecipeMixin(AutomationMixin, ModelRepoMixin):
 
 
 class Services(RecipeMixin, TaskQueueMixin, TestsetMixin):
+    def heal_stale_merge_tasks_on_startup(self):
+        """启动自愈：修正重启后遗留的 merge/merge_evolutionary running/queued 脏状态。"""
+        app = getattr(self, "app", None)
+        if not app:
+            return
+        healed = 0
+        try:
+            with app.app_context():
+                from app.extensions import db
+                from app.models import Task
+                stale_tasks = (
+                    db.session.query(Task)
+                    .filter(
+                        Task.task_type.in_(["merge", "merge_evolutionary"]),
+                        Task.status.in_(["running", "queued"]),
+                    )
+                    .all()
+                )
+                now = datetime.utcnow()
+                for t in stale_tasks:
+                    task_id = t.id
+                    new_status = "interrupted"
+                    meta_path = os.path.join(self.state.merge_dir, task_id, "metadata.json")
+                    if os.path.isfile(meta_path):
+                        try:
+                            with open(meta_path, "r", encoding="utf-8") as f:
+                                raw = (json.load(f).get("status") or "").strip()
+                            if raw == "success":
+                                new_status = "completed"
+                            elif raw == "error":
+                                new_status = "error"
+                        except Exception:
+                            new_status = "interrupted"
+                    t.status = new_status
+                    t.updated_at = now
+                    if new_status in ("completed", "error", "failed"):
+                        t.finished_at = t.finished_at or now
+                    healed += 1
+                if healed:
+                    db.session.commit()
+                    self.logger.info("[startup-heal] 已修复 stale merge 任务状态: %d", healed)
+                else:
+                    self.logger.info("[startup-heal] 无需修复 stale merge 任务")
+        except Exception as e:
+            self.logger.warning("[startup-heal] 修复 stale merge 状态失败: %s", e)
     def heal_stale_eval_tasks_on_startup(self):
         """启动自愈：修正重启后遗留的 eval_only running/queued 脏状态。"""
         app = getattr(self, "app", None)
@@ -2225,4 +2519,5 @@ class Services(RecipeMixin, TaskQueueMixin, TestsetMixin):
 
     def start_task_worker(self):
         self.heal_stale_eval_tasks_on_startup()
+        self.heal_stale_merge_tasks_on_startup()
         self.start_worker()

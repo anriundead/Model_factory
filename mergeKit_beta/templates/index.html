@@ -291,6 +291,22 @@
                             <input type="hidden" id="standard-subset-val" value="global">
                         </div>
 
+                        <div class="form-group" id="standard-split-form-group">
+                            <label>Split</label>
+                            <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                <div class="ios-select-trigger" id="standard-split-trigger">
+                                    <span class="selected-text" id="standard-split-text">test</span>
+                                    <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                </div>
+                                <ul class="ios-select-options" id="standard-split-options">
+                                    <li class="ios-option selected" data-value="test"><span class="opt-name">test</span></li>
+                                    <li class="ios-option" data-value="validation"><span class="opt-name">validation</span></li>
+                                    <li class="ios-option" data-value="train"><span class="opt-name">train</span></li>
+                                </ul>
+                            </div>
+                            <input type="hidden" id="standard-hf-split" value="test">
+                        </div>
+
                         <div class="segmented-control-wrapper">
                             <label class="segmented-label">测试深度 (Limit)</label>
                             <div class="segmented-control" id="merge-limit-control">
@@ -434,17 +450,17 @@
                             <label>Ray GPU 数</label>
                             <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
                                 <div class="ios-select-trigger" id="evolutionary-ray-trigger">
-                                    <span class="selected-text">2</span>
+                                    <span class="selected-text">4</span>
                                     <i class="ri-arrow-down-s-line chevron-icon"></i>
                                 </div>
                                 <ul class="ios-select-options" id="evolutionary-ray-options">
                                     <li class="ios-option" data-value="1"><span class="opt-name">1</span></li>
-                                    <li class="ios-option selected" data-value="2"><span class="opt-name">2</span></li>
-                                    <li class="ios-option" data-value="4"><span class="opt-name">4</span></li>
+                                    <li class="ios-option" data-value="2"><span class="opt-name">2</span></li>
+                                    <li class="ios-option selected" data-value="4"><span class="opt-name">4</span></li>
                                     <li class="ios-option" data-value="8"><span class="opt-name">8</span></li>
                                 </ul>
                             </div>
-                            <input type="hidden" id="evolutionary-ray-gpus" value="2">
+                            <input type="hidden" id="evolutionary-ray-gpus" value="4">
                         </div>
                         <button type="button" id="start-evolutionary-merge" class="btn btn-primary">开始完全融合</button>
                         <div class="recipe-apply-block">

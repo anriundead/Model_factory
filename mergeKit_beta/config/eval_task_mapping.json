@@ -1,6 +1,19 @@
 {
+  "__comment__": "VLM-only datasets (lmms-lab/MMBench etc.) 由代码层面拦截，不在此映射",
   "openai/gsm8k|socratic": "gsm8k",
   "openai/gsm8k|main": "gsm8k",
   "TIGER-Lab/MMLU-Pro|default": "mmlu_flan_n_shot_loglikelihood_high_school_government_and_politics",
-  "Rowan/hellaswag": "hellaswag"
+  "Rowan/hellaswag": "hellaswag",
+  "allenai/ai2_arc|ARC-Easy": "arc_easy",
+  "allenai/ai2_arc|ARC-Challenge": "arc_challenge",
+  "allenai/winogrande|winogrande_xl": "winogrande",
+  "google/boolq|boolq": "boolq",
+  "GBaker/MedQA-USMLE-4-options|all": "medqa_4options",
+  "qiaojin/PubMedQA|pqa_labeled": "pubmedqa",
+  "openlifescienceai/medmcqa|english": "medmcqa",
+  "haonan-li/cmmlu|agronomy": "cmmlu",
+  "ceval/ceval-exam|computer_network": "ceval-valid",
+  "openai/openai_humaneval|openai_humaneval": "humaneval",
+  "google-research-datasets/mbpp|full": "mbpp",
+  "cais/mmlu|society": "click_cul_society"
 }

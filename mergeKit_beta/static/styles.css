@@ -1250,6 +1250,90 @@ select:focus {
     margin-right: 6px;
 }
 
+/* 评估页：测试集类型徽标（VLM/LLM） */
+.testset-type-badge {
+    display: inline-flex;
+    align-items: center;
+    font-size: 0.65rem;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 6px;
+    margin-left: 8px;
+    letter-spacing: 0.3px;
+    flex-shrink: 0;
+    animation: badgeFadeIn 0.3s ease;
+}
+.testset-type-badge.vlm {
+    background: linear-gradient(135deg, rgba(139, 92, 246, 0.18), rgba(168, 85, 247, 0.22));
+    color: #7c3aed;
+    border: 1px solid rgba(139, 92, 246, 0.25);
+}
+.testset-type-badge.llm {
+    background: linear-gradient(135deg, rgba(0, 113, 227, 0.12), rgba(59, 130, 246, 0.16));
+    color: #2563eb;
+    border: 1px solid rgba(0, 113, 227, 0.2);
+}
+@keyframes badgeFadeIn {
+    from { opacity: 0; transform: scale(0.9); }
+    to   { opacity: 1; transform: scale(1); }
+}
+
+/* 评估页：VLM 兼容性提示横幅 */
+.vlm-compat-hint {
+    margin-top: 10px;
+    background: linear-gradient(135deg, rgba(139, 92, 246, 0.10), rgba(168, 85, 247, 0.08));
+    border: 1px solid rgba(139, 92, 246, 0.18);
+    color: #4c1d95;
+    padding: 10px 12px;
+    border-radius: 12px;
+    font-size: 0.85rem;
+    display: none;
+    animation: slideDown 0.25s ease;
+}
+.vlm-compat-hint strong {
+    font-weight: 700;
+}
+
+/* Toast 通知 */
+.toast-container {
+    position: fixed;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    pointer-events: none;
+}
+.toast {
+    pointer-events: auto;
+    min-width: 260px;
+    max-width: 520px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    font-size: 0.85rem;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+    animation: fadeInUp 0.22s ease;
+    border: 1px solid rgba(0,0,0,0.06);
+    backdrop-filter: blur(10px);
+}
+.toast.info {
+    background: rgba(239, 246, 255, 0.92);
+    color: #1e3a8a;
+    border-color: rgba(37, 99, 235, 0.20);
+}
+.toast.warning {
+    background: rgba(250, 245, 255, 0.92);
+    color: #4c1d95;
+    border-color: rgba(139, 92, 246, 0.25);
+}
+.toast.error {
+    background: rgba(254, 242, 242, 0.92);
+    color: #7f1d1d;
+    border-color: rgba(239, 68, 68, 0.25);
+}
+
 /* =========================================
    【新增】iOS 风格输入框 & 错误状态
    ========================================= */

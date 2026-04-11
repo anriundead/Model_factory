@@ -68,7 +68,8 @@
             </div>
             <div id="model-detail-body" style="text-align: left; padding: 0 20px 16px; font-size: 0.9rem; line-height: 1.5;">
             </div>
-            <div class="modal-actions">
+            <div class="modal-actions" style="flex-wrap: wrap; gap: 8px;">
+                <a id="model-detail-fusion-link" href="/fusion_history" class="ios-btn ios-btn-cancel" style="display: none; text-decoration: none; text-align: center;">融合历史 · 3D</a>
                 <button id="model-detail-close" class="ios-btn ios-btn-confirm">关闭</button>
             </div>
         </div>
@@ -169,18 +170,7 @@
         function refreshRepoListThen(callback) {
             var mergedEl = document.getElementById('model-repo-merged');
             var baseEl = document.getElementById('model-repo-base');
-            
-            Promise.all([
-                fetch('/api/models').then(function(r) { return r.json(); }),
-                fetch('/api/merged_models').then(function(r) { return r.json(); })
-            ]).then(function(results) {
-                var baseData = results[0];
-                var mergedData = results[1];
-                var combined = {
-                    status: 'success',
-                    base_models: baseData.models || [],
-                    merged_models: mergedData.models || []
-                };
+            fetch('/api/model_repo/list').then(function(r) { return r.json(); }).then(function(combined) {
                 if (mergedEl && baseEl) renderMergedList(mergedEl, baseEl, combined);
                 if (callback) callback();
             }).catch(function() { if (callback) callback(); });
@@ -236,6 +226,9 @@
             if (r.method) parts.push('算法: ' + r.method);
             if (r.dtype) parts.push('精度: ' + r.dtype);
             if (r.weights && r.weights.length) parts.push('权重: [' + r.weights.join(', ') + ']');
+            if (r.pop_size) parts.push('种群: ' + r.pop_size);
+            if (r.n_iter) parts.push('迭代: ' + r.n_iter);
+            if (r.max_samples) parts.push('样本: ' + r.max_samples);
             return parts.length ? parts.join('；') : '';
         }
         function fmtDataset(d) {
@@ -257,14 +250,23 @@
                 html += '<p style="margin: 0 0 4px; color: #86868b;">父代模型</p>';
                 html += '<p style="margin: 0 0 16px;">' + m.parent_models.join('、') + '</p>';
             }
-            if (m.recipe && (m.recipe.method || m.recipe.dtype || (m.recipe.weights && m.recipe.weights.length))) {
+            if (m.recipe && (m.recipe.method || m.recipe.dtype || (m.recipe.weights && m.recipe.weights.length) || m.recipe.pop_size || m.recipe.n_iter || m.recipe.max_samples)) {
                 html += '<p style="margin: 0 0 4px; color: #86868b;">融合参数</p>';
                 html += '<p style="margin: 0 0 16px;">' + (fmtRecipe(m.recipe) || '—') + '</p>';
             }
             var ds = fmtDataset(m.dataset);
             html += '<p style="margin: 0 0 4px; color: #86868b;">使用数据集</p>';
-            html += '<p style="margin: 0;">' + (ds || '—') + '</p>';
+            html += '<p style="margin: 0 0 16px;">' + (ds || '—') + '</p>';
             document.getElementById('model-detail-body').innerHTML = html;
+            var fl = document.getElementById('model-detail-fusion-link');
+            if (fl) {
+                if (m.task_id) {
+                    fl.style.display = 'inline-flex';
+                    fl.href = '/fusion_history?open_task=' + encodeURIComponent(String(m.task_id));
+                } else {
+                    fl.style.display = 'none';
+                }
+            }
             var overlay = document.getElementById('model-detail-overlay');
             overlay.style.display = 'flex';
             overlay.style.opacity = '1';
@@ -348,23 +350,26 @@
             if (e.target === this) hideRecipeDetail();
         };
 
-        function loadModelRepo() {
+        async function loadModelRepo() {
             var baseEl = document.getElementById('model-repo-base');
             var mergedEl = document.getElementById('model-repo-merged');
             var recipesEl = document.getElementById('model-repo-recipes');
             if (baseEl) baseEl.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>加载中...</p></div>';
             if (mergedEl) mergedEl.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>加载中...</p></div>';
             if (recipesEl) recipesEl.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>加载中...</p></div>';
-            fetch('/api/model_repo/list').then(r=>r.json()).then(d=>{
-                if (baseEl && mergedEl) renderMergedList(mergedEl, baseEl, d);
-                return fetch('/api/recipes').then(r=>r.json());
-            }).then(function(d) {
-                if (!d || d.status !== 'success' || !d.recipes || d.recipes.length === 0) {
+            try {
+                var repoResp = await fetch('/api/model_repo/list');
+                var repoData = await repoResp.json();
+                if (baseEl && mergedEl) renderMergedList(mergedEl, baseEl, repoData);
+
+                var recipesResp = await fetch('/api/recipes');
+                var recipes = await recipesResp.json();
+                if (!recipes || recipes.status !== 'success' || !recipes.recipes || recipes.recipes.length === 0) {
                     if (recipesEl) recipesEl.innerHTML = '<p class="limit-desc">暂无配方</p>';
                     return;
                 }
-                recipesData = d.recipes;
-                recipesEl.innerHTML = d.recipes.map(function(r, i) {
+                recipesData = recipes.recipes;
+                recipesEl.innerHTML = recipes.recipes.map(function(r, i) {
                     var fullName = (r.custom_name || r.recipe_id || '未命名').toString();
                     var name = fullName.slice(0, 30);
                     var parents = (r.parent_names || []).map(function(p) { return typeof p === 'string' ? p.split(/[/\\]/).pop() : ''; }).join(' + ');
@@ -377,14 +382,11 @@
                 recipesEl.querySelectorAll('.model-card-clickable').forEach(function(card) {
                     card.onclick = function() { showRecipeDetail(card.getAttribute('data-recipe-id')); };
                 });
-            }).catch(function() {
-                if (recipesEl) recipesEl.innerHTML = '<p class="limit-desc">加载配方失败</p>';
-            });
-        }).catch(function() {
-            if (baseEl) baseEl.innerHTML = '<p class="limit-desc">加载失败</p>';
-            if (mergedEl) mergedEl.innerHTML = '<p class="limit-desc">加载失败</p>';
-            if (recipesEl) recipesEl.innerHTML = '<p class="limit-desc">加载失败</p>';
-        });
+            } catch (e) {
+                if (baseEl) baseEl.innerHTML = '<p class="limit-desc">加载失败</p>';
+                if (mergedEl) mergedEl.innerHTML = '<p class="limit-desc">加载失败</p>';
+                if (recipesEl) recipesEl.innerHTML = '<p class="limit-desc">加载失败</p>';
+            }
         }
         document.getElementById('model-repo-refresh').onclick = function() { loadModelRepo(); };
         document.addEventListener('visibilitychange', function() { if (document.visibilityState === 'visible') loadModelRepo(); });

@@ -16,6 +16,10 @@ import shlex
 
 from config import Config
 from core.process_manager import ProcessManager
+from core.gpu_topology import parse_nvlink_pairs, select_free_pairs
+from core.gpu_lock import lock_file
+
+os.environ.setdefault("HF_DATASETS_TRUST_REMOTE_CODE", "1")
 
 # 评估用（与 mergeKit_alpha 一致）
 STANDARD_BENCHMARKS = getattr(Config, "STANDARD_BENCHMARKS", ["hellaswag", "arc_easy", "boolq", "winogrande"])
@@ -1327,16 +1331,26 @@ def _auto_discover_lm_eval_task(hf_dataset, hf_subset=None):
             candidates.append((score, len(task), task))
     
     # 策略3: 如果有 subset，尝试匹配包含 subset 的任务
+    # 注意：过滤掉 HF 通用 split/subset 名，避免误匹配（如 "default" 命中 fld_logical_formula_default）
+    _GENERIC_SUBSET_NAMES = {
+        "default", "train", "test", "validation", "valid", "dev",
+        "eval", "all", "full", "main", "base", "data",
+    }
     if subset_lower:
         subset_normalized = subset_lower.replace("-", "_")
-        subset_keywords = [s for s in subset_normalized.split("_") if len(s) > 3]  # 提取关键词（长度>3的词）
+        subset_keywords = [
+            s for s in subset_normalized.split("_")
+            if len(s) > 3 and s not in _GENERIC_SUBSET_NAMES
+        ]  # 提取关键词（长度>3且非通用名）
+        # 精确匹配仅在 subset 本身不是通用名时才执行
+        _subset_is_generic = subset_normalized in _GENERIC_SUBSET_NAMES or not subset_keywords
         for task in available_tasks:
             # 确保不是任务组
             if task in task_groups_set:
                 continue
             task_lower = task.lower()
-            # 精确匹配
-            if subset_normalized in task_lower:
+            # 精确匹配（跳过通用 subset 名，避免 "default" 命中 fld_logical_formula_default）
+            if not _subset_is_generic and subset_normalized in task_lower:
                 score = len(set(task_lower.split("_")) & set([subset_normalized]))
                 candidates.append((score + 15, len(task), task))  # subset 精确匹配高分
             # 关键词匹配
@@ -1352,8 +1366,11 @@ def _auto_discover_lm_eval_task(hf_dataset, hf_subset=None):
             # 优先匹配：先找精确匹配 subset 的任务
             if subset_lower:
                 subset_normalized = subset_lower.replace("-", "_")
-                subset_keywords = [s for s in subset_normalized.split("_") if len(s) > 3]
-                
+                subset_keywords = [
+                    s for s in subset_normalized.split("_")
+                    if len(s) > 3 and s not in _GENERIC_SUBSET_NAMES
+                ]
+
                 # 精确匹配 subset（如 college_medicine）
                 for task in available_tasks:
                     if task in task_groups_set:
@@ -1425,7 +1442,10 @@ def _auto_discover_lm_eval_task(hf_dataset, hf_subset=None):
                         _logger.info("[eval] 自动发现 MMLU subset 匹配: %s/%s -> %s", hf_dataset, hf_subset, task)
                         return task
                     # 如果 subset 包含多个词，尝试匹配关键词
-                    subset_keywords = [s for s in subset_normalized.split("_") if len(s) > 3]
+                    subset_keywords = [
+                        s for s in subset_normalized.split("_")
+                        if len(s) > 3 and s not in _GENERIC_SUBSET_NAMES
+                    ]
                     if any(kw in task_lower for kw in subset_keywords):
                         candidates.append((20, len(task), task))  # MMLU subset 匹配高分
                 else:
@@ -1464,7 +1484,10 @@ def _auto_discover_lm_eval_task(hf_dataset, hf_subset=None):
                 score = 0
                 # 如果有 subset，尝试匹配 subset 的关键词
                 if subset_lower:
-                    subset_keywords = [s for s in subset_lower.replace("-", "_").split("_") if len(s) > 3]
+                    subset_keywords = [
+                        s for s in subset_lower.replace("-", "_").split("_")
+                        if len(s) > 3 and s not in _GENERIC_SUBSET_NAMES
+                    ]
                     matched = sum(1 for kw in subset_keywords if kw in task_lower)
                     score = matched * 3  # 每个匹配的关键词3分
                 mmlu_candidates.append((score, len(task), task))
@@ -1784,6 +1807,155 @@ def _prepare_multimodal_model_for_eval(model_path, output_path):
         return model_path
 
 
+def _load_model_config_json(model_path: str) -> dict | None:
+    try:
+        cfg_path = os.path.join(str(model_path), "config.json")
+        if not os.path.isfile(cfg_path):
+            return None
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _model_is_vlm(model_path: str) -> bool:
+    """
+    尽可能通用地判断一个模型目录是否包含视觉塔（VLM）。
+    注意：某些 *-TextOnly 导出在 config.json 上会退化为纯文本模型；此时仅靠 config 可能无法 100% 识别。
+    """
+    if not model_path or not os.path.isdir(model_path):
+        return False
+
+    # 目录名启发式（兜底）
+    dir_name = os.path.basename(model_path.rstrip(os.sep)).lower()
+    vlm_dir_keywords = (
+        "vl", "vision", "vlm", "_vl-", "-vl-", "-vl_", "qwen2.5vl", "qwen2vl",
+        "llava", "cogvlm", "minicpm-v", "minicpm_v", "visual", "qwen2_vl", "qwen2.5_vl",
+        "internvl", "omni", "multimodal",
+    )
+    if any(k in dir_name for k in vlm_dir_keywords):
+        return True
+
+    cfg = _load_model_config_json(model_path)
+    if not cfg:
+        return False
+
+    # 最强信号：显式 vision_config
+    if cfg.get("vision_config") is not None:
+        return True
+
+    # 常见视觉 token id
+    if any(cfg.get(k) is not None for k in ("image_token_id", "vision_start_token_id", "vision_token_id", "video_token_id")):
+        return True
+
+    # model_type / architectures 信号（含嵌套 text_config/decoder_config）
+    model_type = (cfg.get("model_type") or "").lower()
+    for sub in ("text_config", "decoder_config"):
+        sub_cfg = cfg.get(sub)
+        if isinstance(sub_cfg, dict) and (sub_cfg.get("model_type") or ""):
+            model_type = model_type or (sub_cfg.get("model_type") or "").lower()
+
+    archs = cfg.get("architectures") or []
+    arch_str = " ".join(str(a) for a in archs).lower()
+    vlm_indicators = ("vision", "vl", "qwen2_vl", "qwen2.5_vl", "qwen2vl", "qwen2_5_vl", "qwen3_vl", "llava", "cogvlm", "minicpm-v", "internvl", "multimodal")
+    if any(v in model_type for v in vlm_indicators):
+        return True
+    if any(v in arch_str for v in vlm_indicators):
+        return True
+    return False
+
+
+def _infer_lmms_model_backend(model_path: str) -> str:
+    """
+    将本地模型目录推断为 lmms-eval 的 --model 后端名。
+    当前优先覆盖 Qwen2.5-VL / Qwen2VL / Qwen3VL / LLaVA / InternVL；其他回退 qwen2_5_vl。
+    """
+    cfg = _load_model_config_json(model_path) or {}
+    archs = cfg.get("architectures") or []
+    arch_str = " ".join(str(a) for a in archs).lower()
+    model_type = (cfg.get("model_type") or "").lower()
+    vcfg = cfg.get("vision_config") if isinstance(cfg.get("vision_config"), dict) else {}
+    vision_type = (vcfg.get("model_type") or "").lower()
+
+    s = " ".join([arch_str, model_type, vision_type]).lower()
+    if "qwen2_5_vl" in s or "qwen2.5_vl" in s or "qwen2.5vl" in s or "qwen2_5_vlforconditionalgeneration" in s:
+        return "qwen2_5_vl"
+    if "qwen2vl" in s or "qwen2_vl" in s or "qwen2vlforconditionalgeneration" in s:
+        return "qwen2_vl"
+    if "qwen3vl" in s or "qwen3_vl" in s:
+        return "qwen3_vl"
+    if "llava" in s:
+        return "llava"
+    if "internvl" in s:
+        return "internvl2"
+    return "qwen2_5_vl"
+
+
+# lm_eval 中 HumanEval / MBPP 等任务的 utils 在 import 阶段会 load evaluate.code_eval，
+# 若未设置 HF_ALLOW_CODE_EVAL=1 则直接失败（见 HuggingFace 安全提示）。
+_LM_EVAL_CODE_EXEC_TASK_MARKERS = (
+    "humaneval",
+    "mbpp",
+    "replit",
+    "ds1000",
+    "apps",
+    "mbxp",
+    "codexglue",
+    "code_generation",
+    "executable_code",
+)
+
+
+def _lm_eval_tasks_need_hf_allow_code_eval(cmd_task_str: str, target_tasks_list) -> bool:
+    """判断当前任务列表是否可能触发 evaluate.code_eval（子串匹配，保守覆盖常见代码类任务名）。"""
+    parts = []
+    if cmd_task_str:
+        parts.append(str(cmd_task_str).lower())
+    if target_tasks_list:
+        for t in target_tasks_list:
+            if t:
+                parts.append(str(t).lower())
+    blob = " ".join(parts)
+    return any(m in blob for m in _LM_EVAL_CODE_EXEC_TASK_MARKERS)
+
+
+def _ensure_hf_allow_code_eval_for_lm_eval(eval_env: dict, cmd_task_str: str, target_tasks_list) -> None:
+    """
+    lm_eval 中 HumanEval/MBPP 及大量变体任务名会在 import 阶段加载 evaluate.code_eval；
+    仅靠任务名子串无法覆盖（自定义 YAML、hendrycks_*、bigcode_* 等），故默认对**所有** lm_eval 子进程注入
+    HF_ALLOW_CODE_EVAL=1（与 CLI 已传的 --trust_remote_code 风险模型一致）。
+
+    兜底：
+    - MERGEKIT_FORBID_CODE_EVAL=1：不注入；若任务名仍匹配已知代码类标记则启动前报错并提示关闭 FORBID 或换测试集。
+    - 父进程已显式设置 HF_ALLOW_CODE_EVAL=0 且 FORBID 未开：尊重为「不注入」，由 lm_eval 自行报错（高级用户）。
+    """
+    forbid = os.environ.get("MERGEKIT_FORBID_CODE_EVAL", "").strip().lower() in ("1", "true", "yes")
+    if forbid:
+        if _lm_eval_tasks_need_hf_allow_code_eval(cmd_task_str, target_tasks_list):
+            raise ValueError(
+                "当前测试集对应 lm_eval 代码类任务（如 HumanEval/MBPP 等），需要 HF_ALLOW_CODE_EVAL=1，"
+                "但已设置 MERGEKIT_FORBID_CODE_EVAL=1。请取消 MERGEKIT_FORBID_CODE_EVAL，或改用非代码执行类 benchmark。"
+            )
+        return
+
+    explicit_off = (os.environ.get("HF_ALLOW_CODE_EVAL") or "").strip() == "0"
+    if explicit_off:
+        _logger.warning(
+            "[eval] 检测到 HF_ALLOW_CODE_EVAL=0，不自动注入；若任务加载 code_eval 可能仍失败。"
+        )
+        return
+
+    cur = (eval_env.get("HF_ALLOW_CODE_EVAL") or os.environ.get("HF_ALLOW_CODE_EVAL") or "").strip()
+    if cur == "1":
+        return
+    eval_env["HF_ALLOW_CODE_EVAL"] = "1"
+    _logger.info(
+        "[eval] 已为 lm_eval 子进程设置 HF_ALLOW_CODE_EVAL=1（模型生成代码可能在评测中执行；"
+        "禁止请设 MERGEKIT_FORBID_CODE_EVAL=1，或设 HF_ALLOW_CODE_EVAL=0 并仅跑非 code_eval 任务）。"
+    )
+
+
 def run_lm_eval_stream(
     model_path,
     output_path,
@@ -1799,6 +1971,7 @@ def run_lm_eval_stream(
     lm_eval_task=None,
     custom_include_path=None,
     sampling="sequential",
+    num_gpus=0,
 ):
     """
     与 mergeKit_alpha 一致的评估流程：Popen 流式执行 lm_eval，结果写入 output_path。
@@ -1808,6 +1981,51 @@ def run_lm_eval_stream(
     if task_control is None:
         task_control = {}
     os.makedirs(output_path, exist_ok=True)
+
+    # -----------------------------------------------------------------------
+    # NVLink 对内 TP=2（仅推理阶段 / lm_eval + accelerate）
+    # - 仅在 use_accelerate 为 True 时生效
+    # - 通过 CUDA_VISIBLE_DEVICES 限定到一对 GPU（01 或 23 或 auto），并把 --num_processes 固定为 2
+    # - 30s 获取超时：降级为单卡（继续完成）
+    # -----------------------------------------------------------------------
+    pair_lock_fp = None
+    eval_pair_env = {}
+    try:
+        eval_topo = getattr(Config, "MERGEKIT_EVAL_TOPOLOGY", "off") or "off"
+        eval_topo = str(eval_topo).strip().lower()
+        pair_timeout_s = int(getattr(Config, "MERGEKIT_EVAL_PAIR_TIMEOUT_S", 30) or 30)
+        min_free_gb = int(getattr(Config, "MERGEKIT_EVAL_MIN_FREE_GB", 12) or 12)
+        min_free_mib = int(min_free_gb * 1024)
+
+        # 先只准备，等确定 use_accelerate 后再真正应用
+        if eval_topo and eval_topo != "off":
+            # 任务级共享锁（评测/进化都遵循同一锁文件，避免并行挤爆）
+            lock_path = (os.environ.get("MERGEKIT_GPU_LOCK_PATH") or "/tmp/mergekit_gpu.lock").strip()
+            try:
+                pair_lock_fp = lock_file(lock_path, pair_timeout_s)
+                _logger.info("[eval][tp2] 已获得 GPU 锁: %s", lock_path)
+            except TimeoutError:
+                pair_lock_fp = None
+                _logger.warning("[eval][tp2] GPU 锁等待超时（%ss），将允许降级继续执行", pair_timeout_s)
+
+            if eval_topo in ("pair01", "01", "0-1"):
+                cand_pairs = [(0, 1)]
+            elif eval_topo in ("pair23", "23", "2-3"):
+                cand_pairs = [(2, 3)]
+            else:
+                # auto：按 NVLink 默认对
+                cand_pairs = parse_nvlink_pairs(os.environ.get("MERGEKIT_EVOLUTION_TOPOLOGY") or "01,23")
+
+            ok_pairs = select_free_pairs(pairs=cand_pairs, min_free_mib=min_free_mib)
+            if ok_pairs:
+                a, b = ok_pairs[0]
+                eval_pair_env["CUDA_VISIBLE_DEVICES"] = f"{a},{b}"
+                eval_pair_env["MERGEKIT_EVAL_TP2_PAIR"] = f"{a},{b}"
+                _logger.info("[eval][tp2] 选用卡对 %s,%s（min_free=%sGiB topo=%s）", a, b, min_free_gb, eval_topo)
+            else:
+                _logger.warning("[eval][tp2] 无可用卡对满足空闲显存阈值（min_free=%sGiB topo=%s），将降级单卡", min_free_gb, eval_topo)
+    except Exception as e:
+        _logger.warning("[eval][tp2] 初始化失败（忽略，继续默认路径）: %s", e)
 
     # 保留调用方传入的任务名（例如 hellaswag）；仅在为空时走后续推断逻辑
     task_name = (task_name or "").strip()
@@ -1846,7 +2064,8 @@ def run_lm_eval_stream(
             if mapped:
                 # 注意：内置映射中的 "mmlu" 是任务组，不能直接使用
                 if subset and mapped == "mmlu":
-                    task_name = "mmlu_" + subset.replace("-", "_")
+                    subset_key = subset.replace("-", "_")
+                    task_name = "mmlu_college_biology" if subset_key == "biology" else ("mmlu_" + subset_key)
                 elif mapped == "mmlu":
                     # 如果没有 subset 且映射是 "mmlu"（任务组），不能使用，需要自动发现或报错
                     task_name = ""  # 保持为空，让自动发现处理
@@ -2006,8 +2225,11 @@ def run_lm_eval_stream(
                     error_msg = f"任务名 '{task_name}' 是任务组（返回 ChainMap），无法直接使用。"
                     _logger.error("[eval] %s", error_msg)
                     raise ValueError(error_msg)
-        except ValueError:
-            raise
+        except ValueError as ve:
+            if "trust_remote_code" in str(ve).lower():
+                _logger.warning("[eval] 任务验证需要 trust_remote_code，跳过验证（CLI 已添加全局标志）: %s", ve)
+            else:
+                raise
         except Exception as verify_err:
             _logger.warning("[eval] 验证任务加载失败（非致命）: %s", verify_err)
 
@@ -2029,6 +2251,19 @@ def run_lm_eval_stream(
     except Exception:
         _logger.warning("[eval] 未检测到 GPU (nvidia-smi 失败)，回退到 CPU")
         device = "cpu"
+
+    detected_gpus = 1
+    if device == "cuda":
+        try:
+            _nvsmi = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10,
+            )
+            detected_gpus = max(1, len(_nvsmi.stdout.strip().splitlines()))
+        except Exception:
+            detected_gpus = 1
+    actual_gpus = num_gpus if num_gpus > 0 else detected_gpus
+    _logger.info("[eval] GPU: detected=%d, requested=%d, actual=%d", detected_gpus, num_gpus, actual_gpus)
 
     # 注意：当前版本的 lm_eval CLI 可能不支持 --samples 参数
     # 对于随机采样，我们使用 --limit 配合随机种子，或者回退到顺序采样
@@ -2076,21 +2311,80 @@ def run_lm_eval_stream(
         model_args = model_args.replace("pretrained=%s" % model_path, "pretrained=%s" % eval_model_path, 1)
 
     batch_size_arg = "1" if is_multimodal_task else "auto"
-    cmd = [
-        lm_eval_bin, "--model", model_backend,
-        "--model_args", model_args,
-        "--tasks", cmd_task_str,
-        "--device", device,
-        "--batch_size", batch_size_arg,
-        "--output_path", output_path,
-        "--log_samples",
-    ]
+
+    limit_too_small_for_multi_gpu = _should_fallback_single_gpu_for_limit(limit, actual_gpus)
+    if limit_too_small_for_multi_gpu:
+        try:
+            _logger.info(
+                "[eval] limit=%s 为绝对条数且 < GPU 数(%d)，回退单卡避免空分片",
+                float(limit),
+                actual_gpus,
+            )
+        except (TypeError, ValueError):
+            _logger.info("[eval] limit 为绝对条数且 < GPU 数(%d)，回退单卡避免空分片", actual_gpus)
+    use_accelerate = actual_gpus >= 2 and device == "cuda" and not is_multimodal_task and not limit_too_small_for_multi_gpu
+
+    # 多卡启动前检查各 GPU 可用显存，排除显存不足的卡（如 VLM 评测残留 CUDA context）
+    gpu_filter_env = {}
+    if use_accelerate:
+        needed_mib = _estimate_model_vram_mib(model_path)
+        avail_gpus = _get_available_gpus(min_free_mib=needed_mib)
+        _logger.info("[eval] GPU 显存预检: 需要 %d MiB/卡, 可用卡=%s", needed_mib, avail_gpus)
+        if len(avail_gpus) < 2:
+            use_accelerate = False
+            if avail_gpus:
+                gpu_filter_env["CUDA_VISIBLE_DEVICES"] = str(avail_gpus[0])
+                _logger.warning("[eval] 仅 %d 张 GPU 显存充足，降级单卡 (GPU %d)", len(avail_gpus), avail_gpus[0])
+            else:
+                _logger.warning("[eval] 无 GPU 显存充足 (需 %d MiB)，尝试使用默认设备", needed_mib)
+        else:
+            actual_gpus = len(avail_gpus)
+            gpu_filter_env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in avail_gpus)
+            _logger.info("[eval] 多卡模式使用 %d 张 GPU: %s", actual_gpus, avail_gpus)
+
+    if use_accelerate:
+        # TP=2（卡对）优先：覆盖为 2 卡、固定 num_processes=2
+        if eval_pair_env.get("CUDA_VISIBLE_DEVICES"):
+            gpu_filter_env["CUDA_VISIBLE_DEVICES"] = eval_pair_env["CUDA_VISIBLE_DEVICES"]
+            actual_gpus = 2
+            _logger.info("[eval][tp2] 启用卡对 TP=2 推理：CUDA_VISIBLE_DEVICES=%s", gpu_filter_env["CUDA_VISIBLE_DEVICES"])
+        accelerate_bin = "accelerate"
+        if MERGENETIC_PYTHON and os.path.isabs(MERGENETIC_PYTHON):
+            _acc_candidate = os.path.join(os.path.dirname(MERGENETIC_PYTHON), "accelerate")
+            if os.path.isfile(_acc_candidate) and os.access(_acc_candidate, os.X_OK):
+                accelerate_bin = _acc_candidate
+        cmd = [
+            accelerate_bin, "launch",
+            "--num_processes", str(actual_gpus),
+            "--multi_gpu",
+            "-m", "lm_eval",
+            "--model", model_backend,
+            "--model_args", model_args,
+            "--tasks", cmd_task_str,
+            "--batch_size", batch_size_arg,
+            "--output_path", output_path,
+            "--log_samples",
+            "--trust_remote_code",
+        ]
+        _logger.info("[eval] 使用 accelerate 多卡模式: %d GPU", actual_gpus)
+    else:
+        cmd = [
+            lm_eval_bin, "--model", model_backend,
+            "--model_args", model_args,
+            "--tasks", cmd_task_str,
+            "--device", device,
+            "--batch_size", batch_size_arg,
+            "--output_path", output_path,
+            "--log_samples",
+            "--trust_remote_code",
+        ]
     
     if custom_include_path:
         cmd.extend(["--include_path", custom_include_path])
 
-    # 使用 --limit 参数（顺序采样和随机采样都使用 limit，因为 CLI 不支持 --samples）
-    if str(limit) != "1.0":
+    # --limit：全量时不传，避免 lm_eval 将 JSON 整数 1 当作「仅 1 条」（与 _resolve_eval_dataset_cap 中 1.0=全量一致）
+    _omit_limit_full = str(limit).strip() == "1.0" or (type(limit) is int and limit == 1)
+    if not _omit_limit_full:
         cmd.extend(["--limit", str(limit)])
 
     # Wrap with conda activate
@@ -2100,6 +2394,13 @@ def run_lm_eval_stream(
     os.makedirs(eval_cache, exist_ok=True)
     eval_env = os.environ.copy()
     eval_env["HF_DATASETS_CACHE"] = eval_cache
+    if gpu_filter_env:
+        eval_env.update(gpu_filter_env)
+    # 小 /dev/shm 或部分容器里 NCCL 默认 shm 段创建会失败；允许走 socket 回退（略慢但更稳）
+    if use_accelerate:
+        eval_env.setdefault("NCCL_SHM_DISABLE", "1")
+
+    _ensure_hf_allow_code_eval_for_lm_eval(eval_env, cmd_task_str, target_tasks_list)
 
     _logger.info("[eval] 执行: %s (HF_DATASETS_CACHE=%s)", " ".join(cmd), eval_cache)
     start_time = time.time()
@@ -2113,6 +2414,10 @@ def run_lm_eval_stream(
         **_popen_group_kwargs(),
     )
     task_control["process"] = process
+
+    # 全量日志文件：保存完整 stdout+stderr，便于事后诊断分布式 rank 错误
+    _full_log_path = os.path.join(output_path, "eval_full_output.log")
+    _full_log_file = open(_full_log_path, "w", encoding="utf-8", errors="replace")
 
     last_update_time = 0.0
     last_lines = []
@@ -2145,6 +2450,13 @@ def run_lm_eval_stream(
         line = "".join(buf)
         buf = []
         
+        # 写入全量日志
+        try:
+            _full_log_file.write(line + "\n")
+            _full_log_file.flush()
+        except Exception:
+            pass
+
         # 即使是空行也继续处理（虽然下面 check 了 line）
         if True: # 保持缩进结构
             _logger.info("[eval] %s", line)
@@ -2244,6 +2556,17 @@ def run_lm_eval_stream(
     process.wait()
     duration = time.time() - start_time
 
+    # 关闭全量日志文件 / 释放 GPU 锁
+    try:
+        _full_log_file.close()
+    except Exception:
+        pass
+    try:
+        if pair_lock_fp is not None:
+            pair_lock_fp.close()
+    except Exception:
+        pass
+
     # Fix: Ensure progress is marked as completed/failed at the end
     try:
         final_status = "completed" if process.returncode == 0 else "failed"
@@ -2270,8 +2593,9 @@ def run_lm_eval_stream(
         _logger.warning("[eval] Failed to write final progress: %s", e)
 
     def _fail_msg(tip):
-        tail = "\n".join(last_lines[-30:]) if last_lines else ""
-        return "%s\n--- lm_eval 输出尾行 ---\n%s" % (tip, tail)
+        tail = "\n".join(last_lines[-60:]) if last_lines else ""
+        full_log_ref = "\n[完整输出见: eval_full_output.log]\n"
+        return "%s%s--- lm_eval 输出尾行(最后60行) ---\n%s" % (tip, full_log_ref, tail)
 
     if process.returncode != 0:
         _logger.warning("[eval] lm_eval 退出码 %s", process.returncode)
@@ -2378,6 +2702,724 @@ def run_lm_eval_stream(
         raise RuntimeError("解析评测结果失败: %s" % e) from e
 
 
+def _is_vlm_benchmark_hf_dataset(hf_dataset: str | None) -> bool:
+    if not hf_dataset:
+        return False
+    key = (hf_dataset or "").strip().lower().rstrip("/")
+    # 约定：lmms-lab/* 均为多模态基准；另外 CMMMU 也属于多模态
+    if key.startswith("lmms-lab/"):
+        return True
+    if key in ("m-a-p/cmmmu", "cmmmu/cmmmu"):
+        return True
+    return False
+
+
+def _infer_lmms_task_name(hf_dataset: str | None, hf_subset: str | None) -> str:
+    """
+    将 HF 数据集标识映射到 lmms-eval 的 --tasks 名。
+    约定：
+    - MMBench: subset 为 en/cn/cc 对应 mmbench_en/mmbench_cn/mmbench_cc；若无则默认 en
+    - MME: mme
+    - 其他：使用 dataset basename（小写），作为最小化通用回退
+    """
+    ds = (hf_dataset or "").strip()
+    ds_key = ds.lower().rstrip("/")
+    subset = (hf_subset or "").strip().lower()
+    if ds_key == "lmms-lab/mmbench":
+        lang = subset if subset in ("en", "cn", "cc") else "en"
+        return f"mmbench_{lang}"
+    if ds_key == "lmms-lab/mme":
+        return "mme"
+    if ds_key in ("m-a-p/cmmmu", "cmmmu/cmmmu"):
+        return "cmmmu"
+    base = ds_key.split("/")[-1] if ds_key else ""
+    return base.replace("-", "_")
+
+
+def _pick_latest_json_in_dir(root_dir: str) -> str | None:
+    try:
+        cands = []
+        for r, _ds, fs in os.walk(root_dir):
+            for fn in fs:
+                if fn.endswith(".json"):
+                    cands.append(os.path.join(r, fn))
+        if not cands:
+            return None
+        cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return cands[0]
+    except Exception:
+        return None
+
+
+def _get_available_gpus(min_free_mib: int = 14000) -> list:
+    """查询各 GPU 空闲显存，返回 >= min_free_mib MiB 的 GPU 索引列表。
+    nvidia-smi 不可用时返回空列表。"""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        available = []
+        for line in r.stdout.strip().splitlines():
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            idx, free = int(parts[0].strip()), int(parts[1].strip())
+            if free >= min_free_mib:
+                available.append(idx)
+        return available
+    except Exception as exc:
+        _logger.warning("[eval] nvidia-smi 查询空闲显存失败: %s", exc)
+        return []
+
+
+def _estimate_model_vram_mib(model_path: str) -> int:
+    """根据模型权重文件大小估算单副本 VRAM 需求（MiB）。
+    包含 ~20% 余量用于 KV cache / activations / 框架开销。
+    无法估算时返回保守默认值 14000 MiB（~14 GiB，适用于 7B bfloat16）。"""
+    try:
+        total_bytes = 0
+        for f in os.listdir(model_path):
+            if f.endswith(".safetensors") or (f.startswith("model") and f.endswith(".bin")):
+                total_bytes += os.path.getsize(os.path.join(model_path, f))
+        if total_bytes > 0:
+            mib = int(total_bytes / (1024 * 1024) * 1.2)
+            _logger.debug("[eval] 模型权重 %d MiB * 1.2 = %d MiB VRAM 估算", int(total_bytes / (1024 * 1024)), mib)
+            return max(mib, 2000)
+    except Exception as exc:
+        _logger.debug("[eval] 模型大小估算失败: %s", exc)
+    return 14000
+
+
+def _resolve_eval_dataset_cap(n: int, limit_raw) -> int:
+    """
+    将评估 API/前端传入的 limit 转为本地数据集最多使用条数 k（与评估页「测试深度」一致）。
+    - L > 1.0：绝对条数 k = min(n, max(1, round(L)))（如健康检查 limit=6）。
+    - 0 < L <= 1.0：比例；L == 1.0 为全量 k = n；否则 k = max(1, int(n * L))。
+    - L <= 0 或无法解析：回退比例 0.5。
+    非 CMMMU/MMBench 本地路径走 lmms-eval 子进程时，子进程路径在可 load_dataset 时会用本函数将 limit 换为整数 k（失败则沿用原 limit 字符串）。
+    """
+    if n <= 0:
+        return 0
+    try:
+        L = float(str(limit_raw).strip())
+    except (TypeError, ValueError):
+        _logger.debug("[eval_limit] limit_raw=%r 无法解析，回退比例 0.5", limit_raw)
+        L = 0.5
+    if L <= 0:
+        _logger.debug("[eval_limit] L=%s <= 0，回退比例 0.5", L)
+        L = 0.5
+    if L > 1.0:
+        k = min(n, max(1, int(round(L))))
+    else:
+        if L >= 1.0:
+            k = n
+        else:
+            k = max(1, int(n * L))
+    _logger.debug("[eval_limit] n=%s limit_raw=%r parsed_L=%s -> k=%s", n, limit_raw, L, k)
+    return k
+
+
+def _should_fallback_single_gpu_for_limit(limit, num_gpus: int) -> bool:
+    """多卡 lm_eval 时：仅当 limit 解析为绝对条数且严格落在 (1.0, num_gpus) 才回退单卡，避免把比例 1.0 误判为「1 条」。"""
+    if num_gpus < 2:
+        return False
+    try:
+        lim = float(limit)
+    except (TypeError, ValueError):
+        return False
+    return lim > 1.0 and lim < num_gpus
+
+
+def run_lmms_eval_stream(
+    model_path,
+    output_path,
+    callback,
+    start_prog,
+    end_prog,
+    task_control=None,
+    limit="0.5",
+    hf_dataset=None,
+    hf_subset=None,
+    hf_split=None,  # kept for future expansion; lmms-eval tasks usually encode split internally
+    num_gpus=0,
+):
+    """
+    VLM 评测：调用 lmms-eval CLI，并将其结果归一化为 { acc, f1, samples, time, context, per_task_acc }。
+    注意：lmms-eval 的部分任务对 --limit 有额外约束（如 MME 需要成对），因此这里对 mme 自动将 limit>=1 的奇数调整为偶数。
+    """
+    if task_control is None:
+        task_control = {}
+    os.makedirs(output_path, exist_ok=True)
+
+    task_name = _infer_lmms_task_name(hf_dataset, hf_subset)
+    model_backend = _infer_lmms_model_backend(model_path)
+
+    # MMBench：lmms-eval 默认依赖 OpenAI 评分/提交指标（离线环境不可用），这里走本地多选题准确率评测（dev split）。
+    # 说明：该实现优先适配 Qwen2.5-VL / Qwen2VL 等 transformers 可加载的 VLM；其他 VLM 若不兼容会在此处报错。
+    hf_key = (hf_dataset or "").strip().lower().rstrip("/")
+    # CMMMU：lmms-eval 的任务 YAML 依赖 include 模板，离线/被补空模板时易碎；这里走本地评测以保证系统流程可用。
+    if hf_key in ("m-a-p/cmmmu", "cmmmu/cmmmu"):
+        try:
+            from datasets import load_dataset
+            import torch
+            from transformers import AutoModelForImageTextToText
+            from transformers import AutoProcessor
+            try:
+                from lmms_eval.tasks.cmmmu import utils as cmmmu_utils  # type: ignore
+            except Exception as e:
+                raise RuntimeError(f"CMMMU 本地评测依赖 lmms_eval.tasks.cmmmu.utils，当前不可用: {e}")
+
+            subset = (hf_subset or "").strip() or "health_and_medicine"
+            split = (hf_split or "").strip().lower() or "val"
+            if split not in ("val", "test", "validation", "dev"):
+                split = "val"
+            if split == "validation":
+                split = "val"
+            if split == "dev":
+                split = "val"
+
+            callback(start_prog, f"加载 CMMMU({subset}) 数据集…")
+            ds = load_dataset(hf_dataset, subset, split=split, trust_remote_code=True)
+            n = len(ds)
+            k = _resolve_eval_dataset_cap(n, limit)
+            ds = ds.select(range(k))
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            torch_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+            callback(start_prog + 5, "加载 VLM 权重…")
+            vlm = None
+            processor = None
+            try:
+                vlm = AutoModelForImageTextToText.from_pretrained(
+                    model_path,
+                    torch_dtype=torch_dtype,
+                    device_map=device,
+                    trust_remote_code=True,
+                )
+                vlm.eval()
+                try:
+                    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+                except Exception as e_proc:
+                    _hint = ""
+                    _em = str(e_proc).lower()
+                    if "trailing characters" in _em or "extra data" in _em:
+                        _hint = " tokenizer.json 可能损坏或含拼接的多段 JSON，请备份后截取首段合法对象或从 Hub 重下该文件。"
+                    elif "tokenizer" in _em or "tokenizers" in _em:
+                        _hint = " 请检查模型目录下 tokenizer.json、tokenizer_config.json 是否完整。"
+                    raise RuntimeError("加载 VLM Processor 失败: %s%s" % (e_proc, _hint)) from e_proc
+
+                # Qwen2.5-VL：图像 token 数需与输入图像数一致
+                image_token = "<|image_pad|>"
+                try:
+                    cfg = _load_model_config_json(model_path) or {}
+                    tid = cfg.get("image_token_id")
+                    tok = getattr(processor, "tokenizer", None)
+                    if tid is not None and tok is not None:
+                        image_token = tok.decode([int(tid)]).strip() or image_token
+                except Exception:
+                    pass
+
+                def _build_prompt_and_visuals(doc):
+                    prompt = cmmmu_utils.construct_prompt(doc)
+                    visuals = []
+                    try:
+                        visuals = cmmmu_utils.cmmmu_doc_to_visual(doc) or []
+                    except Exception:
+                        visuals = []
+                    # 将 <图片 i> 替换为模型需要的图像 token（每张图一个 token）
+                    # 注意：construct_prompt 会把 <img="..."> 替换成 <图片 i>
+                    if visuals:
+                        prompt = (image_token + "\n") * len(visuals) + prompt
+                    return prompt, visuals
+
+                results = []
+                start_time = time.time()
+                for i in range(len(ds)):
+                    if task_control.get("aborted"):
+                        raise RuntimeError("任务已被用户手动终止")
+                    doc = ds[i]
+                    prompt, visuals = _build_prompt_and_visuals(doc)
+                    inputs = processor(text=prompt, images=visuals if visuals else None, return_tensors="pt")
+                    _moved = {}
+                    for k, v in inputs.items():
+                        if not hasattr(v, "to"):
+                            _moved[k] = v
+                            continue
+                        if getattr(v, "dtype", None) is not None and str(v.dtype).startswith("torch.int"):
+                            _moved[k] = v.to(device)
+                        else:
+                            _moved[k] = v.to(device, dtype=torch_dtype)
+                    inputs = _moved
+                    with torch.no_grad():
+                        out_ids = vlm.generate(**inputs, max_new_tokens=32)
+                    out_text = processor.batch_decode(out_ids, skip_special_tokens=True)[0]
+                    try:
+                        pr = cmmmu_utils.cmmmu_process_results(doc, [out_text])
+                        if isinstance(pr, dict) and "cmmmu_acc" in pr:
+                            results.append(pr["cmmmu_acc"])
+                    except Exception:
+                        # 若解析失败，也记录空预测，避免中断
+                        results.append({
+                            "id": doc.get("id"),
+                            "subdomain": doc.get("subcategory"),
+                            "question_type": doc.get("type"),
+                            "answer": doc.get("answer"),
+                            "parsed_pred": out_text,
+                        })
+
+                    if (i + 1) % 5 == 0:
+                        pct = int(100 * (i + 1) / max(1, len(ds)))
+                        span = max(0, int(end_prog) - int(start_prog))
+                        prog_val = int(start_prog) + int((span * pct) / 100)
+                        callback(min(int(end_prog), prog_val), f"CMMMU 评测中… {i+1}/{len(ds)}")
+
+                # 复用 lmms_eval 的聚合逻辑，生成 overall 与各域指标
+                subset_to_samples = {}
+                for r in results:
+                    sd = r.get("subdomain") or "unknown"
+                    subset_to_samples.setdefault(sd, []).append(r)
+
+                evaluation_result = {}
+                for sub, entries in subset_to_samples.items():
+                    try:
+                        evaluation_result[sub] = cmmmu_utils.eval_cmmmu(entries)
+                    except Exception:
+                        evaluation_result[sub] = {"correct_num": 0, "entries_num": len(entries), "acc": 0.0}
+
+                printable = {}
+                for domain, in_domain_cats in cmmmu_utils.DOMAIN_CAT2SUB_CAT.items():
+                    in_domain_cat_results = {}
+                    for cat_name in in_domain_cats:
+                        if cat_name in evaluation_result:
+                            in_domain_cat_results[cat_name] = evaluation_result[cat_name]
+                    try:
+                        in_domain_ins_acc = cmmmu_utils.calculate_ins_level_acc(in_domain_cat_results)
+                    except Exception:
+                        in_domain_ins_acc = 0.0
+                    in_domain_data_num = sum(int(cat.get("entries_num") or 0) for cat in in_domain_cat_results.values())
+                    printable["Overall-" + domain] = {"num": int(in_domain_data_num), "acc": round(float(in_domain_ins_acc), 3)}
+
+                try:
+                    all_ins_acc = cmmmu_utils.calculate_ins_level_acc(evaluation_result)
+                except Exception:
+                    all_ins_acc = 0.0
+                printable["Overall"] = {
+                    "num": int(sum(int(cat.get("entries_num") or 0) for cat in evaluation_result.values())),
+                    "acc": round(float(all_ins_acc), 3),
+                }
+
+                duration = time.time() - start_time
+                per_task_acc = {k: round(v.get("acc", 0.0) * 100, 2) for k, v in printable.items()}
+                context_len = _eval_get_context_length(model_path)
+                return {
+                    "acc": round(float(printable["Overall"]["acc"]) * 100, 2),
+                    "f1": round(float(printable["Overall"]["acc"]), 4),
+                    "samples": int(printable["Overall"]["num"]),
+                    "time": round(duration, 2),
+                    "context": int(context_len or 0),
+                    "per_task_acc": per_task_acc,
+                }
+            finally:
+                try:
+                    if vlm is not None:
+                        del vlm
+                    if processor is not None:
+                        del processor
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        except Exception as e:
+            _logger.exception("CMMMU 本地评测失败: %s", e)
+            raise RuntimeError("CMMMU 本地评测失败: %s" % e) from e
+
+    if hf_key == "lmms-lab/mmbench":
+        try:
+            from datasets import load_dataset
+            import torch
+            from transformers import AutoModelForImageTextToText
+            from transformers import AutoProcessor
+
+            lang = (hf_subset or "").strip().lower()
+            if lang not in ("en", "cn", "cc"):
+                lang = "en"
+            split = (hf_split or "").strip().lower() or "dev"
+            if split not in ("dev", "test"):
+                split = "dev"
+            if split == "test":
+                # test 无标签，无法算准确率；强制 dev
+                split = "dev"
+
+            callback(start_prog, f"加载 MMBench({lang}) 数据集…")
+            ds = load_dataset("lmms-lab/MMBench", lang, split=split, trust_remote_code=True)
+            n = len(ds)
+            k = _resolve_eval_dataset_cap(n, limit)
+            ds = ds.select(range(k))
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            torch_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+            callback(start_prog + 5, "加载 VLM 权重…")
+            vlm = None
+            processor = None
+            try:
+                vlm = AutoModelForImageTextToText.from_pretrained(
+                    model_path,
+                    torch_dtype=torch_dtype,
+                    device_map=device,
+                    trust_remote_code=True,
+                )
+                vlm.eval()
+                try:
+                    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+                except Exception as e_proc:
+                    _hint = ""
+                    _em = str(e_proc).lower()
+                    if "trailing characters" in _em or "extra data" in _em:
+                        _hint = " tokenizer.json 可能损坏或含拼接的多段 JSON，请备份后截取首段合法对象或从 Hub 重下该文件。"
+                    elif "tokenizer" in _em or "tokenizers" in _em:
+                        _hint = " 请检查模型目录下 tokenizer.json、tokenizer_config.json 是否完整。"
+                    raise RuntimeError("加载 VLM Processor 失败: %s%s" % (e_proc, _hint)) from e_proc
+
+                # Qwen2.5-VL 需要在 prompt 中显式包含 image 占位 token，否则会出现「image features and image tokens do not match」
+                image_token = "<|image_pad|>"
+                try:
+                    cfg = _load_model_config_json(model_path) or {}
+                    tid = cfg.get("image_token_id")
+                    tok = getattr(processor, "tokenizer", None)
+                    if tid is not None and tok is not None:
+                        image_token = tok.decode([int(tid)]).strip() or image_token
+                except Exception:
+                    pass
+
+                def _parse_choice(text: str) -> str:
+                    if not text:
+                        return ""
+                    s = str(text).strip().upper()
+                    # 优先匹配独立选项字母
+                    m = re.search(r"\b([ABCD])\b", s)
+                    if m:
+                        return m.group(1)
+                    m2 = re.search(r"^\s*([ABCD])\s*$", s)
+                    if m2:
+                        return m2.group(1)
+                    # 回退：取第一个出现的 A/B/C/D
+                    for ch in ("A", "B", "C", "D"):
+                        if ch in s:
+                            return ch
+                    return ""
+
+                correct = 0
+                total = 0
+                start_time = time.time()
+                for i in range(len(ds)):
+                    if task_control.get("aborted"):
+                        raise RuntimeError("任务已被用户手动终止")
+                    ex = ds[i]
+                    hint = ex.get("hint")
+                    q = ex.get("question") or ""
+                    opts = []
+                    for k in ("A", "B", "C", "D"):
+                        v = ex.get(k)
+                        if v is None:
+                            continue
+                        opts.append(f"{k}. {v}")
+                    prompt = ""
+                    if hint and str(hint).lower() not in ("nan", "none"):
+                        prompt += str(hint).strip() + "\n\n"
+                    prompt += image_token + "\n" + str(q).strip() + "\n" + "\n".join(opts) + "\n\nAnswer with a single letter (A, B, C, or D)."
+
+                    image = ex.get("image")
+                    if image is None:
+                        continue
+                    inputs = processor(text=prompt, images=image, return_tensors="pt")
+                    _moved = {}
+                    for k, v in inputs.items():
+                        if not hasattr(v, "to"):
+                            _moved[k] = v
+                            continue
+                        # input_ids/attention_mask 等索引张量必须保持整型
+                        if getattr(v, "dtype", None) is not None and str(v.dtype).startswith("torch.int"):
+                            _moved[k] = v.to(device)
+                        else:
+                            _moved[k] = v.to(device, dtype=torch_dtype)
+                    inputs = _moved
+                    with torch.no_grad():
+                        out_ids = vlm.generate(**inputs, max_new_tokens=8)
+                    out_text = processor.batch_decode(out_ids, skip_special_tokens=True)[0]
+                    pred = _parse_choice(out_text)
+                    gold = (ex.get("answer") or "").strip().upper()
+                    if gold in ("A", "B", "C", "D"):
+                        total += 1
+                        if pred == gold:
+                            correct += 1
+                    if (i + 1) % 5 == 0:
+                        pct = int(100 * (i + 1) / max(1, len(ds)))
+                        span = max(0, int(end_prog) - int(start_prog))
+                        prog_val = int(start_prog) + int((span * pct) / 100)
+                        callback(min(int(end_prog), prog_val), f"MMBench 评测中… {i+1}/{len(ds)}")
+
+                acc = (correct / total) * 100 if total else 0.0
+                duration = time.time() - start_time
+                return {
+                    "acc": round(acc, 2),
+                    "f1": round(acc / 100, 4) if total else 0.0,
+                    "samples": int(total),
+                    "time": round(duration, 2),
+                    "context": 0,
+                    "per_task_acc": {"acc": round(acc, 2)},
+                }
+            finally:
+                try:
+                    if vlm is not None:
+                        del vlm
+                    if processor is not None:
+                        del processor
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        except Exception as e:
+            raise RuntimeError(f"MMBench 本地评测失败: {e}") from e
+
+    # lmms-eval 子进程：优先用 hf_dataset + load_dataset 得到 n，再 _resolve_eval_dataset_cap(n, limit) -> 整数 k 作为 --limit；失败则保持下方 limit_str 解析（与现网一致）。
+    limit_str = str(limit or "0.5").strip()
+    try:
+        limit_val = float(limit_str)
+    except Exception:
+        limit_val = 0.5
+        limit_str = "0.5"
+
+    hf_probe = (hf_dataset or "").strip()
+    if hf_probe:
+        try:
+            from datasets import load_dataset
+
+            sub = (hf_subset or "").strip() or None
+            spl = (hf_split or "").strip() or "validation"
+            if sub:
+                ds_probe = load_dataset(hf_probe, sub, split=spl, trust_remote_code=True)
+            else:
+                ds_probe = load_dataset(hf_probe, split=spl, trust_remote_code=True)
+            n_cli = len(ds_probe)
+            if n_cli > 0:
+                k_cli = _resolve_eval_dataset_cap(n_cli, limit)
+                limit_str = str(k_cli)
+                limit_val = float(k_cli)
+                _logger.debug(
+                    "[lmms-eval] CLI --limit 由数据集换算: hf=%s n=%s limit_raw=%r -> k=%s",
+                    hf_probe,
+                    n_cli,
+                    limit,
+                    limit_str,
+                )
+        except Exception as e:
+            _logger.debug(
+                "[lmms-eval] load_dataset 换算 limit 跳过，沿用 limit_str=%s: %s",
+                limit_str,
+                e,
+            )
+
+    # 仅当 limit 表示绝对条数（>1）时，对 mme 做偶数对齐；1.0 表示比例全量，不再误整成 2
+    if task_name == "mme" and limit_val > 1.0:
+        n_mme = int(round(limit_val))
+        if n_mme % 2 == 1:
+            n_mme += 1
+            limit_str = str(n_mme)
+            _logger.info("[lmms-eval] mme 需要成对样本，limit 调整为偶数: %s", limit_str)
+
+    full_log_path = os.path.join(output_path, "eval_full_output.log")
+
+    # 构建命令（注意：不要把 trust_remote_code 放进 model_args；部分后端会断言 Unexpected kwargs）
+    model_args = f"pretrained={model_path}"
+    cmd = [
+        sys.executable, "-m", "lmms_eval", "eval",
+        "--model", model_backend,
+        "--model_args", model_args,
+        "--tasks", task_name,
+        "--batch_size", "1",
+        "--limit", limit_str,
+        "--output_path", output_path,
+        "--log_samples",
+        "--trust_remote_code",
+        "--process_with_media",
+    ]
+
+    if int(num_gpus or 0) >= 2:
+        _logger.info("[lmms-eval] 当前暂不启用多卡；num_gpus=%s 将回退单进程执行", num_gpus)
+
+    eval_env = os.environ.copy()
+    eval_env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    _logger.info("[lmms-eval] 执行: %s (HF_ENDPOINT=%s)", " ".join(cmd), eval_env.get("HF_ENDPOINT"))
+
+    import subprocess
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=eval_env,
+        **_popen_group_kwargs(),
+    )
+    task_control["process"] = process
+
+    last_lines = []
+    max_tail = 60
+    last_update_time = 0.0
+    start_time = time.time()
+
+    with open(full_log_path, "w", encoding="utf-8", errors="replace") as flog:
+        buf = []
+        while True:
+            if task_control.get("aborted"):
+                ProcessManager.kill_process_tree(process)
+                raise RuntimeError("任务已被用户手动终止")
+
+            ch = process.stdout.read(1) if process.stdout else ""
+            if not ch:
+                if process.poll() is not None:
+                    break
+                continue
+
+            if ch not in ("\n", "\r"):
+                buf.append(ch)
+                continue
+
+            line = "".join(buf)
+            buf = []
+
+            try:
+                flog.write(line + "\n")
+                flog.flush()
+            except Exception:
+                pass
+
+            if line:
+                last_lines.append(line)
+                if len(last_lines) > max_tail:
+                    last_lines.pop(0)
+            _logger.info("[lmms-eval] %s", line)
+
+            now = time.time()
+            if now - last_update_time > 0.5:
+                clean = line.strip()[:80]
+                if clean:
+                    prog_val = start_prog
+                    m = re.search(r"(\d+)\s*%\|", line)
+                    if m:
+                        try:
+                            pct = int(m.group(1))
+                            span = max(0, int(end_prog) - int(start_prog))
+                            prog_val = int(start_prog) + int((span * pct) / 100)
+                            if prog_val > int(end_prog):
+                                prog_val = int(end_prog)
+                        except Exception:
+                            prog_val = start_prog
+                    callback(prog_val, clean)
+                    last_update_time = now
+
+    if process.returncode != 0:
+        tail = "\n".join(last_lines[-60:]) if last_lines else ""
+        err_path = os.path.join(output_path, "eval_stderr.txt")
+        try:
+            with open(err_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "lmms-eval 退出码: %s\n[完整输出见: eval_full_output.log]\n--- 输出尾行(最后60行) ---\n%s"
+                    % (process.returncode, tail)
+                )
+        except Exception:
+            pass
+        raise RuntimeError(
+            "评测进程退出码 %s，详见任务目录 eval_stderr.txt.\n--- 输出尾行 ---\n%s"
+            % (process.returncode, tail[-2000:] if len(tail) > 2000 else tail)
+        )
+
+    # lmms-eval 输出的结果文件通常为 *results.json（可能在子目录 Models__* 下）。
+    # 注意：任务目录中本项目自身也会写 metadata.json，必须排除以避免误解析。
+    json_path = None
+    try:
+        cands = []
+        for r, _ds, fs in os.walk(output_path):
+            for fn in fs:
+                if fn.endswith("_results.json"):
+                    cands.append(os.path.join(r, fn))
+        if cands:
+            cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            json_path = cands[0]
+    except Exception:
+        json_path = None
+    if not json_path:
+        # 若没有 results.json，视为失败（lmms-eval 部分错误会错误地返回 exit=0）
+        tail = "\n".join(last_lines[-60:]) if last_lines else ""
+        err_path = os.path.join(output_path, "eval_stderr.txt")
+        try:
+            with open(err_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "lmms-eval 未生成结果文件（可能内部异常但退出码为 0）。\n"
+                    "[完整输出见: eval_full_output.log]\n"
+                    "--- 输出尾行(最后60行) ---\n%s" % tail
+                )
+        except Exception:
+            pass
+        raise RuntimeError("评测未生成结果文件，请检查 eval_full_output.log")
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            result_json = json.load(f)
+    except Exception as e:
+        raise RuntimeError("解析 lmms-eval 结果 json 失败: %s" % e) from e
+
+    duration = time.time() - start_time
+
+    per_task_acc = {}
+    acc = 0.0
+    samples = 0
+
+    container = None
+    if isinstance(result_json, dict):
+        container = result_json.get("results") or result_json.get("tasks") or result_json.get("task_results") or result_json
+    if isinstance(container, dict):
+        task_blob = container.get(task_name) if isinstance(container.get(task_name), dict) else None
+        if task_blob is None:
+            for _k, v in container.items():
+                if isinstance(v, dict):
+                    task_blob = v
+                    break
+        if isinstance(task_blob, dict):
+            for k in ("n_samples", "num_samples", "samples", "count"):
+                if isinstance(task_blob.get(k), (int, float)):
+                    samples = int(task_blob.get(k))
+                    break
+            cand_keys = ("accuracy", "acc", "mme_cognition_score", "mme_perception_score", "score")
+            for k in cand_keys:
+                v = task_blob.get(k)
+                if isinstance(v, (int, float)):
+                    per_task_acc[k] = float(v)
+            if per_task_acc:
+                acc = float(next(iter(per_task_acc.values())))
+            else:
+                for k, v in task_blob.items():
+                    if isinstance(v, (int, float)):
+                        acc = float(v)
+                        per_task_acc[k] = float(v)
+                        break
+
+    return {
+        "acc": float(acc or 0.0),
+        "f1": 0.0,
+        "samples": int(samples or 0),
+        "time": round(float(duration), 2),
+        "context": 0,
+        "per_task_acc": per_task_acc,
+    }
+
+
 def run_eval_only_task(task_id, params, update_progress_callback, task_control=None):
     """仅评估任务：与 mergeKit_alpha 一致，调用 run_lm_eval_stream 后按 alpha 格式写 metadata 并返回。
     当选择「测试集仓库」时，使用 params 中的 hf_dataset / hf_subset / hf_split，不再使用内置 benchmark。"""
@@ -2442,22 +3484,18 @@ def run_eval_only_task(task_id, params, update_progress_callback, task_control=N
         display_task = "Standard Benchmark" if (dataset_name == "all" and not hf_dataset) else dataset_name
         update_progress_callback(30, "正在启动评估 (%s)..." % display_task)
 
-        prompt_yaml = _resolve_prompt_yaml_for_testset(params.get("testset_id"), hf_dataset, hf_subset)
-        use_yaml = bool(prompt_yaml and os.path.isfile(prompt_yaml) and (prompt_yaml.endswith(".yaml") or prompt_yaml.endswith(".yml")))
-        if use_yaml:
-            metadata["yaml_template"] = prompt_yaml
-            _write_metadata(task_id, task_dir, metadata)
-            
-            # 直接调用 lm_eval，不再使用 eval_worker.py 避免递归死循环
-            # 解析任务名和包含路径
-            custom_task_name = os.path.splitext(os.path.basename(prompt_yaml))[0]
-            custom_include_path = os.path.dirname(prompt_yaml)
-            
-            # 复用 run_lm_eval_stream 的逻辑，但传入 custom_include_path
-            metrics = run_lm_eval_stream(
+        use_yaml = False
+
+        # VLM 路由：当选择的是 VLM 基准（如 lmms-lab/MMBench、lmms-lab/MME）时，
+        # 若模型包含视觉塔则走 lmms-eval；否则直接报错并阻止执行（避免误入文本 lm_eval）。
+        if hf_dataset and _is_vlm_benchmark_hf_dataset(hf_dataset):
+            if not _model_is_vlm(model_path):
+                msg = "该测试集为 VLM（视觉-语言）基准，需要选择带视觉塔的模型才能运行。hf_dataset=%s" % hf_dataset
+                _write_meta("error", error=msg)
+                return {"status": "error", "error": msg}
+            metrics = run_lmms_eval_stream(
                 model_path,
                 task_dir,
-                custom_task_name,
                 update_progress_callback,
                 30,
                 95,
@@ -2466,27 +3504,58 @@ def run_eval_only_task(task_id, params, update_progress_callback, task_control=N
                 hf_dataset=hf_dataset,
                 hf_subset=hf_subset,
                 hf_split=hf_split,
-                custom_include_path=custom_include_path, # 传入包含路径
-                sampling=(params.get("sampling") or "sequential").strip() or "sequential",
+                num_gpus=int(params.get("num_gpus", 0)),
             )
-
-
         else:
-            metrics = run_lm_eval_stream(
-                model_path,
-                task_dir,
-                dataset_name,
-                update_progress_callback,
-                30,
-                95,
-                task_control,
-                limit=limit_val,
-                hf_dataset=hf_dataset,
-                hf_subset=hf_subset,
-                hf_split=hf_split,
-                lm_eval_task=(params.get("lm_eval_task") or "").strip() or None,
-                sampling=(params.get("sampling") or "sequential").strip() or "sequential",
+            prompt_yaml = _resolve_prompt_yaml_for_testset(params.get("testset_id"), hf_dataset, hf_subset)
+            use_yaml = bool(
+                prompt_yaml
+                and os.path.isfile(prompt_yaml)
+                and (prompt_yaml.endswith(".yaml") or prompt_yaml.endswith(".yml"))
             )
+            if use_yaml:
+                metadata["yaml_template"] = prompt_yaml
+                _write_metadata(task_id, task_dir, metadata)
+
+                # 直接调用 lm_eval，不再使用 eval_worker.py 避免递归死循环
+                # 解析任务名和包含路径
+                custom_task_name = os.path.splitext(os.path.basename(prompt_yaml))[0]
+                custom_include_path = os.path.dirname(prompt_yaml)
+
+                # 复用 run_lm_eval_stream 的逻辑，但传入 custom_include_path
+                metrics = run_lm_eval_stream(
+                    model_path,
+                    task_dir,
+                    custom_task_name,
+                    update_progress_callback,
+                    30,
+                    95,
+                    task_control,
+                    limit=limit_val,
+                    hf_dataset=hf_dataset,
+                    hf_subset=hf_subset,
+                    hf_split=hf_split,
+                    custom_include_path=custom_include_path,
+                    sampling=(params.get("sampling") or "sequential").strip() or "sequential",
+                    num_gpus=int(params.get("num_gpus", 0)),
+                )
+            else:
+                metrics = run_lm_eval_stream(
+                    model_path,
+                    task_dir,
+                    dataset_name,
+                    update_progress_callback,
+                    30,
+                    95,
+                    task_control,
+                    limit=limit_val,
+                    hf_dataset=hf_dataset,
+                    hf_subset=hf_subset,
+                    hf_split=hf_split,
+                    lm_eval_task=(params.get("lm_eval_task") or "").strip() or None,
+                    sampling=(params.get("sampling") or "sequential").strip() or "sequential",
+                    num_gpus=int(params.get("num_gpus", 0)),
+                )
 
         # 与 mergeKit_alpha 一致：雷达图固定为三维 [Accuracy, Efficiency, Context]
         context_val = metrics.get("context", 0) or 0
@@ -2538,6 +3607,7 @@ def run_eval_only_task(task_id, params, update_progress_callback, task_control=N
             "test_cases": metrics["samples"],
             "context": str(metrics["context"]) if metrics["context"] else "N/A",
             "base_name": base_model_name,
+            "per_task_acc": metrics.get("per_task_acc", {}) or {},
             "comparison": {
                 "labels": ["Accuracy", "Efficiency", "Context"],
                 "base_data": [0, 0, 0], # 0 will be treated as 'No Data' in UI

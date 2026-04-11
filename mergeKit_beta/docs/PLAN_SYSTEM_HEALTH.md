@@ -1,25 +1,27 @@
 ---
+
 name: 系统健康监控与仓库自动发现
 overview: 在现有 Flask 应用中新增自动化健康检查、模型/数据集目录变更监听与门户校验、全量变更日志，以及面向非技术用户的系统仪表盘前端页面；同时修复 Docker 构建阶段的 conda/pip 下载速度问题。
 todos:
-  - id: phase-a
-    content: "Phase A: DB 模型（SystemEvent + ModelHealthCheck + 补字段）+ HealthCheckService + ChangeLogService + API 端点"
-    status: pending
-  - id: phase-b
-    content: "Phase B: FileSystemWatcher（watchdog PollingObserver）+ 与健康检查/变更日志集成 + 自动触发"
-    status: pending
-  - id: phase-c
-    content: "Phase C: system.html 仪表盘 + system.js + model_repo/testsets 状态指示器 + 侧栏导航"
-    status: pending
-  - id: phase-d
-    content: "Phase D: Dockerfile conda/pip 镜像源配置 + 重建验证"
-    status: pending
-  - id: phase-e
-    content: "Phase E: 端到端集成验收（新模型/数据集自动发现 → 门户校验 → 前端展示）"
-    status: pending
-isProject: false
----
 
+- id: phase-a
+content: "Phase A: DB 模型（SystemEvent + ModelHealthCheck + 补字段）+ HealthCheckService + ChangeLogService + API 端点"
+status: pending
+- id: phase-b
+content: "Phase B: FileSystemWatcher（watchdog PollingObserver）+ 与健康检查/变更日志集成 + 自动触发"
+status: pending
+- id: phase-c
+content: "Phase C: system.html 仪表盘 + system.js + model_repo/testsets 状态指示器 + 侧栏导航"
+status: pending
+- id: phase-d
+content: "Phase D: Dockerfile conda/pip 镜像源配置 + 重建验证"
+status: pending
+- id: phase-e
+content: "Phase E: 端到端集成验收（新模型/数据集自动发现 → 门户校验 → 前端展示）"
+status: pending
+isProject: false
+
+---
 
 # 系统健康监控、仓库自动发现与变更日志
 
@@ -58,6 +60,8 @@ flowchart TB
     DB --> ModelPage
     DB --> TestsetPage
 ```
+
+
 
 ## 一、新增 DB 模型
 
@@ -123,6 +127,7 @@ flowchart TB
 **两级检查**：
 
 **Quick Check（自动触发，无需 GPU，约 2-5 秒/模型）**：
+
 - `config.json` 存在且可解析
 - `architectures` 字段可读
 - 权重文件存在（`.safetensors` 或 `.bin`）
@@ -131,16 +136,19 @@ flowchart TB
 - 判定 `weight_format`：safetensors / bin / mixed / missing
 
 **Deep Check（手动触发，需 GPU，约 30-60 秒/模型）**：
+
 - 复用已有 [check_model_health.py](Workspaces/mergeKit_beta/evolution/vendor/vlm_merge/check_model_health.py) 的 `scan_safetensors` + `smoke_generate`
 - 检测 nan/inf tensor
 - 冒烟生成测试
 
 **数据集检查**：
+
 - yaml/json 文件可解析
 - HF 数据集可 `load_dataset` 加载（可选，网络依赖）
 - 样本数 > 0
 
 **mergekit 架构兼容检查**：
+
 - 读取模型 `config.json` 的 `architectures`
 - 对照当前 mergekit 安装的 `_data/architectures/*.json`，判断是否支持
 - 返回兼容状态：`supported` / `unsupported` / `needs_patch`
@@ -148,11 +156,13 @@ flowchart TB
 ### 2.3 `app/changelog.py` — 变更日志服务
 
 **记录范围**：
+
 - 环境层：Git commit 变化、依赖版本变化、Docker 镜像重建
 - 业务层：模型新增/删除/健康状态变化、数据集注册/注销、融合任务配置变化
 - 操作层：手动触发的健康检查、手动刷新
 
 **接口**：
+
 - `log_event(event_type, target, severity, details)` — 写入 `SystemEvent` 表
 - `get_events(since=None, event_type=None, limit=50)` — 查询事件列表
 - `get_system_summary()` — 聚合当前系统状态（模型数/健康数/异常数、数据集数、最近事件）
@@ -161,28 +171,34 @@ flowchart TB
 
 在 [app/routes.py](Workspaces/mergeKit_beta/app/routes.py) 中新增：
 
-| 方法 | 路径 | 功能 |
-|------|------|------|
-| GET | `/api/system/health` | 返回系统健康总览（模型状态统计、数据集状态统计、GPU 信息、依赖版本、磁盘空间） |
-| GET | `/api/system/changelog` | 分页查询变更日志，支持 `?type=...&since=...&limit=50` |
-| POST | `/api/system/check/model` | 手动触发单个模型健康检查，body: `{"model_name": "...","check_type": "quick|deep"}` |
-| POST | `/api/system/check/all` | 触发全量快速检查 |
-| GET | `/api/system/models/status` | 返回所有模型及其 `health_status`，含最近一次检查结果摘要 |
-| GET | `/api/system/datasets/status` | 返回所有数据集及其 `health_status` |
-| GET | `/api/system/env` | 返回当前环境信息（Git HEAD、mergekit 版本、transformers 版本、torch 版本、GPU 型号/显存） |
+
+| 方法   | 路径                            | 功能                                                                |
+| ---- | ----------------------------- | ----------------------------------------------------------------- |
+| GET  | `/api/system/health`          | 返回系统健康总览（模型状态统计、数据集状态统计、GPU 信息、依赖版本、磁盘空间）                         |
+| GET  | `/api/system/changelog`       | 分页查询变更日志，支持 `?type=...&since=...&limit=50`                        |
+| POST | `/api/system/check/model`     | 手动触发单个模型健康检查，body: `{"model_name": "...","check_type": "quick     |
+| POST | `/api/system/check/all`       | 触发全量快速检查                                                          |
+| GET  | `/api/system/models/status`   | 返回所有模型及其 `health_status`，含最近一次检查结果摘要                              |
+| GET  | `/api/system/datasets/status` | 返回所有数据集及其 `health_status`                                         |
+| GET  | `/api/system/env`             | 返回当前环境信息（Git HEAD、mergekit 版本、transformers 版本、torch 版本、GPU 型号/显存） |
+
 
 页面路由：
-| 方法 | 路径 | 功能 |
-|------|------|------|
+
+
+| 方法  | 路径        | 功能      |
+| --- | --------- | ------- |
 | GET | `/system` | 系统仪表盘页面 |
+
 
 ## 四、前端
 
 ### 4.1 新增 `templates/system.html` — 系统仪表盘
 
-整体风格与现有 Apple/iOS 风格保持一致（使用 [styles.css](Workspaces/mergeKit_beta/static/styles.css) 中已有的 `.apple-card`、`.ios-*`、CSS 变量）。
+整体风格与现有 Apple/iOS 风格保持一致（使用 [styles.css](Workspaces/mergeKit_beta/static/styles.css) 中已有的 `.apple-card`、`.ios-`*、CSS 变量）。
 
 **布局**：
+
 - 顶部状态栏：三个状态卡片（模型健康率、数据集可用率、系统状态），用绿/黄/红色圆点
 - 环境信息区：Git commit（短 hash + 提交信息）、mergekit/transformers/torch 版本、GPU 信息、磁盘剩余
 - 模型健康列表：表格，每行一个模型，列 = 名称 / 架构 / 格式 / 大小 / 状态（带颜色标记）/ 最近检查时间 / 操作（手动检查按钮）
@@ -190,6 +206,7 @@ flowchart TB
 - 变更日志时间线：按时间倒序，每条事件卡片展示类型图标 + 目标 + 摘要 + 时间
 
 **交互**：
+
 - 页面打开时一次性拉取 `/api/system/health` + `/api/system/changelog`
 - 每 30 秒轮询 `/api/system/health`（仅页面可见时）
 - 手动检查按钮 → POST `/api/system/check/model`，按钮变为 spinner，完成后刷新该行
@@ -205,16 +222,19 @@ flowchart TB
 
 ### 4.3 修改现有页面
 
-**`templates/model_repo.html`**：
+`**templates/model_repo.html`**：
+
 - 每个 `.model-card` 右上角加状态圆点（绿=healthy / 黄=checking / 红=error / 灰=unknown）
 - 鼠标悬停显示最近检查时间与摘要
 - 刷新时同时拉取 `/api/system/models/status`
 
-**`templates/testsets.html`**：
+`**templates/testsets.html**`：
+
 - 每个 `.testset-card` 加状态圆点
 - 同理
 
 **所有模板的侧栏导航**：
+
 - 新增「系统监控」链接指向 `/system`，图标使用 `ri-pulse-line` 或 `ri-dashboard-3-line`
 
 ### 4.4 状态指示器样式
@@ -249,6 +269,7 @@ RUN /opt/conda/bin/conda config --add channels https://mirrors.tuna.tsinghua.edu
 同时在 `environment.yml` 的 channels 段落确认使用 `defaults`（conda 镜像会自动代理 defaults 通道）。
 
 **排障要点**（写入提示词的诊断步骤）：
+
 1. 确认宿主机 DNS 可解析 `mirrors.tuna.tsinghua.edu.cn` 和 `mirrors.aliyun.com`
 2. 容器内 `curl -I https://mirrors.aliyun.com/pypi/simple/` 应返回 200
 3. 若仍慢，检查 Docker DNS 配置（`docker-compose.yml` 已有 `dns: [223.5.5.5, 8.8.8.8]`）
@@ -257,10 +278,12 @@ RUN /opt/conda/bin/conda config --add channels https://mirrors.tuna.tsinghua.edu
 ## 六、依赖变更
 
 `environment.yml` 新增：
+
 - `watchdog>=3.0.0`（文件系统监听）
 - `psutil>=5.9.0`（系统信息采集：CPU、内存、磁盘、GPU）
 
 `Dockerfile` pip install 行新增：
+
 - `watchdog` 和 `psutil`（与 conda 二选一，确保安装）
 
 ## 七、数据流
@@ -287,6 +310,8 @@ sequenceDiagram
     FE->>FE: 更新仪表盘 + 模型卡片状态
 ```
 
+
+
 ### 数据集自动发现流程
 
 ```mermaid
@@ -306,6 +331,8 @@ sequenceDiagram
     FE->>DB: GET /api/system/health (polling 30s)
     FE->>FE: 更新测试集卡片状态
 ```
+
+
 
 ## 八、实现顺序
 

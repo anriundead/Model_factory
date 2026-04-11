@@ -192,6 +192,9 @@
                                         <input type="hidden" id="eval-testset-id" value="">
                                         <input type="hidden" id="eval-hf-dataset" value="">
                                     </div>
+                                    <div id="vlm-compat-hint" class="vlm-compat-hint">
+                                        <strong>⚠ 提示：</strong>此测试集为 VLM（视觉-语言）基准，需选择带视觉塔的模型（如 Qwen2.5-VL）才能运行。
+                                    </div>
                                     <label class="segmented-label" style="margin-top: 12px;">子集 (Subset)</label>
                                     <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
                                         <div class="ios-select-trigger" id="eval-subset-trigger">
@@ -259,6 +262,22 @@
                                     <div class="limit-desc">注：测试用例跑得越多，结果越准，耗时越久</div>
                                     <input type="hidden" id="eval-limit" value="0.5">
                                     <input type="hidden" id="eval-sampling" value="sequential">
+                                </div>
+                                <div class="form-group" style="margin-top: 14px;">
+                                    <label class="segmented-label">GPU 并行数</label>
+                                    <div class="ios-select-wrapper generic-select" style="margin: 5px 0 0 0;">
+                                        <div class="ios-select-trigger" id="eval-gpu-trigger">
+                                            <span class="selected-text">自动 (全部)</span>
+                                            <i class="ri-arrow-down-s-line chevron-icon"></i>
+                                        </div>
+                                        <ul class="ios-select-options" id="eval-gpu-options">
+                                            <li class="ios-option selected" data-value="0"><span class="opt-name">自动 (全部)</span></li>
+                                            <li class="ios-option" data-value="1"><span class="opt-name">1</span></li>
+                                            <li class="ios-option" data-value="2"><span class="opt-name">2</span></li>
+                                            <li class="ios-option" data-value="4"><span class="opt-name">4</span></li>
+                                        </ul>
+                                    </div>
+                                    <input type="hidden" id="eval-num-gpus" value="0">
                                 </div>
 
                             </div> </div> </section>

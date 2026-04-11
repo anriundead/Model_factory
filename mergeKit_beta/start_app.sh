@@ -4,6 +4,23 @@
 set -e
 cd "$(dirname "$0")"
 
+# Docker：可选改写 /etc/hosts，使本机 hostname 仅指向 127.0.0.1（多机 Ray 请勿启用）。
+# 开启条件：MERGEKIT_DOCKER_HOSTS_LOOPBACK_FIX=1，或 MERGEKIT_RAY_SINGLE_NODE_LOOPBACK=1 且未显式 MERGEKIT_DOCKER_HOSTS_LOOPBACK_FIX=0。
+if [ -w /etc/hosts ]; then
+  _hbf="${MERGEKIT_DOCKER_HOSTS_LOOPBACK_FIX:-}"
+  _snl="${MERGEKIT_RAY_SINGLE_NODE_LOOPBACK:-}"
+  if [ "$_hbf" = "0" ]; then
+    :
+  elif [ "$_hbf" = "1" ] || [ "$_snl" = "1" ]; then
+    _hn="$(hostname -f 2>/dev/null || hostname)"
+    if [ -n "$_hn" ]; then
+      _tmp="$(mktemp)"
+      awk -v hn="$_hn" '$NF != hn' /etc/hosts > "$_tmp" && cat "$_tmp" > /etc/hosts && rm -f "$_tmp"
+      printf '127.0.0.1\t%s\n' "$_hn" >> /etc/hosts
+    fi
+  fi
+fi
+
 # 激活 conda 环境 mergenetic（运行 mergenetic 完全融合必需）
 CONDA_BASE=""
 if command -v conda &>/dev/null; then

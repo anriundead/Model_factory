@@ -1,32 +1,88 @@
 # 用法（在 Workspaces 目录）: docker compose build && docker compose up
+# deploy.resources 仅 docker compose v2+ 生效；docker-compose v1 需 runtime: nvidia
 services:
   mergekit-beta:
+    runtime: nvidia
+    shm_size: "10g"
+    restart: unless-stopped
+    # 可选固定 hostname；单机 Docker 可配合 MERGEKIT_RAY_SINGLE_NODE_LOOPBACK + extra_hosts 使用
+    hostname: mergekit-beta-local
     build:
       context: .
       dockerfile: mergeKit_beta/Dockerfile
     image: mergekit-beta:latest
     ports:
       - "5000:5000"
+    healthcheck:
+      # 说明：镜像内未必有 curl；用 python 标准库访问 /healthz
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=5).read()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     environment:
       - PORT=5000
+      - NVIDIA_VISIBLE_DEVICES=all
       - LOCAL_MODELS_PATH=/data/Models
       - MERGEKIT_MODEL_POOL=/data/models_pool
       - DATABASE_URL=${DATABASE_URL:-}
       - VLM_SEARCH_DIR=${VLM_SEARCH_DIR:-}
+      # NVLink 对内 TP=2（评测推理阶段）：auto=自动选择空闲卡对(01/23)，不足则降级单卡
+      - MERGEKIT_EVAL_TOPOLOGY=auto
+      - MERGEKIT_EVAL_PAIR_TIMEOUT_S=30
+      - MERGEKIT_EVAL_MIN_FREE_GB=12
+      # 进化融合 runner 全局墙钟上限（秒），默认 5 天；本地/CI 可用 .env 覆盖 MERGEKIT_MAX_TASK_DURATION_S
+      - MERGEKIT_MAX_TASK_DURATION_S=${MERGEKIT_MAX_TASK_DURATION_S:-432000}
+      # Triton/torch.compile 运行期需要 C 编译器时，显式指定
+      - CC=gcc
       - HF_ENDPOINT=https://hf-mirror.com
       - HF_HUB_DISABLE_XET=1
+      # 安全：不要在版本库中提供 HF_TOKEN 默认值；需要访问私有仓库/限流较紧时请在宿主机环境或 .env 注入
+      - HF_TOKEN=${HF_TOKEN:-}
       - HF_DATASETS_CACHE=/data/hf_datasets
       - MERGEKIT_EVAL_HF_CACHE=/data/eval_datasets
+      # 数据集离线优先：强制只使用本地 HF_DATASETS_CACHE，缺失则报错（不再向 Hub 拉取，避免卡在下载/锁）
+      - MERGEKIT_DATASETS_LOCAL_ONLY=1
+      - HF_DATASETS_OFFLINE=1
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      # --- vLLM TP=2 + Ray（故障时可选，默认不设置 = 多 worker 并行）---
+      # --- 进化融合 TP 策略（默认 auto）---
+      # MERGEKIT_EVOLUTION_TP2=auto|1|0
+      # - auto（默认）：基于显存余量选择 TP=1（优先并行）；显存不足则尝试 TP=2；仍不足则降低 batch（不隐式改 max_new_tokens/max_samples）
+      # - 1：强制 TP=2（仅在模型单卡放不下或明确需要时使用；7B 通常不需要）
+      # - 0：强制 TP=1
+      # - MERGEKIT_EVOLUTION_TP2=auto
+      # 多 worker 并行 vLLM 仍 TCPStore 超时时开启：强制单 Ray worker、串行 eval（仍可用 TP=2）
+      # - MERGEKIT_VLLM_TP_SERIALIZE=1
+      # c10d 绑定地址（一般无需改；代码默认 127.0.0.1）
+      # - MERGEKIT_VLLM_MASTER_ADDR=127.0.0.1
+      # 多机 Ray：设为本机可达 IP；单机 Docker 可选：MERGEKIT_RAY_SINGLE_NODE_LOOPBACK=1（ray.init 用 127.0.0.1）
+      # - MERGEKIT_RAY_NODE_IP_ADDRESS=192.168.x.x
+      # - MERGEKIT_RAY_SINGLE_NODE_LOOPBACK=1
+      # TP>1 vLLM 每轮评测默认子进程隔离；回滚进程内 vLLM：MERGEKIT_VLLM_TP_SUBPROCESS=0
+      # - MERGEKIT_VLLM_TP_SUBPROCESS=0
+      # - MERGEKIT_VLLM_SUBPROCESS_TIMEOUT_S=1200
+      # Ray Pool worker 注入 GLOO_SOCKET_IFNAME=lo（可选，与 vLLM 子进程方案并行）
+      # - MERGEKIT_RAY_POOL_RUNTIME_ENV=1
+      # 进化子进程 NCCL 走 socket（与评测路径类似，默认关）
+      # - MERGEKIT_EVOLUTION_NCCL_SHM_DISABLE=1
+      # 仅当 IB 异常时考虑：# - MERGEKIT_EVOLUTION_NCCL_IB_DISABLE=1
+      # /etc/hosts 去 172：显式 1，或与 MERGEKIT_RAY_SINGLE_NODE_LOOPBACK=1 联动（勿设 MERGEKIT_DOCKER_HOSTS_LOOPBACK_FIX=0）
+      # - MERGEKIT_DOCKER_HOSTS_LOOPBACK_FIX=1
     volumes:
+      - ./mergeKit_beta:/app/ServiceEndFiles/Workspaces/mergeKit_beta
       - ${HOST_MODELS:-../Models}:/data/Models:ro
       - ${HOST_MODEL_POOL:-../mergeKit/models_pool}:/data/models_pool
       - ${HOST_PACKAGES:-../Packages}:/app/ServiceEndFiles/Packages:ro
       - ${HOST_MERGES:-./mergeKit_beta/merges}:/app/ServiceEndFiles/Workspaces/mergeKit_beta/merges
-      - ${HOST_APP_DB:-./mergeKit_beta/app.db}:/app/ServiceEndFiles/Workspaces/mergeKit_beta/app.db
+      - ${HOST_HF_DATASETS:-./hf_datasets_cache}:/data/hf_datasets
+      - ${HOST_EVAL_DATASETS:-./eval_datasets_cache}:/data/eval_datasets
     dns:
       - 223.5.5.5
       - 8.8.8.8
     extra_hosts:
+      - "mergekit-beta-local:127.0.0.1"
       - "host.docker.internal:host-gateway"
     deploy:
       resources:

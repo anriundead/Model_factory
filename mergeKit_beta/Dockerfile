@@ -16,8 +16,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LOCAL_MODELS_PATH=/data/Models \
     MERGENETIC_PYTHON=/opt/conda/envs/mergenetic/bin/python
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.ustc.edu.cn/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://mirrors.ustc.edu.cn/ubuntu|g' /etc/apt/sources.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl bzip2 git \
+    # vLLM/Triton/torch.compile 运行期可能需要本机 C 编译器（如编译 triton driver.c 小模块）
+    build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh \
@@ -31,15 +34,22 @@ RUN sed -e '/lm-eval==0.4.11/d' \
         -e '/transformers==5.3.0/d' \
         -e '/huggingface-hub==1.5.0/d' \
         -e '/tokenizers==0.22.2/d' \
+        -e '/mergekit==0.1.4/d' \
         -e '/virtualenv==20.35.4/d' \
         /tmp/environment.yml > /tmp/environment.docker.yml \
+    && conda config --system --remove-key channels || true \
+    && conda config --system --add channels https://mirrors.ustc.edu.cn/anaconda/cloud/conda-forge \
+    && conda config --system --add channels https://mirrors.ustc.edu.cn/anaconda/pkgs/main \
+    && conda config --system --set show_channel_urls true \
     && . /opt/conda/etc/profile.d/conda.sh \
+    && python -m pip config set global.index-url https://pypi.mirrors.ustc.edu.cn/simple \
+    && python -m pip config set install.trusted-host pypi.mirrors.ustc.edu.cn \
     && conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
     && conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r \
     && conda env create -n mergenetic -f /tmp/environment.docker.yml \
     && conda run -n mergenetic pip install --upgrade \
         'huggingface-hub==1.5.0' 'transformers==5.3.0' 'lm_eval[hf]==0.4.11' \
-        'mergekit>=0.1.4' \
+    && conda run -n mergenetic pip install --no-deps 'mergekit>=0.1.4' \
     && conda clean -afy \
     && rm -f /tmp/environment.yml /tmp/environment.docker.yml
 

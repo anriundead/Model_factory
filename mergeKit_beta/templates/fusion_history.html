@@ -220,9 +220,10 @@
                     
                     // 将 task 对象转为 JSON 字符串，以便点击时传递 (需要转义引号)
                     const taskJson = JSON.stringify(task).replace(/"/g, '&quot;');
+                    const tidAttr = (task.task_id && task.task_id !== '未知') ? ' data-task-id="' + String(task.task_id).replace(/"/g, '&quot;') + '"' : '';
                     
                     return `
-                        <div class="history-item" onclick="showFusionDetail(${taskJson})" style="padding: 20px; border-bottom: 1px solid var(--apple-border); cursor: pointer; transition: background 0.2s;" onmouseover="this.style.background='#f5f5f7'" onmouseout="this.style.background='transparent'">
+                        <div class="history-item"${tidAttr} onclick="showFusionDetail(${taskJson})" style="padding: 20px; border-bottom: 1px solid var(--apple-border); cursor: pointer; transition: background 0.2s;" onmouseover="this.style.background='#f5f5f7'" onmouseout="this.style.background='transparent'">
                             <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 12px;">
                                 <div>
                                     <h4 style="margin: 0 0 4px 0; font-size: 1.1rem;">${customName}</h4>
@@ -259,9 +260,26 @@
                         </div>
                     `;
                 }).join('');
+                maybeOpenFusionTaskFromQuery();
             } catch (e) {
                 container.innerHTML = '<p class="limit-desc">加载失败: ' + e.message + '</p>';
             }
+        }
+
+        function maybeOpenFusionTaskFromQuery() {
+            try {
+                const q = new URLSearchParams(window.location.search);
+                const openTid = q.get('open_task');
+                if (!openTid || !window.fusionHistoryData || !window.fusionHistoryData.length) return;
+                const task = window.fusionHistoryData.find(t => String(t.task_id || '') === openTid);
+                if (!task) return;
+                requestAnimationFrame(() => {
+                    const esc = (typeof CSS !== 'undefined' && CSS.escape) ? CSS.escape(openTid) : openTid.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+                    const el = document.querySelector('.history-item[data-task-id="' + esc + '"]');
+                    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                    showFusionDetail(task);
+                });
+            } catch (e) { /* C-D4: 静默忽略 */ }
         }
         
         // 显示融合详情弹窗

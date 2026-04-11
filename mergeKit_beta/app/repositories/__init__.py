@@ -138,7 +138,9 @@ def model_register(
     else:
         model.name = name
         model.source = source
-        model.task_id = task_id
+        # 列表同步等场景可能解析不到 metadata，勿用 None 覆盖 worker 已写入的 task_id
+        if task_id is not None:
+            model.task_id = task_id
         if parent_model_ids is not None:
             model.parent_model_ids = parent_model_ids
         if param_count is not None:
@@ -227,6 +229,8 @@ def testset_upsert(
     created_by: str = None,
     notes: str = None,
     question_type: str = None,
+    cached_configs: list = None,
+    cached_splits: list = None,
     **extra,
 ) -> TestSet:
     """创建或更新测试集。DB 为主写入源。"""
@@ -249,6 +253,8 @@ def testset_upsert(
             created_by=created_by,
             notes=notes,
             question_type=question_type,
+            cached_configs=cached_configs,
+            cached_splits=cached_splits,
         )
         db.session.add(row)
     else:
@@ -272,9 +278,31 @@ def testset_upsert(
             row.notes = notes
         if question_type is not None:
             row.question_type = question_type
+        if cached_configs is not None:
+            row.cached_configs = cached_configs
+        if cached_splits is not None:
+            row.cached_splits = cached_splits
         row.updated_at = datetime.utcnow()
     db.session.commit()
     return row
+
+
+def testset_update_hf_cache(
+    testset_id: str,
+    cached_configs: list = None,
+    cached_splits: list = None,
+) -> bool:
+    """更新测试集的 hf_info 缓存字段。"""
+    row = db.session.get(TestSet, testset_id)
+    if not row:
+        return False
+    if cached_configs is not None:
+        row.cached_configs = cached_configs
+    if cached_splits is not None:
+        row.cached_splits = cached_splits
+    row.updated_at = datetime.utcnow()
+    db.session.commit()
+    return True
 
 
 def testset_list_from_db():
