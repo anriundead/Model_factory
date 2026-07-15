@@ -56,6 +56,24 @@ logger = logging.getLogger(__name__)
 
 
 _shadow_dirs: list[str] = []
+_DEBUG_LOG_PATH = "/home/a/Workspace/.cursor/debug-c8d559.log"
+
+
+def _debug_emit(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
+    payload = {
+        "sessionId": "c8d559",
+        "runId": os.environ.get("MERGEKIT_RUN_ID", "unknown"),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def _cleanup_shadow_dirs():
@@ -375,28 +393,218 @@ def load_prompt_yaml(prompt_yaml: str) -> dict:
 
 
 def build_mmlu_prompt(question: str, choices: list, prompt_cfg: dict) -> str:
-    """MMLU: question, choices (list of 4), answer 0-3 -> prompt string."""
+    """MMLU: question, choices (list of 4), answer 0-3 -> prompt string.
+
+    prompt_cfg 中 task_instructions 会拼在 prompt 前部，用于约束模型输出格式。
+    """
+    instructions = (prompt_cfg.get("task_instructions") or [""])[0]
     template = (prompt_cfg.get("multi_choice_example_format") or [""])[0]
     opts = "\n".join([f"{chr(65+i)}. {c}" for i, c in enumerate(choices)])
-    return template.format(question, opts).strip() + " "
+    body = template.format(question, opts).strip()
+    # #region agent log
+    _debug_emit(
+        "H1",
+        "run_vlm_search.py:build_mmlu_prompt",
+        "prompt_shape",
+        {
+            "has_task_instructions": bool((instructions or "").strip()),
+            "template_head": (template or "")[:80],
+            "question_head": (question or "")[:80],
+            "choices_count": len(choices or []),
+        },
+    )
+    # #endregion
+    if instructions:
+        return instructions.strip() + "\n\n" + body + " "
+    return body + " "
+
+
+def _normalize_mcq_sample(sample: dict) -> tuple[str, list[str], int]:
+    """兼容 MMLU/CMMLU/CMMMU 字段，归一化为 question/choices/answer_idx。"""
+    question = (
+        sample.get("question")
+        or sample.get("Question")
+        or sample.get("query")
+        or sample.get("prompt")
+        or ""
+    )
+
+    raw_choices = sample.get("choices", None)
+    choices = []
+    if raw_choices is not None and hasattr(raw_choices, "__iter__") and not isinstance(raw_choices, (str, bytes)):
+        tmp_choices = [str(c) for c in raw_choices]
+        if len(tmp_choices) > 0:
+            choices = tmp_choices
+    if not choices:
+        if all(k in sample for k in ("A", "B", "C", "D")):
+            choices = [str(sample.get("A", "")), str(sample.get("B", "")), str(sample.get("C", "")), str(sample.get("D", ""))]
+        elif all(k in sample for k in ("option1", "option2", "option3", "option4")):
+            choices = [
+                str(sample.get("option1", "")),
+                str(sample.get("option2", "")),
+                str(sample.get("option3", "")),
+                str(sample.get("option4", "")),
+            ]
+
+    raw_ans = sample.get("answer", sample.get("Answer", 0))
+    if isinstance(raw_ans, (int, np.integer)):
+        ans_idx = int(raw_ans)
+    elif isinstance(raw_ans, float):
+        ans_idx = int(raw_ans)
+    elif isinstance(raw_ans, str):
+        s = raw_ans.strip().upper()
+        if s in ("A", "B", "C", "D"):
+            ans_idx = ord(s) - 65
+        else:
+            try:
+                ans_idx = int(float(s))
+            except (TypeError, ValueError):
+                ans_idx = 0
+    else:
+        ans_idx = 0
+
+    ans_idx = min(max(0, int(ans_idx)), 3)
+    return str(question), choices, ans_idx
+
+
+def _format_and_tokenize_prompt(prompt: str, tokenizer, prompt_cfg: dict) -> list[int]:
+    """用 chat_template 构造并直接返回 token ids，避免字符串往返编码误差。"""
+    if not prompt:
+        prompt = ""
+
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        system_msg = ((prompt_cfg.get("system_message") or [""])[0] or "").strip()
+        messages = []
+        if system_msg:
+            messages.append({"role": "system", "content": system_msg})
+        messages.append({"role": "user", "content": prompt})
+        try:
+            tokenized = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+            # #region agent log
+            import json as _j, time as _t
+            _dpath = "/app/ServiceEndFiles/Workspaces/mergeKit_beta/_debug_c8d559.log"
+            with open(_dpath, "a") as _df:
+                _df.write(_j.dumps({"sessionId":"c8d559","hypothesisId":"H-A","location":"run_vlm_search.py:_format_and_tokenize_prompt","message":"apply_chat_template returned","data":{"type":str(type(tokenized)),"shape":str(getattr(tokenized,'shape','N/A')),"has_tolist":hasattr(tokenized,'tolist'),"len":len(tokenized) if hasattr(tokenized,'__len__') else 'N/A'},"timestamp":int(_t.time()*1000)}) + "\n")
+            # #endregion
+            if hasattr(tokenized, "tolist"):
+                ids = tokenized[0].tolist()
+            elif isinstance(tokenized, dict) or hasattr(tokenized, "input_ids"):
+                raw_ids = tokenized["input_ids"]
+                if hasattr(raw_ids, "tolist"):
+                    ids = raw_ids[0].tolist()
+                elif isinstance(raw_ids, list) and raw_ids:
+                    ids = raw_ids[0] if isinstance(raw_ids[0], list) else raw_ids
+                else:
+                    ids = []
+            else:
+                ids = list(tokenized) if hasattr(tokenized, "__iter__") else []
+            # #region agent log
+            with open(_dpath, "a") as _df:
+                _df.write(_j.dumps({"sessionId":"c8d559","hypothesisId":"H-B","location":"run_vlm_search.py:_format_and_tokenize_prompt:ids","message":"extracted ids","data":{"ids_len":len(ids),"ids_head":ids[:12] if ids else [],"ids_tail":ids[-5:] if ids else [],"type_first":str(type(ids[0])) if ids else "empty"},"timestamp":int(_t.time()*1000)}) + "\n")
+            # #endregion
+            if ids:
+                return [int(x) for x in ids]
+        except Exception as _exc:
+            # #region agent log
+            import json as _j, time as _t, traceback as _tb
+            _dpath = "/app/ServiceEndFiles/Workspaces/mergeKit_beta/_debug_c8d559.log"
+            with open(_dpath, "a") as _df:
+                _df.write(_j.dumps({"sessionId":"c8d559","hypothesisId":"H-A","location":"run_vlm_search.py:_format_and_tokenize_prompt:except","message":"apply_chat_template EXCEPTION","data":{"exc":str(_exc),"tb":_tb.format_exc()[:500]},"timestamp":int(_t.time()*1000)}) + "\n")
+            # #endregion
+            pass
+
+    # #region agent log
+    import json as _j, time as _t
+    _dpath = "/app/ServiceEndFiles/Workspaces/mergeKit_beta/_debug_c8d559.log"
+    with open(_dpath, "a") as _df:
+        _df.write(_j.dumps({"sessionId":"c8d559","hypothesisId":"H-A","location":"run_vlm_search.py:_format_and_tokenize_prompt:fallback","message":"FALLBACK to tokenizer.encode (no chat template)","data":{"prompt_head":prompt[:120]},"timestamp":int(_t.time()*1000)}) + "\n")
+    # #endregion
+    ids = tokenizer.encode(prompt, add_special_tokens=True)
+    return [int(x) for x in (ids or [])]
+
+
+def _parse_mmlu_single_line(text: str) -> str:
+    """对单行文本做 ABCD 提取（text 已 upper + strip）。"""
+    if not text:
+        return ""
+
+    # 结构化前缀 —— "ANSWER: B", "THE ANSWER IS C", "答案: A"
+    structured = re.match(
+        r"(?:.*(?:ANSWER|答案)\s*(?:IS\s*[:：]?\s*|[:：]\s*))([ABCD])\b",
+        text,
+    )
+    if structured:
+        return structured.group(1)
+
+    # 括号包裹 —— "(B)", "（A）"
+    paren = re.match(r"\s*[\(（]([ABCD])[\)）]", text)
+    if paren:
+        return paren.group(1)
+
+    # 纯字母输出 —— "B" / "B."
+    if re.fullmatch(r"\s*([ABCD])\s*\.?\s*", text):
+        return text.strip()[0]
+
+    # 首字符 A-D + 分隔符，仅限短文本（<=4 词）
+    if len(text.split()) <= 4:
+        head = re.match(r"([ABCD])(?:\.|,|\s|$)", text)
+        if head:
+            return head.group(1)
+
+    # 孤立字母扫描，仅限短文本（<=3 词）
+    if len(text.split()) <= 3:
+        letter_match = re.search(r"(?<![A-Z])([ABCD])(?![A-Z])", text)
+        if letter_match:
+            return letter_match.group(1)
+
+    return ""
 
 
 def parse_mmlu_answer(response: str) -> str:
-    response = (response or "").strip().upper()
-    if not response:
+    """从模型输出中提取 ABCD 答案。
+
+    策略：先对第一行做解析（模型通常在首行/首 token 给出答案后续才展开解释），
+    若首行无结果再对完整文本做解析。
+    """
+    raw = (response or "").strip()
+    if not raw:
         return ""
-    letter_match = re.search(r"(?<![A-Z])([ABCD])(?![A-Z])", response)
-    if letter_match:
-        return letter_match.group(1)
-    digit_match = re.search(r"(?<!\d)([0-3])(?!\d)", response)
-    if digit_match:
-        return chr(65 + int(digit_match.group(1)))
-    digit_match = re.search(r"(?<!\d)([1-4])(?!\d)", response)
-    if digit_match:
-        return chr(64 + int(digit_match.group(1)))
-    if response[0] in "ABCD":
-        return response[0]
-    return ""
+
+    # 优先解析第一行（模型常在首行给出答案字母，之后才是解释）
+    first_line = raw.split("\n", 1)[0].strip().upper()
+    result = _parse_mmlu_single_line(first_line)
+    if result:
+        # #region agent log
+        _debug_emit(
+            "H2",
+            "run_vlm_search.py:parse_mmlu_answer",
+            "parse_hit_first_line",
+            {"first_line": first_line[:120], "parsed": result, "raw_head": raw[:120]},
+        )
+        # #endregion
+        return result
+
+    # 首行无结果，用完整文本尝试
+    full_text = raw.upper()
+    parsed_full = _parse_mmlu_single_line(full_text)
+    # #region agent log
+    _debug_emit(
+        "H2",
+        "run_vlm_search.py:parse_mmlu_answer",
+        "parse_fallback_full_text",
+        {
+            "first_line_head": first_line[:120],
+            "full_head": full_text[:120],
+            "parsed": parsed_full,
+        },
+    )
+    # #endregion
+    return parsed_full
 
 
 def load_llm(model_path: str, device: str, torch_dtype: torch.dtype):
@@ -424,35 +632,72 @@ def load_llm(model_path: str, device: str, torch_dtype: torch.dtype):
 
 
 def _generate_responses(
-    prompts: list[str],
+    prompts_ids: list[list[int]],
     tokenizer,
     model,
     device: str,
     max_new_tokens: int,
     batch_size: int,
 ) -> list[str]:
+    stop_token_ids = set()
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        stop_token_ids.add(int(tokenizer.eos_token_id))
+    try:
+        ids = tokenizer.encode("\n", add_special_tokens=False)
+        if ids:
+            stop_token_ids.add(int(ids[-1]))
+    except Exception:
+        pass
+    eos_list = list(stop_token_ids) if stop_token_ids else None
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    if pad_id is None:
+        pad_id = tokenizer.unk_token_id
+    if pad_id is None:
+        raise ValueError("tokenizer pad/eos/unk token id all unavailable")
+
+    # #region agent log
+    import json as _j, time as _t
+    _dpath = "/app/ServiceEndFiles/Workspaces/mergeKit_beta/_debug_c8d559.log"
+    with open(_dpath, "a") as _df:
+        _df.write(_j.dumps({"sessionId":"c8d559","hypothesisId":"H-C,H-D","location":"run_vlm_search.py:_generate_responses:entry","message":"generate_responses entry","data":{"n_prompts":len(prompts_ids),"eos_list":eos_list,"pad_id":pad_id,"ids_len_0":len(prompts_ids[0]) if prompts_ids else 0},"timestamp":int(_t.time()*1000)}) + "\n")
+    # #endregion
+
     responses = []
-    for start in range(0, len(prompts), batch_size):
-        batch = prompts[start : start + batch_size]
-        inputs = tokenizer(
-            batch,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=2048,
-        )
+    for start in range(0, len(prompts_ids), batch_size):
+        batch_ids = prompts_ids[start : start + batch_size]
+        max_len = min(max(len(ids) for ids in batch_ids), 2048)
+        padded = []
+        for ids in batch_ids:
+            trunc = (ids or [])[-max_len:]
+            pad_len = max_len - len(trunc)
+            padded.append(([pad_id] * pad_len) + trunc)
+
+        input_ids = torch.tensor(padded, dtype=torch.long)
+        attention_mask = (input_ids != pad_id).long()
+        # #region agent log
+        if start == 0:
+            with open(_dpath, "a") as _df:
+                _df.write(_j.dumps({"sessionId":"c8d559","hypothesisId":"H-D","location":"run_vlm_search.py:_generate_responses:mask","message":"first batch mask stats","data":{"input_shape":list(input_ids.shape),"mask_sum_per_seq":[int(attention_mask[i].sum()) for i in range(min(2,len(attention_mask)))],"total_ids_per_seq":[int(input_ids.shape[1])],"pad_count_in_content":int((input_ids[:,max(0,padded[0].index(padded[0][-1]) if pad_id in padded[0][-10:] else -1):] == pad_id).sum()) if len(padded) > 0 else -1},"timestamp":int(_t.time()*1000)}) + "\n")
+        # #endregion
         if device == "auto":
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            target_device = model.device
         else:
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+            target_device = device
+        input_ids = input_ids.to(target_device)
+        attention_mask = attention_mask.to(target_device)
         with torch.no_grad():
             out_ids = model.generate(
-                **inputs,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
-                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                pad_token_id=pad_id,
+                eos_token_id=eos_list,
             )
-        trimmed = [out[len(inp) :] for inp, out in zip(inputs["input_ids"], out_ids)]
+        trimmed = [out[len(inp) :] for inp, out in zip(input_ids, out_ids)]
         responses.extend(
             tokenizer.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         )
@@ -466,7 +711,7 @@ def llm_text_eval_mmlu(
     prompt_cfg: dict,
     device: str,
     torch_dtype: torch.dtype,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 16,
     batch_size: int = 4,
 ) -> float:
     """
@@ -488,29 +733,37 @@ def llm_text_eval_mmlu(
     prompts = []
     gold_letters = []
     for s in samples:
-        q = s.get("question", "")
-        choices = s.get("choices", [])
-        if isinstance(choices, (list, tuple)):
-            choices = [str(c) for c in choices]
-        else:
-            choices = []
-        ans_idx = s.get("answer", 0)
-        if isinstance(ans_idx, (str, float)):
-            try:
-                ans_idx = int(float(ans_idx))
-            except (ValueError, TypeError):
-                ans_idx = 0
+        q, choices, ans_idx = _normalize_mcq_sample(s)
         gold_letters.append(chr(65 + min(max(0, ans_idx), 3)))
         prompts.append(build_mmlu_prompt(q, choices, prompt_cfg))
+    prompts_ids = [_format_and_tokenize_prompt(p, tokenizer, prompt_cfg) for p in prompts]
+
+    # #region agent log
+    _debug_emit(
+        "H3",
+        "run_vlm_search.py:llm_text_eval_mmlu",
+        "eval_input_summary",
+        {
+            "samples_len": len(samples),
+            "max_new_tokens": int(max_new_tokens),
+            "batch_size": int(batch_size),
+            "gold_dist": {k: gold_letters.count(k) for k in ["A", "B", "C", "D"]},
+            "prompt_preview": (prompts[0][:220] if prompts else ""),
+            "prompt_ids_len_0": (len(prompts_ids[0]) if prompts_ids else 0),
+        },
+    )
+    # #endregion
 
     responses = _generate_responses(
-        prompts, tokenizer, model, device=device, max_new_tokens=max_new_tokens, batch_size=batch_size
+        prompts_ids, tokenizer, model, device=device, max_new_tokens=max_new_tokens, batch_size=batch_size
     )
     correct = 0
+    pred_letters = []
     # 临时调试：打印前若干条样本的 gold/pred/raw，便于定位 acc=0 问题
     debug_limit = int(os.environ.get("MERGEKIT_DEBUG_PRED_LIMIT", "8") or 8)
     for idx, (resp, gold) in enumerate(zip(responses, gold_letters)):
         pred = parse_mmlu_answer(resp)
+        pred_letters.append(pred)
         if idx < debug_limit:
             logger.info(
                 "[debug-pred] idx=%s gold=%s pred=%s raw=%r",
@@ -519,8 +772,22 @@ def llm_text_eval_mmlu(
                 pred,
                 (resp or "")[:220],
             )
+            # #region agent log
+            _debug_emit(
+                "H4",
+                "run_vlm_search.py:llm_text_eval_mmlu",
+                "pred_sample",
+                {"idx": idx, "gold": gold, "pred": pred, "raw_head": (resp or "")[:220]},
+            )
+            # #endregion
         if pred == gold:
             correct += 1
+    pred_hist = {k: pred_letters.count(k) for k in ["A", "B", "C", "D", ""]}
+    logger.info(
+        "[eval-dist] pred_hist=%s gold_dist=%s",
+        pred_hist,
+        {k: gold_letters.count(k) for k in ["A", "B", "C", "D"]},
+    )
     acc = correct / len(samples) if samples else 0.0
 
     try:
@@ -589,7 +856,7 @@ def _llm_text_eval_mmlu_vllm_in_process(
     samples: list[dict],
     prompt_cfg: dict,
     tensor_parallel_size: int,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 16,
     batch_size: int = 4,
 ) -> float:
     """当前进程内跑 vLLM TP 评测（供子进程 worker 或 SUBPROCESS=0 使用）。"""
@@ -613,25 +880,17 @@ def _llm_text_eval_mmlu_vllm_in_process(
     prompts = []
     gold_letters = []
     for s in samples:
-        q = s.get("question", "")
-        choices = s.get("choices", [])
-        if isinstance(choices, (list, tuple)):
-            choices = [str(c) for c in choices]
-        else:
-            choices = []
-        ans_idx = s.get("answer", 0)
-        if isinstance(ans_idx, (str, float)):
-            try:
-                ans_idx = int(float(ans_idx))
-            except (ValueError, TypeError):
-                ans_idx = 0
+        q, choices, ans_idx = _normalize_mcq_sample(s)
         gold_letters.append(chr(65 + min(max(0, int(ans_idx)), 3)))
         prompts.append(build_mmlu_prompt(q, choices, prompt_cfg))
+    tok = AutoTokenizer.from_pretrained(merged_llm_dir, trust_remote_code=True)
+    prompts_ids = [_format_and_tokenize_prompt(p, tok, prompt_cfg) for p in prompts]
 
     sampling = SamplingParams(
         temperature=0.0,
         top_p=1.0,
         max_tokens=max_new_tokens,
+        stop=["\n"],
     )
     llm = None
     try:
@@ -646,9 +905,9 @@ def _llm_text_eval_mmlu_vllm_in_process(
 
         correct = 0
         debug_limit = int(os.environ.get("MERGEKIT_DEBUG_PRED_LIMIT", "8") or 8)
-        for start in range(0, len(prompts), max(1, int(batch_size))):
-            batch = prompts[start : start + batch_size]
-            outs = llm.generate(batch, sampling)
+        for start in range(0, len(prompts_ids), max(1, int(batch_size))):
+            batch_ids = prompts_ids[start : start + batch_size]
+            outs = llm.generate(prompt_token_ids=batch_ids, sampling_params=sampling)
             for i, o in enumerate(outs):
                 text = ""
                 try:
@@ -715,7 +974,7 @@ def _llm_text_eval_mmlu_vllm_subprocess(
     samples: list[dict],
     prompt_cfg: dict,
     tensor_parallel_size: int,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 16,
     batch_size: int = 4,
 ) -> float:
     """TP>1 时在独立子进程中跑 vLLM，避免 Ray actor 内多轮 LLM() 触发 c10d/TCPStore 问题。"""
@@ -775,7 +1034,7 @@ def llm_text_eval_mmlu_vllm(
     samples: list[dict],
     prompt_cfg: dict,
     tensor_parallel_size: int,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 16,
     batch_size: int = 4,
 ) -> float:
     """
@@ -813,7 +1072,7 @@ def _vllm_tp_eval_worker_main(job_path: str) -> None:
         samples=job["samples"],
         prompt_cfg=job["prompt_cfg"],
         tensor_parallel_size=int(job.get("tensor_parallel_size", 1)),
-        max_new_tokens=int(job.get("max_new_tokens", 64)),
+        max_new_tokens=int(job.get("max_new_tokens", 16)),
         batch_size=int(job.get("batch_size", 4)),
     )
     print(json.dumps({"acc": acc}), flush=True)
@@ -1129,10 +1388,8 @@ def main():
         }
         logger.info("[main] VLM 模式: 使用 vlm_cmmmu_fitness, vlm_path=%s, 子集数=%s", args.vlm_path, len(hf_subset_list))
     else:
-        # 进化阶段使用 hf_split（训练/验证建议 val，最终 acc 使用 hf_split_final=test）
-        hf_split = args.hf_split if args.hf_split not in ("val", "validation") else "test"
-        if args.hf_split in ("val", "validation") and (args.hf_dataset or "").lower().strip() in ("cais/mmlu", "mmlu", "m-a-p/mmlu"):
-            logger.info("[main] MMLU 进化用 split=test（请求 val 时）以避免 datasets 兼容问题")
+        # 进化阶段严格使用调用方指定的 split，不做强制转换，防止数据泄漏
+        hf_split = args.hf_split
         hf_dataset_id = (args.hf_dataset or "cais/mmlu").strip()
         cache_dir = os.environ.get("HF_DATASETS_CACHE") or None
         if cache_dir:
@@ -1163,7 +1420,7 @@ def main():
                             samples=kw["samples"],
                             prompt_cfg=kw["prompt_cfg"],
                             tensor_parallel_size=tp_size,
-                            max_new_tokens=kw.get("max_new_tokens", 64),
+                            max_new_tokens=kw.get("max_new_tokens", 16),
                             batch_size=kw.get("batch_size", 4),
                         )
                     except Exception as e:
@@ -1201,7 +1458,7 @@ def main():
             "prompt_cfg": prompt_cfg,
             "device": args.device,
             "torch_dtype": torch_dtype,
-            "max_new_tokens": 64,
+            "max_new_tokens": 16,
             "batch_size": max(1, int(getattr(args, "batch_size", 4) or 4)),
         }
 

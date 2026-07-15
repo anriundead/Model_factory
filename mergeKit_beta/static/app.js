@@ -12,6 +12,9 @@ let deleteTargetId = null;
 const STORAGE_ACTIVE_TASK = 'mergenetic_active_task';
 let currentTaskId = null;
 let pollTimer = null;
+let evolutionaryPollTimer = null;
+let recipePollTimer = null;
+let taskRunningActive = false;
 let currentPriority = 'common';
 let hasShownRestartToast = false;
 let isHistoryMode = false;
@@ -461,10 +464,8 @@ async function executeMergeTask() {
         // ... (后续处理逻辑保持不变) ...
         const data = await response.json();
         if (data.status === 'success' && data.task_id) {
-            currentTaskId = data.task_id;
-            sessionStorage.setItem(STORAGE_ACTIVE_TASK, currentTaskId);
-            toggleResetButton('stop');
-            pollStatus(currentTaskId);
+            registerActiveTask(data.task_id);
+            pollStatus(data.task_id);
         } else {
             alert('启动失败: ' + (data.message || 'Unknown error'));
             resetStartButton();
@@ -479,15 +480,12 @@ async function executeMergeTask() {
 
 }
 
-// 恢复刷新后的会话：如果存在 active task，直接进入轮询并把按钮切换到“停止任务”
+// 恢复刷新后的会话：如果存在 active task，直接进入轮询
 function restoreSession() {
     const activeTaskId = sessionStorage.getItem(STORAGE_ACTIVE_TASK);
     if (!activeTaskId) return;
 
-    currentTaskId = activeTaskId;
-
-    // UI：立即进入“运行中”状态
-    toggleResetButton('stop');
+    registerActiveTask(activeTaskId);
 
     const startBtn = document.getElementById('start-merge');
     const statusDiv = document.getElementById('task-status');
@@ -503,6 +501,8 @@ function restoreSession() {
 function setupEventListeners() {
     document.getElementById('start-merge').addEventListener('click', openPriorityModal);
     document.getElementById('clear-selection').addEventListener('click', handleClearOrStop);
+    const stopBtn = document.getElementById('stop-all-tasks');
+    if (stopBtn) stopBtn.addEventListener('click', stopAllTasks);
     setupModalListeners();
 }
 
@@ -896,26 +896,82 @@ function closeModal() {
 }
 
 // ===================== UI 辅助 =====================
+function setStopAllButtonEnabled(enabled) {
+    taskRunningActive = !!enabled;
+    const btn = document.getElementById('stop-all-tasks');
+    if (btn) btn.disabled = !enabled;
+}
+
+function registerActiveTask(taskId) {
+    currentTaskId = taskId;
+    sessionStorage.setItem(STORAGE_ACTIVE_TASK, taskId);
+    setStopAllButtonEnabled(true);
+    toggleResetButton('clear');
+}
+
+function clearActiveTaskUI(message, options = {}) {
+    sessionStorage.removeItem(STORAGE_ACTIVE_TASK);
+    currentTaskId = null;
+    taskRunningActive = false;
+    hasShownRestartToast = false;
+    clearPolling();
+    clearEvolutionaryPolling();
+    clearRecipePolling();
+    setStopAllButtonEnabled(false);
+    toggleResetButton('clear');
+    resetStartButton();
+    hideRestartToast();
+    hideInterruptedUI();
+    resetEvolutionaryStartButton();
+    resetRecipeApplyButton();
+    resetTaskProgressExtras();
+    if (message !== undefined) {
+        setStatusUI({
+            message,
+            progress: options.progress !== undefined ? options.progress : 0,
+            color: options.color || '#86868b',
+            stripes: false
+        });
+    }
+}
+
+function resetEvolutionaryStartButton() {
+    const btn = document.getElementById('start-evolutionary-merge');
+    if (btn) {
+        btn.disabled = false;
+        btn.textContent = '开始完全融合';
+    }
+}
+
+function resetRecipeApplyButton() {
+    const btn = document.getElementById('recipe-apply-btn');
+    if (btn) {
+        btn.disabled = false;
+        btn.textContent = '按配方融合';
+    }
+}
+
+function clearEvolutionaryPolling() {
+    if (evolutionaryPollTimer) {
+        clearTimeout(evolutionaryPollTimer);
+        evolutionaryPollTimer = null;
+    }
+}
+
+function clearRecipePolling() {
+    if (recipePollTimer) {
+        clearTimeout(recipePollTimer);
+        recipePollTimer = null;
+    }
+}
+
 function toggleResetButton(mode) {
     const btn = document.getElementById('clear-selection');
-
-    if (mode === 'stop') {
-        btn.innerText = "停止任务";
-        btn.dataset.mode = 'stop';
-        btn.disabled = false;
-
-        // 直接用内联颜色避免依赖 CSS 新增类
-        btn.style.backgroundColor = '#c8c8c8ff';
-        btn.style.color = 'white';
-    } else {
-        btn.innerText = "重置";
-        btn.dataset.mode = 'clear';
-
-        btn.style.backgroundColor = '';
-        btn.style.color = '';
-
-        btn.disabled = state.selectedModels.length === 0;
-    }
+    btn.innerText = "重置";
+    btn.dataset.mode = 'clear';
+    btn.style.backgroundColor = '';
+    btn.style.color = '';
+    btn.disabled = taskRunningActive ? true : state.selectedModels.length === 0;
 }
 
 function showRestartToast() {
@@ -945,6 +1001,21 @@ function showRestartToast() {
 function hideRestartToast() {
     const toast = document.getElementById('restart-toast');
     if (toast) toast.remove();
+}
+
+function resetTaskProgressExtras() {
+    const stageEl = document.getElementById('task-progress-stage');
+    const pctEl = document.getElementById('task-progress-pct');
+    const progContainer = document.querySelector('.progress-container');
+    if (stageEl) {
+        stageEl.textContent = '';
+        stageEl.style.display = 'none';
+    }
+    if (pctEl) {
+        pctEl.textContent = '';
+        pctEl.style.display = 'none';
+    }
+    if (progContainer) progContainer.style.display = 'none';
 }
 
 function resetStartButton() {
@@ -977,6 +1048,38 @@ function clearPolling() {
     if (pollTimer) {
         clearInterval(pollTimer);
         pollTimer = null;
+    }
+}
+
+async function stopAllTasks() {
+    if (!confirm('确认停止？')) return;
+
+    const btn = document.getElementById('stop-all-tasks');
+    const prevText = btn ? btn.textContent : '停止';
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = '停止中...';
+    }
+
+    clearPolling();
+    clearEvolutionaryPolling();
+    clearRecipePolling();
+
+    try {
+        const res = await fetch('/api/stop_all', { method: 'POST' });
+        const data = await res.json();
+        if (data.status === 'success') {
+            clearActiveTaskUI('任务已手动停止');
+        } else {
+            alert('停止失败: ' + (data.message || 'Unknown error'));
+            setStopAllButtonEnabled(true);
+        }
+    } catch (e) {
+        console.error(e);
+        alert('网络错误');
+        setStopAllButtonEnabled(true);
+    } finally {
+        if (btn) btn.textContent = prevText;
     }
 }
 
@@ -1576,6 +1679,7 @@ function setupEvolutionaryMerge() {
                 btn.textContent = '开始完全融合';
                 return;
             }
+            registerActiveTask(data.task_id);
             btn.textContent = '已提交，任务 ID: ' + data.task_id;
             const statusDiv = document.getElementById('task-status');
             if (statusDiv) {
@@ -1598,20 +1702,20 @@ function setupEvolutionaryMerge() {
                 const stageEl = document.getElementById('task-progress-stage');
                 const evo = s.evolution_progress || {};
                 if (s.status === 'completed' || s.status === 'success') {
-                    btn.disabled = false;
-                    btn.textContent = '开始完全融合';
-                    if (statusDiv) statusDiv.querySelector('.status-message').textContent = '完全融合完成';
-                    if (fillEl) fillEl.style.width = '100%';
-                    if (pctEl) pctEl.textContent = '100%';
-                    if (stageEl) stageEl.textContent = '';
+                    clearActiveTaskUI('完全融合完成', { progress: 100, color: '#34c759' });
                     loadHistoryList();
                     showTaskCompletionModal(data.task_id, s, evo);
                     return;
                 }
-                if (s.status === 'error') {
-                    btn.disabled = false;
-                    btn.textContent = '开始完全融合';
-                    if (statusDiv) statusDiv.querySelector('.status-message').textContent = '失败: ' + (s.message || s.error);
+                if (s.status === 'stopped') {
+                    clearActiveTaskUI('任务已手动停止');
+                    return;
+                }
+                const evoFailed = !!(evo && (evo.error || evo.status === 'error'));
+                if (s.status === 'error' || evoFailed) {
+                    clearActiveTaskUI();
+                    const failMsg = (evo && (evo.error || evo.message)) || s.message || s.error || '未知错误';
+                    if (statusDiv) statusDiv.querySelector('.status-message').textContent = '失败: ' + failMsg;
                     return;
                 }
                 if (statusDiv && s.message) statusDiv.querySelector('.status-message').textContent = (s.message || '').slice(0, 120);
@@ -1664,9 +1768,9 @@ function setupEvolutionaryMerge() {
                     ? ' · 当前最优 acc: ' + Number(evo.current_best).toFixed(4) : '';
                 if (stageEl) stageEl.textContent = stepText + etaText + accText;
                 pollCount++;
-                if (pollCount < 3600) setTimeout(poll, 1000);
+                if (pollCount < 3600) evolutionaryPollTimer = setTimeout(poll, 1000);
             };
-            setTimeout(poll, 1500);
+            evolutionaryPollTimer = setTimeout(poll, 1500);
         } catch (e) {
             btn.disabled = false;
             btn.textContent = '开始完全融合';
@@ -1796,6 +1900,7 @@ function setupRecipeApply() {
                 btn.textContent = '按配方融合';
                 return;
             }
+            registerActiveTask(data.task_id);
             btn.textContent = '已提交: ' + data.task_id;
             const statusDiv = document.getElementById('task-status');
             if (statusDiv) {
@@ -1815,20 +1920,17 @@ function setupRecipeApply() {
                 const pctEl = document.getElementById('task-progress-pct');
                 const stageEl = document.getElementById('task-progress-stage');
                 if (s.status === 'completed' || s.status === 'success') {
-                    btn.disabled = false;
-                    btn.textContent = '按配方融合';
-                    if (statusDiv) statusDiv.querySelector('.status-message').textContent = '配方融合完成';
-                    if (fillEl) fillEl.style.width = '100%';
-                    if (pctEl) pctEl.textContent = '100%';
-                    if (stageEl) stageEl.textContent = '';
+                    clearActiveTaskUI('配方融合完成', { progress: 100, color: '#34c759' });
                     loadHistoryList();
-                    // 显示完成弹窗
                     showTaskCompletionModal(data.task_id, s, {});
                     return;
                 }
+                if (s.status === 'stopped') {
+                    clearActiveTaskUI('任务已手动停止');
+                    return;
+                }
                 if (s.status === 'error') {
-                    btn.disabled = false;
-                    btn.textContent = '按配方融合';
+                    clearActiveTaskUI();
                     if (statusDiv) statusDiv.querySelector('.status-message').textContent = '失败: ' + (s.message || s.error);
                     return;
                 }
@@ -1838,9 +1940,9 @@ function setupRecipeApply() {
                 if (pctEl) pctEl.textContent = pct + '%';
                 if (stageEl) stageEl.textContent = '';
                 pollCount++;
-                if (pollCount < 600) setTimeout(poll, 1000);
+                if (pollCount < 600) recipePollTimer = setTimeout(poll, 1000);
             };
-            setTimeout(poll, 1500);
+            recipePollTimer = setTimeout(poll, 1500);
         } catch (e) {
             btn.disabled = false;
             btn.textContent = '按配方融合';
@@ -1851,8 +1953,7 @@ function setupRecipeApply() {
 
 // 4. 添加模型到选择区（model 为 {name, path}、{ type:'recipe', recipe_id, name } 或 name 字符串）
 function addModelToSelection(model) {
-    const clearBtn = document.getElementById('clear-selection');
-    if (clearBtn.dataset.mode === 'stop') {
+    if (taskRunningActive) {
         alert('任务运行中，无法修改选择列表。请先停止任务。');
         return;
     }
@@ -2043,8 +2144,7 @@ function loadStandardSubsets(datasetType) {
 }
 
 window.removeModel = function (index) {
-    const clearBtn = document.getElementById('clear-selection');
-    if (clearBtn.dataset.mode === 'stop') {
+    if (taskRunningActive) {
         alert('任务运行中，无法修改选择列表。请先停止任务。');
         return;
     }
@@ -2086,10 +2186,8 @@ function updateWeightSliders() {
 // 7. 更新按钮状态
 function updateUIState() {
     const startBtn = document.getElementById('start-merge');
-    const clearBtn = document.getElementById('clear-selection');
 
-    // 如果当前处于 stop 模式，不允许被其它逻辑切回
-    if (clearBtn.dataset.mode === 'stop') return;
+    if (taskRunningActive) return;
 
     startBtn.disabled = state.selectedModels.length === 0;
     toggleResetButton('clear');
@@ -2098,15 +2196,6 @@ function updateUIState() {
 // ===================== 业务逻辑：开始/停止任务 =====================
 
 function handleClearOrStop() {
-    const btn = document.getElementById('clear-selection');
-    const mode = btn.dataset.mode || 'clear';
-
-    if (mode === 'stop') {
-        stopCurrentTask();
-        return;
-    }
-
-    // 清空选择
     state.selectedModels = [];
     renderSelectedModels();
     updateUIState();
@@ -2127,7 +2216,7 @@ async function handleResumeTask(taskId) {
             // 轮询会自然接管 update 状态 (变成 queued)
         } else {
             alert("恢复失败: " + data.message);
-            handleClearOrStop(); // 失败就当做停止处理
+            stopAllTasks();
         }
     } catch (e) {
         console.error(e);
@@ -2218,11 +2307,8 @@ async function startMergeTask() {
         const data = await response.json();
 
         if (data.status === 'success' && data.task_id) {
-            currentTaskId = data.task_id;
-            sessionStorage.setItem(STORAGE_ACTIVE_TASK, currentTaskId);
-
-            toggleResetButton('stop');
-            pollStatus(currentTaskId);
+            registerActiveTask(data.task_id);
+            pollStatus(data.task_id);
         } else {
             alert('启动失败: ' + (data.message || 'Unknown error'));
             resetStartButton();
@@ -2258,7 +2344,7 @@ function showInterruptedUI(taskId) {
         const cancelBtn = document.createElement('button');
         cancelBtn.className = 'btn btn-secondary btn-cancel-resume';
         cancelBtn.innerText = '取消';
-        cancelBtn.onclick = () => handleClearOrStop(); // 复用停止逻辑
+        cancelBtn.onclick = () => stopAllTasks();
 
         resumeGroup.appendChild(cancelBtn);
         resumeGroup.appendChild(confirmBtn);
@@ -2276,57 +2362,15 @@ function hideInterruptedUI() {
     if (resumeGroup) resumeGroup.remove();
 }
 
-async function stopCurrentTask() {
-    const taskId = currentTaskId || sessionStorage.getItem(STORAGE_ACTIVE_TASK);
-    if (!taskId) return;
-
-    if (!confirm('确定要停止当前任务吗？')) return;
-
-    const btn = document.getElementById('clear-selection');
-    btn.innerText = "正在停止...";
-    btn.disabled = true;
-
-    // 立刻停止前端轮询，避免“停止后又被轮询覆盖”
-    clearPolling();
-
-    try {
-        const res = await fetch(`/api/stop/${taskId}`, { method: 'POST' });
-        const data = await res.json();
-
-        if (data.status === 'success') {
-            handleStopSuccessUI();
-        } else {
-            alert('停止失败: ' + (data.message || 'Unknown error'));
-            toggleResetButton('stop');
-        }
-    } catch (e) {
-        console.error(e);
-        alert('网络错误');
-        toggleResetButton('stop');
-    }
-}
-
-function handleStopSuccessUI() {
-    sessionStorage.removeItem(STORAGE_ACTIVE_TASK);
-    currentTaskId = null;
-
-    // 恢复按钮
-    toggleResetButton('clear');
-    resetStartButton();
-
-    // 更新状态栏
-    setStatusUI({ message: "任务已手动停止", progress: 0, color: '#86868b', stripes: false });
-}
-
 // ===================== 轮询状态 =====================
 function pollStatus(taskId) {
     clearPolling();
 
     const startBtn = document.getElementById('start-merge');
     
-    // 确保按钮是禁用状态
     startBtn.disabled = true;
-    toggleResetButton('stop');
+    setStopAllButtonEnabled(true);
+    toggleResetButton('clear');
 
     pollTimer = setInterval(async () => {
         try {
@@ -2390,23 +2434,15 @@ function pollStatus(taskId) {
             // ================== 4. 结束/错误/手动停止 ==================
             if (['completed', 'error', 'stopped'].includes(data.status)) {
                 clearPolling();
-                sessionStorage.removeItem(STORAGE_ACTIVE_TASK);
-                currentTaskId = null;
-                hasShownRestartToast = false; // 重置 flag
-
-                toggleResetButton('clear');
-                resetStartButton();
-                hideRestartToast(); // 清理 UI
-                hideInterruptedUI(); // 清理 UI
 
                 if (data.status === 'completed') {
-                    setStatusUI({ message: "任务完成", progress: 100, color: '#34c759', stripes: false });
+                    clearActiveTaskUI('任务完成', { progress: 100, color: '#34c759' });
                     if (data.result) finishTask(data.result);
                 } else if (data.status === 'stopped') {
-                    setStatusUI({ message: "任务已手动停止", progress: 0, color: '#86868b', stripes: false });
+                    clearActiveTaskUI('任务已手动停止');
                 } else {
+                    clearActiveTaskUI();
                     setStatusUI({ message: data.message || "任务失败", progress: 0, color: '#ff3b30', stripes: false });
-                    // alert('任务出错: ' + (data.message || 'Unknown error'));
                 }
             }
 

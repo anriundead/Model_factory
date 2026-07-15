@@ -1,0 +1,40 @@
+{
+  "task_id": "c47ae0d4",
+  "output_dir_name": "Qwen2.5-7B-Instruct_Meditron3-Qwen2.5-7B_20260403-022645",
+  "custom_name": "show0.1",
+  "model_paths": [
+    "/data/Models/Qwen2.5-7B-Instruct",
+    "/data/Models/Meditron3-Qwen2.5-7B"
+  ],
+  "parent_names": [
+    "Qwen2.5-7B-Instruct",
+    "Meditron3-Qwen2.5-7B"
+  ],
+  "best_genotype": [
+    0.33849955813561483,
+    0.793971655711136
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "business_ethics",
+    "econometrics",
+    "management",
+    "marketing",
+    "professional_accounting"
+  ],
+  "hf_subset_group": "business_economics",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 2,
+  "n_iter": 1,
+  "max_samples": 64,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 4,
+  "eval_mode": "text",
+  "completed_at": "2026-04-03T02:26:50.970291",
+  "current_best_acc": 0.2812,
+  "final_test_acc": 0.1875,
+  "final_test_duration": 85.64673185348511
+}

@@ -2,6 +2,8 @@
 # deploy.resources 仅 docker compose v2+ 生效；docker-compose v1 需 runtime: nvidia
 services:
   mergekit-beta:
+    # Reap Ray grandchildren after a stopped evolution task; Flask itself is not a process reaper.
+    init: true
     runtime: nvidia
     shm_size: "10g"
     restart: unless-stopped
@@ -10,6 +12,10 @@ services:
     build:
       context: .
       dockerfile: mergeKit_beta/Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
     image: mergekit-beta:latest
     ports:
       - "5000:5000"
@@ -22,11 +28,25 @@ services:
       start_period: 120s
     environment:
       - PORT=5000
-      - NVIDIA_VISIBLE_DEVICES=all
+      # 默认 all。若某张卡 PCIe 异常（nvidia-smi 报 Unable to determine device handle / sysfs link Unknown），
+      # 在仓库旁 .env 设置 NVIDIA_VISIBLE_DEVICES 为若干 GPU-UUID（逗号分隔），用宿主机 nvidia-smi -L 取健康卡的 UUID，避免 CDI 枚举死卡导致容器无法启动。
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - LOCAL_MODELS_PATH=/data/Models
       - MERGEKIT_MODEL_POOL=/data/models_pool
       - DATABASE_URL=${DATABASE_URL:-}
+      # Empty keeps legacy SQLite compatibility. The research profile sets this
+      # to the dedicated PostgreSQL service before any production cutover.
+      - MERGEKIT_MODEL_GATEWAY_DATABASE_URL=${MERGEKIT_MODEL_GATEWAY_DATABASE_URL:-}
+      # Redis carries research delivery only; PostgreSQL remains the durable
+      # source of truth for job state, cancellation and restart recovery.
+      - MERGEKIT_MODEL_GATEWAY_QUEUE_BACKEND=${MERGEKIT_MODEL_GATEWAY_QUEUE_BACKEND:-db}
+      - MERGEKIT_MODEL_GATEWAY_REDIS_URL=${MERGEKIT_MODEL_GATEWAY_REDIS_URL:-}
+      - MERGEKIT_MODEL_GATEWAY_WORKER_TOKEN=${MERGEKIT_MODEL_GATEWAY_WORKER_TOKEN:-}
+      - MERGEKIT_MODEL_GATEWAY_CLAMAV_HOST=${MERGEKIT_MODEL_GATEWAY_CLAMAV_HOST:-model-gateway-clamav}
+      - MERGEKIT_MODEL_GATEWAY_CLAMAV_PORT=${MERGEKIT_MODEL_GATEWAY_CLAMAV_PORT:-3310}
       - VLM_SEARCH_DIR=${VLM_SEARCH_DIR:-}
+      # 模型服务管理员 API Token；请在 .env 或启动环境注入，仓库不提供默认可用秘钥
+      - MERGEKIT_MODEL_GATEWAY_ADMIN_TOKEN=${MERGEKIT_MODEL_GATEWAY_ADMIN_TOKEN:-}
       # NVLink 对内 TP=2（评测推理阶段）：auto=自动选择空闲卡对(01/23)，不足则降级单卡
       - MERGEKIT_EVAL_TOPOLOGY=auto
       - MERGEKIT_EVAL_PAIR_TIMEOUT_S=30
@@ -35,6 +55,8 @@ services:
       - MERGEKIT_MAX_TASK_DURATION_S=${MERGEKIT_MAX_TASK_DURATION_S:-432000}
       # Triton/torch.compile 运行期需要 C 编译器时，显式指定
       - CC=gcc
+      # 降低大块 CUDA 分配碎片化导致的 OOM 概率（PyTorch 2.x）
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - HF_ENDPOINT=https://hf-mirror.com
       - HF_HUB_DISABLE_XET=1
       # 安全：不要在版本库中提供 HF_TOKEN 默认值；需要访问私有仓库/限流较紧时请在宿主机环境或 .env 注入
@@ -88,6 +110,136 @@ services:
       resources:
         reservations:
           devices:
+            # 某物理 GPU PCIe 异常时，count:all 会触发 CDI 枚举死卡；改为显式 UUID（与 .env MERGEKIT_NVIDIA_DEVICE_ID_* 一致）。
+            # 仅三卡可用时：从下列 device_ids 删掉一行，并同步从 .env 去掉对应 MERGEKIT_* 与 NVIDIA_VISIBLE_DEVICES 中该项。
             - driver: nvidia
-              count: all
+              device_ids:
+                - ${MERGEKIT_NVIDIA_DEVICE_ID_0}
+                - ${MERGEKIT_NVIDIA_DEVICE_ID_1}
+                - ${MERGEKIT_NVIDIA_DEVICE_ID_2}
+                - ${MERGEKIT_NVIDIA_DEVICE_ID_3}
               capabilities: [gpu]
+
+  model-gateway-postgres:
+    profiles: ["research"]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${MERGEKIT_GATEWAY_POSTGRES_DB:-model_gateway}
+      POSTGRES_USER: ${MERGEKIT_GATEWAY_POSTGRES_USER:-model_gateway}
+      # Required before `--profile research up`; left empty so normal compose
+      # validation and the existing SQLite service remain usable.
+      POSTGRES_PASSWORD: ${MERGEKIT_GATEWAY_POSTGRES_PASSWORD:-}
+    volumes:
+      - ./mergeKit_beta/runtime/model_gateway/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  model-gateway-redis:
+    profiles: ["research"]
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - ./mergeKit_beta/runtime/model_gateway/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  model-gateway-clamav:
+    profiles: ["research"]
+    # Locally verified against Docker Hub's official linux/amd64 config digest.
+    image: clamav/clamav:1.5.3-verified
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./mergeKit_beta/runtime/model_gateway/clamav:/var/lib/clamav
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --ping 1 >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  model-gateway-research-worker:
+    profiles: ["research"]
+    image: mergekit-beta:latest
+    restart: unless-stopped
+    init: true
+    command: ["/opt/conda/envs/mergenetic/bin/python", "-m", "app.model_gateway.file_worker"]
+    depends_on:
+      model-gateway-postgres:
+        condition: service_healthy
+      model-gateway-redis:
+        condition: service_healthy
+      model-gateway-clamav:
+        condition: service_healthy
+      model-gateway-legacy-parser:
+        condition: service_healthy
+    environment:
+      - MERGEKIT_CLI_SCRIPT=1
+      - LD_PRELOAD=/opt/conda/envs/mergenetic/lib/libstdc++.so.6
+      - DATABASE_URL=${DATABASE_URL:-}
+      - MERGEKIT_MODEL_GATEWAY_DATABASE_URL=${MERGEKIT_MODEL_GATEWAY_DATABASE_URL:-}
+      - MERGEKIT_MODEL_GATEWAY_QUEUE_BACKEND=${MERGEKIT_MODEL_GATEWAY_QUEUE_BACKEND:-db}
+      - MERGEKIT_MODEL_GATEWAY_REDIS_URL=${MERGEKIT_MODEL_GATEWAY_REDIS_URL:-}
+      - MERGEKIT_MODEL_GATEWAY_WORKER_TOKEN=${MERGEKIT_MODEL_GATEWAY_WORKER_TOKEN:-}
+      - MERGEKIT_MODEL_GATEWAY_CLAMAV_HOST=${MERGEKIT_MODEL_GATEWAY_CLAMAV_HOST:-model-gateway-clamav}
+      - MERGEKIT_MODEL_GATEWAY_CLAMAV_PORT=${MERGEKIT_MODEL_GATEWAY_CLAMAV_PORT:-3310}
+      - MERGEKIT_MODEL_GATEWAY_FILE_RECONCILE_SECONDS=${MERGEKIT_MODEL_GATEWAY_FILE_RECONCILE_SECONDS:-30}
+      - MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_URL=http://model-gateway-legacy-parser:8090
+      - MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_TOKEN=${MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_TOKEN:-}
+      - MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_TIMEOUT_SECONDS=${MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_TIMEOUT_SECONDS:-45}
+      - MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_MAX_MIB=${MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_MAX_MIB:-50}
+    volumes:
+      - ./mergeKit_beta:/app/ServiceEndFiles/Workspaces/mergeKit_beta
+    networks:
+      - default
+      - model-gateway-private
+
+  model-gateway-legacy-parser:
+    profiles: ["research"]
+    build:
+      context: .
+      dockerfile: mergeKit_beta/model_gateway_legacy_parser/Dockerfile
+      network: host
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+    image: mergekit-legacy-office-parser:latest
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 128
+    tmpfs:
+      - /work:rw,nosuid,nodev,noexec,size=768m,mode=1777
+    environment:
+      - HOME=/work/home
+      - TMPDIR=/work/tmp
+      - MERGEKIT_LEGACY_PARSER_TOKEN=${MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_TOKEN:-}
+      - MERGEKIT_LEGACY_PARSER_TIMEOUT_SECONDS=${MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_TIMEOUT_SECONDS:-45}
+      - MERGEKIT_LEGACY_PARSER_MAX_MIB=${MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_MAX_MIB:-50}
+    networks:
+      - model-gateway-private
+    healthcheck:
+      test: ["CMD", "java", "-jar", "/opt/legacy-parser/legacy-office-parser.jar", "--healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+networks:
+  model-gateway-private:
+    internal: true

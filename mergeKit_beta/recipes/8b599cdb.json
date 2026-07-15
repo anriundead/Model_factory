@@ -1,0 +1,37 @@
+{
+  "task_id": "8b599cdb",
+  "output_dir_name": "HuatuoGPT-Vision-7B-Qwen2.5VL_Meditron3-Qwen2.5-7B_20260403-024201",
+  "custom_name": "smaple-0.3",
+  "model_paths": [
+    "/data/Models/HuatuoGPT-Vision-7B-Qwen2.5VL",
+    "/data/Models/Meditron3-Qwen2.5-7B"
+  ],
+  "parent_names": [
+    "HuatuoGPT-Vision-7B-Qwen2.5VL",
+    "Meditron3-Qwen2.5-7B"
+  ],
+  "best_genotype": [
+    0.9330062518115968,
+    0.7137616614235619
+  ],
+  "hf_dataset": "m-a-p/CMMMU",
+  "hf_subsets": [
+    "art_and_design",
+    "humanities_and_social_sciences"
+  ],
+  "hf_subset_group": "humanities_art",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 2,
+  "n_iter": 1,
+  "max_samples": 12,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 4,
+  "eval_mode": "text",
+  "completed_at": "2026-04-03T02:42:06.753771",
+  "current_best_acc": 0.5833,
+  "final_test_acc": 0.16666666666666666,
+  "final_test_duration": 29.941586017608643
+}

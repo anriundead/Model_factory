@@ -4,6 +4,25 @@
 
 本文件仅描述 `Workspaces/mergeKit_beta` 的现状与约定，不覆盖仓库内其他子项目。
 
+## 系统文档索引（接口与数据）
+
+| 文档 | 用途 |
+|------|------|
+| [`docs/API.md`](docs/API.md) | HTTP 接口清单、请求习惯、与任务/测试集相关的路径说明 |
+| [`docs/DATABASE.md`](docs/DATABASE.md) | ORM 表、字段职责、`DATABASE_URL`、磁盘文件双写与读写规范 |
+| [`evolution/contracts.md`](evolution/contracts.md) | 进化子进程、Ray 显存裁剪、`metadata.json`/`progress.json` 契约 |
+
+接口实现入口：`app/routes.py`；数据库模型：`app/models.py`；写入层：`app/repositories/`。
+
+## 进化融合并行与用卡说明
+
+- **你提交的 `ray_num_gpus`**：只是“希望并行用几张卡”。不是承诺。
+- **系统实际会用几张卡**：Runner 会在启动 `run_vlm_search.py` 子进程前按显存做裁剪（方案 B），把“可并行卡数”收敛为 `ray_num_gpus_effective`，必要时设置 `CUDA_VISIBLE_DEVICES` 只暴露够用的卡。
+- **如何对账**：看 `merges/<task_id>/metadata.json` 里的
+  - `ray_num_gpus_effective`（事实：最终并行数）
+  - `evolution_cuda_visible_devices`（事实：子进程实际可见卡）
+  - `ray_cap_reason`（原因：为什么裁剪）
+
 ## 开发与协作规则（人机共用）
 
 完整规则位于 `**.cursor/rules/**`（Cursor / AI 与人类开发者共用），索引：`[.cursor/rules/RULES_INDEX.md](.cursor/rules/RULES_INDEX.md)`。
@@ -73,6 +92,7 @@
 | `HF_DATASETS_CACHE`                | HuggingFace `datasets` 缓存                                           | 未设为项目内 `cache/datasets`                                                                            |
 | `VLM_SEARCH_DIR`                   | **可选**。进化算法默认已内置在 `evolution/vendor/vlm_merge`；仅在外置/对比调试时设此变量指向其他目录 | 不设则走内置；旧部署可继续指向 `modelmerge_visual/.../VLM_merge`                                                  |
 | `MERGEKIT_EVOLUTION_LEGACY_BRIDGE` | 为 `1`/`true`/`yes` 时子进程入口改为 `scripts/run_vlm_search_bridge.py`      | 默认关闭，使用 `python -m evolution.runner`                                                               |
+| `MERGEKIT_VERIFY_VLLM_IMPORT`      | 为 `1`/`true`/`yes`/`on` 时，`scripts/verify_db_integration.py` 额外执行 `import vllm` 与 `lm_eval.models.vllm_causallms`（第 9 步） | 默认不设置则跳过；用于有 GPU 的环境做依赖冒烟，避免无 GPU 的 CI 误杀 |
 | `NUMEXPR_MAX_THREADS`              | numexpr 线程数                                                         | 由 `Config.setup_environment` 设为 `64`（类内常量，非环境变量读取）                                                 |
 | `HF_ENDPOINT`                      | HuggingFace 端点                                                      | 代码默认 `https://hf-mirror.com`，`setup_environment` 会写入 `os.environ`                                  |
 
@@ -93,6 +113,7 @@
 | `VLM_SEARCH_DIR`         | `${VLM_SEARCH_DIR:-}` | 进化融合必填时挂载脚本树或显式设置                     |
 | `HF_DATASETS_CACHE`      | `/data/hf_datasets`   | 建议持久化卷或大盘路径                           |
 | `MERGEKIT_EVAL_HF_CACHE` | `/data/eval_datasets` | 评测数据集缓存                               |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | 降低大块分配碎片化导致的 CUDA OOM（compose 已设） |
 
 **text 进化融合（vLLM 张量并行 + Ray）** 相关（`evolution/vendor/vlm_merge/run_vlm_search.py`，由 `evolution.runner` 子进程拉起；**不**影响 Flask 主进程与 `merge_manager` 的 lm_eval 路径）：
 
@@ -106,9 +127,10 @@
 | `MERGEKIT_VLLM_TP_SERIALIZE` | 已有：为 `1` 时 TP>1 下仅 1 个 Ray worker，串行 eval（稳定性兜底）。 |
 | `MERGEKIT_VLLM_ENABLE` / `MERGEKIT_EVOLUTION_TP2` | 已有：关 vLLM 或关进化侧 TP2 时的深度降级。 |
 | `MERGEKIT_EVOLUTION_MIN_FREE_GB` | 进化 Runner 选 TP、**以及** TP=1 时 Ray 并行裁剪（见下）共用的「单卡空闲显存下限」GiB；未设时回退 `MERGEKIT_EVAL_MIN_FREE_GB`，再默认 `12`。 |
+| `MERGEKIT_EVOLUTION_PEAK_GIB_PER_WORKER` | TP=1 时 Ray 并行裁剪的**单次 eval 预估峰值** GiB（与上一项取 max 作为并行门槛）；默认 `18`。无卡达该门槛时串行并尽量绑定单张余量最大的卡。 |
 | `MERGEKIT_MAX_TASK_DURATION_S` | 全局任务墙钟上限（秒），由 `config.Config` 读入；Runner 用 **monotonic** 计时，超时会 terminate 子进程。Compose 侧可设为多天以适配长跑（见仓库根 `docker-compose.yml` / `.env`）。 |
 
-**Ray 并行显存裁剪（`evolution/runner.py`，给其他 Agent）**：当 `tp_size=1` 且 `ray_num_gpus>1` 时，Runner 不再假设「任意 N 张卡都能各跑一个 worker」。会统计空闲 ≥ `MERGEKIT_EVOLUTION_MIN_FREE_GB` 的卡数，将 **`--ray-num-gpus` 降为 min(请求, 达标数)**，并在必要时仅向子进程暴露达标卡（`CUDA_VISIBLE_DEVICES`），避免在余量不足的 GPU 上调度导致 OOM。详见 [`evolution/contracts.md`](evolution/contracts.md) 中「Ray 并行度与显存」一节；`metadata.json` 中可查 `ray_num_gpus_effective`、`evolution_cuda_visible_devices`、`ray_cap_reason`。
+**Ray 并行显存裁剪（`evolution/runner.py`，给其他 Agent）**：当 `tp_size=1` 且 `ray_num_gpus>1` 时，Runner 用 **`max(MIN_FREE_GB, PEAK_GIB_PER_WORKER)`** 作为「可并行」单卡空闲门槛（默认约 12 vs 18 → **18GiB**），将 **`--ray-num-gpus` 降为 min(请求, 达标数)**，必要时收窄 `CUDA_VISIBLE_DEVICES`；无卡达峰值时 **串行 + 单卡 CVD**。详见 [`evolution/contracts.md`](evolution/contracts.md)；`metadata.json` 中可查 `ray_num_gpus_effective`、`evolution_cuda_visible_devices`、`ray_cap_reason`、`evolution_peak_gib_per_worker` 等。
 
 **进度单写者（方案 B）**：Runner 向子进程注入 `MERGEKIT_RUNNER_OWNS_PROGRESS=1`，`run_vlm_search.py` 不再覆盖 `progress.json`，仅可选写 `progress_mergenetic_debug.json`，避免 Ray worker 局部 `step` 冲掉前端/API 的全局步数。见 `contracts.md`「进度文件」。
 
@@ -217,6 +239,58 @@ GPU：**docker-compose v1** 需在 `docker-compose.yml` 中设置 `runtime: nvid
 - 异常/失败日志应尽量携带 `task_id`（任务相关时必选）、`model_id`（涉及模型时）、`testset_id`（涉及评测时）。
 - 推荐在 logger 的 message 中直接写出或使用 `extra={"task_id": task_id}`，便于 grep 与后续集中日志。
 
+### 9) 进化任务终态、`/api/status` 与前端对齐（持久修复）
+
+**问题背景**：GPU 侧失败（如 `CUDA error: unspecified launch failure`）与 **OOM** 不同，应用层无法根除；但可出现 **磁盘 `metadata.json` 已为 `error`，而 Worker 内存仍为 `running`**，导致前端一直轮询。另：失败时若整文件覆盖 `progress.json`，会丢失最后步数/best。
+
+**约定**：
+
+- **`GET /api/status/<id>`（任务仍在内存）**：除原有「磁盘 `metadata.status==success` → 强制 `completed`」外，若磁盘 **`metadata.status==error`**，则强制 **`status=error`**、**`is_active=false`**，并刷新 `evolution_progress`（自磁盘读取）。**仅进化任务**：若 metadata 仍为 `running` 但 **`progress.json` 的 `status==error`**（例如写 metadata 失败），同样强制终态 error，避免单点依赖 metadata。
+- **`progress.json` 失败落盘**：由 `evolution/progress_io.py:write_progress_error` 合并写入，保留 `current_step`、`total_expected_steps`、`current_best`、`percent` 等；字段含 `error_detail`、`failed_at`。Runner 与 Worker 进化失败路径均使用此辅助函数。
+- **`read_evolution_progress`**：`status==error` 时仍返回上述进度字段，并带 **`status`、`error`、`message`** 供前端展示。
+- **前端**：进化轮询除 `s.status==='error'` 外，若 **`evolution_progress.error` 或 `evolution_progress.status==='error'`** 也停止轮询并提示失败。
+
+**修复边界**：不改变 DB schema；**不**把「仅 progress 标 error」逻辑推广到 `eval_only`（其 `progress.json` 语义独立）。可选环境开关「关闭磁盘 error 纠偏」未实现，默认始终纠偏。
+
+**回滚**：`git revert` 相关提交后重建容器（若 compose 挂载本目录则无需重打镜像）；无 DB migrate；旧代码遇合并后的 `progress.json` 应忽略未知键。
+
+**运维提示（CUDA launch failure）**：查 `nvidia-smi`/残留进程、`dmesg` Xid；尝试降低 `ray_num_gpus`、仅暴露达标 GPU（见 `evolution/contracts.md` Ray 裁剪）、必要时重启容器或宿主机 NVIDIA 栈。
+
+### 10) 进化融合：vLLM 与 Sphinx、验收与兜底
+
+**根因**：`mergenetic` 中 `vllm==0.7.0` 在导入链上会用到 **`sphinx`**（如 `sphinx.ext.autodoc.mock`）。Runner 在「验证数据集加载」阶段会 `import run_vlm_search`，进而 `mergenetic` → `lm_eval` → `vllm`；若环境缺 **`sphinx==7.4.7`**，会出现 `ModuleNotFoundError: No module named 'sphinx'`，`bridge.log` 在验证阶段失败、`metadata` 可能为 `error`（子进程退出码 1）。
+
+**依赖声明**：已在 [environment.yml](environment.yml) 的 pip 段与 [Dockerfile](Dockerfile) 的 `conda run -n mergenetic pip install` 中锁定 **`sphinx==7.4.7`**（与 `vllm` 同环境）。裸机：`conda activate mergenetic && pip install 'sphinx==7.4.7'` 或 `conda env update -f environment.yml`。
+
+**重建镜像**：在仓库根（`Workspaces`）执行 `docker build -f mergeKit_beta/Dockerfile -t mergekit-beta .` 或 `docker compose build mergekit-beta`，再 `docker compose up -d`（或 `--force-recreate`）。
+
+**不重打镜像的应急**（与重建二选一即可，版本须与 yml 一致）：
+
+```bash
+docker compose exec mergekit-beta /opt/conda/envs/mergenetic/bin/pip install 'sphinx==7.4.7'
+docker compose restart mergekit-beta
+```
+
+依赖或业务代码变更后 **应 restart**，否则 Worker 可能仍用旧解释器内存中的模块。
+
+**验收分层（发布前至少 L1+L2+L4；有 GPU 时做 L3、L5）**：
+
+| 层级 | 说明 |
+|------|------|
+| **L1** | 使用 **`mergenetic`** 的 Python（如 `/opt/conda/envs/mergenetic/bin/python` 或 `MERGENETIC_PYTHON`），**勿用** 容器内 base `python` 验进化依赖。 |
+| **L2** | `MERGENETIC_PYTHON -c "import vllm"`；可选再测 `import lm_eval.models.vllm_causallms`。**判读**：报错栈含 `sphinx` 属依赖未装齐；若仅为 CUDA/无 GPU，属运行环境，不据此否定 sphinx 修复。 |
+| **L3** | 仅在有 GPU、与生产一致的 compose 上：`POST /api/merge_evolutionary`，`model_paths` 填本机 **`LOCAL_MODELS_PATH`**（容器内多为 `/data/Models`）下**两个真实目录**（文档占位 `{MODEL_A}`、`{MODEL_B}`）；建议 `max_evals=1`、`ray_num_gpus=1`、`skip_final_eval=true`。`bridge.log` 应在「验证数据集加载」**之后**仍有日志，且无仅因 sphinx 的 ImportError。 |
+| **L4** | `scripts/verify_db_integration.py` 在 mergenetic 下跑通，PASS 数不减少。 |
+| **L5** | `GET /healthz`、`GET /api/history` 等 **200**，确认服务未因依赖异常整体挂掉。 |
+
+**自动化门控**：设置 **`MERGEKIT_VERIFY_VLLM_IMPORT=1`** 后再跑 `verify_db_integration.py`，将执行 **L2** 等价导入；默认不设置则跳过第 9 步。
+
+### 11) 文档同步原则（修复与 PR 约定）
+
+- 凡修改行为、依赖、环境变量、验收方式或运维步骤，须在**同一 PR / 同一次合并**内更新**本仓库内**文档（至少 `DEVELOPMENT.md`；触及进化契约/进度语义时同步 `evolution/contracts.md`）；**不得**只改代码或只更新个人计划文件。
+- 脚本新增环境变量或开关时：**脚本顶部注释**与 **`DEVELOPMENT.md` 环境表**各写一处。
+- 与协作规则一致时，可交叉引用 [`.cursor/rules/RULES_INDEX.md`](.cursor/rules/RULES_INDEX.md) / `WORKFLOW_AND_GIT.md`。
+
 ## 开发步骤细化（参考）
 
 以下为短期/中期/后期开发的操作级参考，具体以 ROADMAP 与当前分支为准。
@@ -299,6 +373,7 @@ curl -s http://127.0.0.1:5000/api/history
 | 2026-03-04 | 根目录 `.gitignore` 增加 `EnterpriseQuestionAnsweringSystem/`；新增「最终环境参数清单」（应用环境变量、Compose 宿主机变量、规划项、勿提交运行时文件）。                                                                                                                                                         |
 | 2026-03-30 | 新增人机共用开发规则：`.cursor/rules/` 下 `RULES_INDEX`、`ARCHITECTURE_BOUNDARIES`、`WORKFLOW_AND_GIT`、`AI_COLLABORATION`（含「95% 把握前须追问」）；DEVELOPMENT 增加「开发与协作规则」摘要与索引。                                                                                                          |
 | 2026-04-04 | Docker：`docker-compose.yml` 增加 `runtime: nvidia` 与 `NVIDIA_VISIBLE_DEVICES`；移除单独 `app.db` 文件卷；单体入口重命名为 `app.py.legacy`；Compose 宿主机变量表更新。                                                                                                                          |
+| 2026-04-11 | 进化融合：`environment.yml` / `Dockerfile` 增加 **`sphinx==7.4.7`**（vLLM 0.7 导入链需要）；新增「§10 vLLM/Sphinx、验收与兜底」「§11 文档同步原则」；环境表增加 `MERGEKIT_VERIFY_VLLM_IMPORT`；`verify_db_integration.py` 可选第 9 步；`evolution/contracts.md` 补充 mergenetic 依赖说明。 |
+| 2026-04-16 | 评测准确率治理：修正 Chat Template `BatchEncoding` token ids 提取；新增 MMLU/CMMLU/CMMMU 多选题样本字段归一化（支持 `numpy.ndarray` choices、`Answer='A'..'D'`、`option1..4`）；相关现状与验收已写入 `SYSTEM_STATUS.md` §6.9。 |
 | 此前         | 端口统一 5000；文档收敛为 README/DEVELOPMENT/ROADMAP；lm_eval 0.4.11 + transformers 5.3.0 升级与适配。                                                                                                                                                                             |
-
 

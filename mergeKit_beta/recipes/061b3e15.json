@@ -1,0 +1,36 @@
+{
+  "task_id": "061b3e15",
+  "output_dir_name": "HuatuoGPT-Vision-7B-Qwen2.5VL_Meditron3-Qwen2.5-7B_20260410-085818",
+  "custom_name": "进化融合-1775811148128",
+  "model_paths": [
+    "/data/Models/HuatuoGPT-Vision-7B-Qwen2.5VL",
+    "/data/Models/Meditron3-Qwen2.5-7B"
+  ],
+  "parent_names": [
+    "HuatuoGPT-Vision-7B-Qwen2.5VL",
+    "Meditron3-Qwen2.5-7B"
+  ],
+  "best_genotype": [
+    0.33849955813561483,
+    0.793971655711136
+  ],
+  "hf_dataset": "m-a-p/CMMMU",
+  "hf_subsets": [
+    "health_and_medicine"
+  ],
+  "hf_subset_group": "health_medicine",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 2,
+  "n_iter": 1,
+  "max_samples": 4,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 4,
+  "eval_mode": "text",
+  "completed_at": "2026-04-10T08:58:23.886681",
+  "current_best_acc": 0.25,
+  "final_test_acc": null,
+  "final_test_duration": 4.425060033798218
+}

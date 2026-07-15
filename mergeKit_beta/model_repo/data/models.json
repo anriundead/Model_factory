@@ -51,6 +51,32 @@
       "created_by": "system",
       "eval_history": [],
       "tags": []
+    },
+    "928ec46a-8c39-45b3-a3d9-f105e6d94118": {
+      "model_id": "928ec46a-8c39-45b3-a3d9-f105e6d94118",
+      "name": "research_gateway_smoke_20260713_210042",
+      "path": "/app/ServiceEndFiles/Workspaces/mergeKit_beta/merges/35214914/output",
+      "architecture": "Qwen2ForCausalLM",
+      "model_type": "LLM",
+      "is_merged": true,
+      "recipe": {
+        "parent_models": [
+          "Qwen2.5-VL-7B-TextOnly",
+          "HuatuoGPT-Vision-TextOnly"
+        ],
+        "weights": [
+          0.5,
+          0.5
+        ],
+        "method": "linear",
+        "library": "mergenetic",
+        "dtype": "bfloat16"
+      },
+      "param_count": 0,
+      "created_at": 1783947695.0798068,
+      "created_by": "system",
+      "eval_history": [],
+      "tags": []
     }
   }
 }

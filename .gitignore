@@ -25,17 +25,25 @@ ZjyCode/
 # ========== mergeKit_beta 内：仅忽略过大的输出与缓存 ==========
 # 保留代码、配置、前端等，只忽略融合产物与日志等
 
+.env
+.env.*
+*.bak
+
 mergeKit_beta/merges/
 mergeKit_beta/logs/
+mergeKit_beta/runtime/
 mergeKit_beta/app.log
+mergeKit_beta/_debug_*.log
 mergeKit_beta/__pycache__/
 mergeKit_beta/eval/
 mergeKit_beta/eval_workflow/
 mergeKit_beta/models_pool/
 mergeKit_beta/testset_download/
-mergeKit_beta/testset_repo/
-!mergeKit_beta/testset_repo/yaml/
+mergeKit_beta/testset_repo/data/
 mergeKit_beta/yaml_template/
+
+# Browser screenshots and raw acceptance output are local verification evidence.
+logs/model_gateway/acceptance/
 
 # Python 与通用缓存（整仓库）
 **/__pycache__/

@@ -1,0 +1,45 @@
+{
+  "task_id": "d8e496e0",
+  "output_dir_name": "Qwen2.5-7B-Instruct_HuatuoGPT-o1-7B_20260422-123349",
+  "custom_name": "med-1.5",
+  "model_paths": [
+    "/data/Models/Qwen2.5-7B-Instruct",
+    "/data/Models/HuatuoGPT-o1-7B"
+  ],
+  "parent_names": [
+    "Qwen2.5-7B-Instruct",
+    "HuatuoGPT-o1-7B"
+  ],
+  "best_genotype": [
+    0.4872900431259194,
+    0.7012259614996343
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "college_medicine",
+    "college_biology",
+    "clinical_knowledge",
+    "professional_medicine",
+    "anatomy",
+    "medical_genetics",
+    "virology",
+    "high_school_biology",
+    "human_aging",
+    "human_sexuality"
+  ],
+  "hf_subset_group": "biology_medicine",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 30,
+  "n_iter": 15,
+  "max_samples": 120,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 4,
+  "eval_mode": "text",
+  "completed_at": "2026-04-22T12:33:54.761869",
+  "current_best_acc": 0.7917,
+  "final_test_acc": 0.725,
+  "final_test_duration": 11.971523523330688
+}

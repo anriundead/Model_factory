@@ -24,6 +24,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from config import Config
+from evolution.progress_io import write_progress_error
 
 MERGE_DIR = Config.MERGE_DIR
 # 算法目录：非空 VLM_SEARCH_DIR 优先；否则使用仓内 vendor（不依赖外部 modelmerge_visual 树）
@@ -227,7 +228,7 @@ def _cap_ray_num_gpus_for_parallel_eval(
 
     返回：(effective_ray_num_gpus, 子进程 CUDA_VISIBLE_DEVICES 或 None, 写入 metadata 的补丁 dict)
     """
-    from core.gpu_topology import env_int, query_gpus
+    from core.gpu_topology import env_float, env_int, query_gpus
 
     patch: dict = {}
     if tp_size != 1 or ray_num_gpus <= 1:
@@ -235,6 +236,9 @@ def _cap_ray_num_gpus_for_parallel_eval(
 
     min_free_gb = env_int("MERGEKIT_EVOLUTION_MIN_FREE_GB", env_int("MERGEKIT_EVAL_MIN_FREE_GB", 12))
     min_mib = int(min_free_gb * 1024)
+    # 单次 TP=1 并行 worker 预估峰值（merge+vLLM 等）；与 min_free 取较大者作为「可并行」门槛（方案 B）
+    peak_gib = env_float("MERGEKIT_EVOLUTION_PEAK_GIB_PER_WORKER", 18.0)
+    parallel_mib = max(min_mib, int(peak_gib * 1024))
     vis = _parse_cuda_visible_devices()
     try:
         gpus = query_gpus()
@@ -246,8 +250,8 @@ def _cap_ray_num_gpus_for_parallel_eval(
     if not gpus:
         return ray_num_gpus, None, patch
 
-    eligible = sorted([g for g in gpus if g.mem_free_mib >= min_mib], key=lambda g: -g.mem_free_mib)
-    if not eligible:
+    eligible_min = [g for g in gpus if g.mem_free_mib >= min_mib]
+    if not eligible_min:
         log.warning(
             "[ray] 无 GPU 满足空闲 >= %s GiB，将 ray_num_gpus %s 降为 1",
             min_free_gb,
@@ -255,19 +259,45 @@ def _cap_ray_num_gpus_for_parallel_eval(
         )
         patch["ray_num_gpus_effective"] = 1
         patch["ray_cap_reason"] = "no_gpu_meets_min_free"
+        patch["evolution_peak_gib_per_worker"] = peak_gib
         return 1, None, patch
 
-    eff = min(ray_num_gpus, len(eligible))
-    picked = eligible[:eff]
-    subset_needed = len(eligible) < len(gpus) or eff < ray_num_gpus
+    eligible_parallel = sorted(
+        [g for g in gpus if g.mem_free_mib >= parallel_mib],
+        key=lambda g: -g.mem_free_mib,
+    )
+    patch["evolution_peak_gib_per_worker"] = peak_gib
+    patch["evolution_parallel_min_free_mib"] = parallel_mib
+
+    if not eligible_parallel:
+        best = max(eligible_min, key=lambda g: g.mem_free_mib)
+        cvd = str(best.index)
+        log.warning(
+            "[ray] 无 GPU 满足并行阈值 max(%s GiB min, %.2f GiB peak)=%.2f GiB；"
+            "串行 1 worker，CUDA_VISIBLE_DEVICES=%s",
+            min_free_gb,
+            peak_gib,
+            parallel_mib / 1024.0,
+            cvd,
+        )
+        patch["ray_num_gpus_effective"] = 1
+        patch["evolution_cuda_visible_devices"] = cvd
+        patch["ray_cap_reason"] = "no_gpu_meets_peak_gib"
+        return 1, cvd, patch
+
+    eff = min(ray_num_gpus, len(eligible_parallel))
+    picked = eligible_parallel[:eff]
+    subset_needed = len(eligible_parallel) < len(gpus) or eff < ray_num_gpus
     if not subset_needed:
         return eff, None, patch
 
-    cvd = ",".join(str(g.index) for g in picked)
+    cvd = ",".join(str(g.index) for g in sorted(picked, key=lambda g: g.index))
     log.warning(
-        "[ray] 空闲>=%s GiB 的卡 %s/%s 张；ray_num_gpus %s -> %s；子进程 CUDA_VISIBLE_DEVICES=%s",
+        "[ray] 并行需空闲 >= %.2f GiB（min=%s GiB, peak=%.2f GiB）：达标卡 %s/%s；ray_num_gpus %s -> %s；CUDA_VISIBLE_DEVICES=%s",
+        parallel_mib / 1024.0,
         min_free_gb,
-        len(eligible),
+        peak_gib,
+        len(eligible_parallel),
         len(gpus),
         ray_num_gpus,
         eff,
@@ -275,7 +305,7 @@ def _cap_ray_num_gpus_for_parallel_eval(
     )
     patch["ray_num_gpus_effective"] = eff
     patch["evolution_cuda_visible_devices"] = cvd
-    patch["ray_cap_reason"] = "vram_eligible_subset"
+    patch["ray_cap_reason"] = "peak_gib_parallel_subset"
     return eff, cvd, patch
 
 
@@ -708,8 +738,10 @@ def main():
         )
         if not test_samples or len(test_samples) == 0:
             logger.error("数据集验证失败: 无法加载任何样本 (数据集=%s, 子集=%s, 分割=%s)", hf_dataset, hf_subsets, hf_split)
-            with open(progress_path, "w", encoding="utf-8") as f:
-                json.dump({"status": "error", "message": f"数据集验证失败: 无法加载样本 (数据集={hf_dataset}, 子集={hf_subsets}, 分割={hf_split})"}, f, ensure_ascii=False)
+            write_progress_error(
+                progress_path,
+                f"数据集验证失败: 无法加载样本 (数据集={hf_dataset}, 子集={hf_subsets}, 分割={hf_split})",
+            )
             sys.exit(1)
         logger.info("数据集验证成功: 成功加载 %d 个样本 (验证用样本数)", len(test_samples))
         # 验证样本结构
@@ -725,8 +757,7 @@ def main():
     except Exception as e:
         logger.error("数据集验证过程出错: %s", e)
         logger.exception("数据集验证异常详情:")
-        with open(progress_path, "w", encoding="utf-8") as f:
-            json.dump({"status": "error", "message": f"数据集验证失败: {str(e)}"}, f, ensure_ascii=False)
+        write_progress_error(progress_path, f"数据集验证失败: {str(e)}")
         sys.exit(1)
 
     if not os.path.isfile(RUN_VLM_SEARCH_PY):
@@ -923,18 +954,14 @@ def main():
                     except Exception:
                         pass
                     try:
-                        with open(progress_path, "w", encoding="utf-8") as f:
-                            json.dump(
-                                {
-                                    "status": "error",
-                                    "message": "任务超时，已终止子进程",
-                                    "timeout_elapsed_seconds": round(elapsed_mono, 2),
-                                    "timeout_limit_seconds": int(task_duration_limit_s),
-                                },
-                                f,
-                                ensure_ascii=False,
-                                indent=2,
-                            )
+                        write_progress_error(
+                            progress_path,
+                            "任务超时，已终止子进程",
+                            extra={
+                                "timeout_elapsed_seconds": round(elapsed_mono, 2),
+                                "timeout_limit_seconds": int(task_duration_limit_s),
+                            },
+                        )
                     except Exception:
                         pass
                     # 清理大目录（保留日志/元数据）
@@ -1176,8 +1203,11 @@ def main():
             tail = "".join(out_lines[-50:]) if len(out_lines) > 50 else "".join(out_lines)
             logger.warning("标准输出（最后500字符）: %s", tail[-500:])
             try:
-                with open(progress_path, "w", encoding="utf-8") as f:
-                    json.dump({"status": "error", "message": tail[-500:], "returncode": proc.returncode}, f, ensure_ascii=False)
+                write_progress_error(
+                    progress_path,
+                    tail[-500:] if tail else "子进程失败",
+                    extra={"returncode": proc.returncode},
+                )
             except Exception:
                 pass
             logger.error("run_vlm_search 执行失败（返回码: %s）", proc.returncode)
@@ -1256,8 +1286,7 @@ def main():
     except Exception as e:
         logger.exception("进化 Runner 异常: %s", e)
         try:
-            with open(progress_path, "w", encoding="utf-8") as f:
-                json.dump({"status": "error", "message": str(e)}, f, ensure_ascii=False)
+            write_progress_error(progress_path, str(e))
         except Exception:
             pass
         sys.exit(1)

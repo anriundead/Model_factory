@@ -42,10 +42,12 @@ else
     PYTHON=python
 fi
 
-# 基座模型目录：未设置时使用默认路径，便于前端选取模型后正确解析路径
-export LOCAL_MODELS_PATH="${LOCAL_MODELS_PATH:-/home/a/ServiceEndFiles/Models}"
+# 基座模型目录：优先环境变量，否则由 config/paths.json 解析
 # 默认端口 5000，可通过环境变量覆盖
 export PORT="${PORT:-5000}"
+# Only the long-lived Flask runtime may reconcile serving processes on startup.
+# CLI and maintenance imports must not clear the PID of a live vLLM service.
+export MERGEKIT_MODEL_GATEWAY_RUNTIME_PROCESS=1
 echo "--- mergeKit_beta 后端启动 (port=$PORT) ---"
 exec "$PYTHON" - <<'PY'
 import os

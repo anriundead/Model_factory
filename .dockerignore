@@ -10,6 +10,7 @@ Datasets/
 mergeKit/models_pool/
 
 # 运行时与本地数据（挂载即可）
+mergeKit_beta/runtime/
 **/merges/
 **/logs/
 **/cache/

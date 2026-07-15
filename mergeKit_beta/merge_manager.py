@@ -92,6 +92,55 @@ def _popen_group_kwargs():
     return ProcessManager.create_process_group_kwargs()
 
 
+_TOKENIZER_FILES = (
+    "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+    "tokenizer.model", "vocab.json", "merges.txt", "added_tokens.json",
+)
+
+
+def _read_json(path: str):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _tokenizer_config_matches(output_dir: str, parent_dir: str) -> bool:
+    try:
+        output = _read_json(os.path.join(output_dir, "config.json"))
+        parent = _read_json(os.path.join(parent_dir, "config.json"))
+        keys = ("vocab_size", "bos_token_id", "eos_token_id", "pad_token_id")
+        return all(output.get(key) == parent.get(key) for key in keys)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def repair_merged_tokenizer(output_dir: str, parent_paths: list[str]) -> str | None:
+    """Repair an invalid merged tokenizer only from a config-compatible parent."""
+    tokenizer_path = os.path.join(output_dir, "tokenizer.json")
+    try:
+        _read_json(tokenizer_path)
+        return None
+    except (OSError, ValueError, TypeError):
+        pass
+    for parent in parent_paths:
+        source = os.path.join(parent, "tokenizer.json")
+        try:
+            _read_json(source)
+        except (OSError, ValueError, TypeError):
+            continue
+        if not _tokenizer_config_matches(output_dir, parent):
+            continue
+        for name in _TOKENIZER_FILES:
+            target = os.path.join(output_dir, name)
+            if os.path.exists(target):
+                os.unlink(target)
+            candidate = os.path.join(parent, name)
+            if os.path.isfile(candidate):
+                shutil.copy2(candidate, target)
+        _read_json(tokenizer_path)
+        return parent
+    raise RuntimeError("merged tokenizer is invalid and no compatible parent tokenizer is available")
+
+
 def _get_conda_activate_cmd(cmd_list):
     """
     Wraps a command list in a shell command that activates the mergenetic environment.
@@ -477,6 +526,10 @@ def run_merge_task(task_id, params, update_progress_callback, task_control=None)
             for f in os.listdir(output_dir)
         ):
             raise RuntimeError("融合输出目录无效或缺少权重/配置: %s" % output_dir)
+        repaired_from = repair_merged_tokenizer(output_dir, model_paths)
+        if repaired_from:
+            metadata["tokenizer_repaired_from"] = repaired_from
+            _logger.warning("[run_merge_task] 已从兼容父模型修复 tokenizer: %s", repaired_from)
         _logger.info("[run_merge_task] ✅ 最终路径验证通过: %s", output_dir)
 
         update_progress_callback(90, "融合完成，正在注册模型仓库...")

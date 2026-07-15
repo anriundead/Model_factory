@@ -1,0 +1,45 @@
+{
+  "task_id": "b778f7c9",
+  "output_dir_name": "Qwen2.5-7B-Instruct_Meditron3-Qwen2.5-7B_20260416-062732",
+  "custom_name": "进化融合-1776320589428",
+  "model_paths": [
+    "/data/Models/Qwen2.5-7B-Instruct",
+    "/data/Models/Meditron3-Qwen2.5-7B"
+  ],
+  "parent_names": [
+    "Qwen2.5-7B-Instruct",
+    "Meditron3-Qwen2.5-7B"
+  ],
+  "best_genotype": [
+    0.9967321829600528,
+    0.28423548310846947
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "college_medicine",
+    "college_biology",
+    "clinical_knowledge",
+    "professional_medicine",
+    "anatomy",
+    "medical_genetics",
+    "virology",
+    "high_school_biology",
+    "human_aging",
+    "human_sexuality"
+  ],
+  "hf_subset_group": "biology_medicine",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 2,
+  "n_iter": 1,
+  "max_samples": 16,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 4,
+  "eval_mode": "text",
+  "completed_at": "2026-04-16T06:27:37.359240",
+  "current_best_acc": 0.3125,
+  "final_test_acc": 0.375,
+  "final_test_duration": 4.375156879425049
+}

@@ -1,11 +1,14 @@
 # MMLU-style multiple choice prompt (cais/mmlu: question, choices, answer 0-3)
+# task_instructions 会被 build_mmlu_prompt() 拼接到 prompt 前部，约束模型只输出字母
+system_message:
+  - "You are a helpful assistant that answers multiple choice questions. Output ONLY the letter of the correct answer."
 task_instructions:
-  - "Answer the following multiple choice question. Choose one option (A, B, C, or D)."
+  - "Answer the following multiple choice question. Output ONLY the letter (A, B, C, or D) of the correct answer, nothing else. Each option (A, B, C, D) is equally likely to be correct."
 multi_choice_example_format:
   - |
     Question: {}
     Choices:
     {}
-    Answer:
+    Answer (A/B/C/D):
 temperature:
   - 0

@@ -64,7 +64,7 @@ def main():
         prompt_cfg=prompt_cfg,
         device=args.device,
         torch_dtype=getattr(torch, args.dtype),
-        max_new_tokens=64,
+        max_new_tokens=16,
         batch_size=4
     )
     

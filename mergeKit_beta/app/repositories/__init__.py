@@ -61,6 +61,39 @@ def task_update_after_completion(
         db.session.commit()
 
 
+def task_mark_stopped(task_id: str, error: str = "任务已手动停止") -> bool:
+    """将未完成任务标记为失败/停止，并写入 error。"""
+    task = db.session.get(Task, task_id)
+    if task is None:
+        return False
+    if task.status in ("completed",):
+        return False
+    task.status = "failed"
+    task.error = (error or "任务已手动停止")[:2000]
+    task.finished_at = datetime.utcnow()
+    task.updated_at = datetime.utcnow()
+    db.session.commit()
+    return True
+
+
+def evolution_steps_delete_for_task(task_id: str) -> int:
+    """删除指定任务在 DB 中的进化步骤（停止任务时清理中间写入）。"""
+    n = db.session.query(EvolutionStep).filter_by(task_id=task_id).delete()
+    db.session.commit()
+    return n
+
+
+def models_delete_by_task_id(task_id: str) -> int:
+    """删除与 task_id 关联的融合产物 Model 记录（停止/取消时回滚）。"""
+    rows = db.session.query(Model).filter_by(task_id=task_id).all()
+    count = len(rows)
+    for row in rows:
+        db.session.delete(row)
+    if count:
+        db.session.commit()
+    return count
+
+
 def task_backfill_from_metadata(task_id: str, meta: dict) -> Task:
     """从 metadata.json 内容回填/更新任务记录（迁移脚本用）。存在则更新，不存在则创建。"""
     status_map = {"success": "completed", "error": "failed"}
@@ -447,6 +480,13 @@ def model_list_all():
     """模型表全量列表，按创建时间倒序。"""
     models = db.session.query(Model).order_by(Model.created_at.desc()).all()
     return [m.to_dict() for m in models]
+
+
+def model_list_by_sources(sources: list[str]):
+    """按 source 过滤返回 ORM 行（如 base / merged）。"""
+    if not sources:
+        return []
+    return db.session.query(Model).filter(Model.source.in_(sources)).all()
 
 
 def evaluation_best_per_model_per_testset():

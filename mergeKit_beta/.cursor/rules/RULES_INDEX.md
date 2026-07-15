@@ -1,6 +1,6 @@
 # mergeKit_beta 规则索引（人机共用）
 
-完整约定拆分为多文件，便于 Cursor、其他 AI 工具与**人肉开发者**按需查阅。权威技术背景仍以 [DEVELOPMENT.md](../../DEVELOPMENT.md) 为准；本目录规则侧重 **协作纪律与代码边界**。
+完整约定拆分为多文件，便于 Cursor、其他 AI 工具与**人肉开发者**按需查阅。权威技术背景仍以 [DEVELOPMENT.md](../../DEVELOPMENT.md) 为准；**接口与数据规范**见 [docs/API.md](../../docs/API.md)、[docs/DATABASE.md](../../docs/DATABASE.md)。本目录规则侧重 **协作纪律与代码边界**。
 
 | 文件 | 摘要 |
 |------|------|

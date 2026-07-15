@@ -1,0 +1,15 @@
+{
+  "local_models_dir": "../../../Model_factory_data/models",
+  "model_pool_dir": "../../../Model_factory_data/models_pool",
+  "legacy_local_models_prefixes": [
+    "/home/a/ServiceEndFiles/Models"
+  ],
+  "legacy_model_pool_prefixes": [
+    "/home/a/ServiceEndFiles/Workspaces/mergeKit/models_pool",
+    "/home/a/mergeKit/models_pool"
+  ],
+  "legacy_merge_prefixes": [
+    "/home/a/ServiceEndFiles/Workspaces/mergeKit_beta/merges",
+    "/app/ServiceEndFiles/Workspaces/mergeKit_beta/merges"
+  ]
+}

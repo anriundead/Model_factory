@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mergenetic - Research Archive</title>
+    <link rel="stylesheet" href="https://font.sec.miui.com/font/css?family=MiSans:300,400,500,600,700&display=swap">
+    <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
+    <link rel="stylesheet" href="/static/model_gateway/research.css?v=research-command-desk-v1">
+</head>
+<body class="research-body">
+    <div class="research-shell">
+        <aside id="research-session-rail" class="research-session-rail" aria-label="本机会话">
+            <a class="research-archive-brand" href="/research" aria-label="Mergenetic Research Archive">
+                <span class="research-mark" aria-hidden="true">M</span>
+                <span><strong>Mergenetic</strong><small>RESEARCH ARCHIVE</small></span>
+            </a>
+            <button id="research-new-session" class="research-new-session" type="button"><i class="ri-add-line" aria-hidden="true"></i><span>新建会话</span></button>
+            <label class="research-session-search"><i class="ri-search-line" aria-hidden="true"></i><span class="sr-only">搜索会话</span><input id="research-session-search" type="search" autocomplete="off" placeholder="搜索本机会话"></label>
+            <nav id="research-session-list" class="research-session-list" aria-label="最近会话" aria-live="polite"></nav>
+            <div class="research-rail-footer"><span><i class="ri-computer-line" aria-hidden="true"></i>仅保存在此设备</span><button id="research-clear-local-history" type="button">清除</button></div>
+        </aside>
+
+        <main class="research-stage">
+            <header class="research-stage-header research-command-strip">
+                <button id="research-session-drawer-toggle" class="research-icon-button research-mobile-sessions" type="button" aria-expanded="false" aria-controls="research-session-rail" title="会话" aria-label="会话"><i class="ri-menu-line" aria-hidden="true"></i></button>
+                <div class="research-stage-title"><p>RESEARCH ARCHIVE</p><h1 id="research-active-session-title">新建研究</h1></div>
+                <div class="research-stage-context"><span id="research-local-archive-state" class="research-command-state"><i class="ri-computer-line" aria-hidden="true"></i>本机存档</span><span id="research-stage-source-count">0 份资料</span><button id="research-session-settings" class="research-header-action" type="button" aria-expanded="false" aria-controls="research-settings-drawer"><i class="ri-equalizer-line" aria-hidden="true"></i><span>会话设置</span></button></div>
+            </header>
+
+            <section id="research-conversation" class="research-conversation" aria-live="polite">
+                <section id="research-chat-timeline" class="research-chat-timeline" aria-label="对话记录"><p class="research-chat-empty">新建会话后可直接提问，或添加资料进行引用研究。</p></section>
+                <form id="research-job-form" class="research-composer research-composer-deck">
+                    <div id="research-attachment-strip" class="research-attachment-strip" hidden aria-label="本次使用的资料"></div>
+                    <div id="research-composer-tools" class="research-composer-tools">
+                        <input id="research-file-input" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx" hidden>
+                        <div id="research-add-source-menu" class="research-add-source-menu" hidden>
+                            <label for="research-file-input" class="research-tool-action"><i class="ri-file-upload-line" aria-hidden="true"></i><span>上传文件</span></label>
+                            <button id="research-open-url-panel" class="research-tool-action" type="button"><i class="ri-link" aria-hidden="true"></i><span>导入链接</span></button>
+                            <button id="research-open-materials" class="research-tool-action" type="button"><i class="ri-folder-open-line" aria-hidden="true"></i><span>查看资料</span></button>
+                        </div>
+                        <div id="research-url-panel" class="research-url-panel" hidden><div id="research-url-form" class="research-url-form"><input id="research-source-url" type="url" placeholder="公开 HTML 或 PDF URL" aria-label="公开链接"><button id="research-submit-url" type="button" class="research-icon-button" title="导入链接" aria-label="导入链接"><i class="ri-arrow-right-up-line" aria-hidden="true"></i></button></div></div>
+                    </div>
+                    <textarea id="research-question" rows="4" required placeholder="输入问题，或添加资料后进行研究。"></textarea>
+                    <div class="research-composer-footer"><span id="research-hint">无资料时直接对话；添加资料后自动提供引用。</span><div class="research-composer-actions"><button id="research-toggle-tools" class="research-icon-button" type="button" aria-expanded="false" aria-controls="research-add-source-menu" title="添加资料" aria-label="添加资料"><i class="ri-add-line" aria-hidden="true"></i></button><button class="research-primary-button" type="submit"><i class="ri-arrow-up-line" aria-hidden="true"></i><span>发送</span></button></div></div>
+                </form>
+            </section>
+        </main>
+    </div>
+
+    <div id="research-settings-overlay" class="research-settings-overlay" hidden></div>
+    <aside id="research-settings-drawer" class="research-settings-drawer" aria-label="会话设置" aria-hidden="true" aria-modal="true" role="dialog" tabindex="-1" hidden>
+        <div class="research-drawer-head"><div><p>SESSION</p><h2>会话设置</h2></div><button id="research-close-settings" class="research-icon-button" type="button" aria-label="关闭会话设置"><i class="ri-close-line" aria-hidden="true"></i></button></div>
+        <section class="research-drawer-section"><div class="research-section-title"><span>模型连接</span><button id="research-clear-key" class="research-icon-button" type="button" title="清除 API Key" aria-label="清除 API Key"><i class="ri-delete-bin-6-line" aria-hidden="true"></i></button></div><label class="research-field"><span>API Key</span><input id="research-api-key" type="password" autocomplete="off" placeholder="mk_live_..."></label><label class="research-remember"><input id="research-remember-key" type="checkbox"><span>在此可信设备保存</span></label><button id="research-load-models" class="research-secondary-button" type="button"><i class="ri-radar-line" aria-hidden="true"></i>连接模型</button><label class="research-select"><span>模型</span><select id="research-model" required><option value="">连接 API Key 后选择</option></select></label></section>
+        <section class="research-drawer-section"><div class="research-section-title"><span>本会话资料</span><span id="research-source-count">0 / 10</span></div><div id="research-source-list" class="research-source-list" aria-live="polite" tabindex="-1"><p class="research-empty">尚未添加资料。</p></div></section>
+    </aside>
+
+    <dialog id="research-session-limit-dialog" class="research-confirm-dialog" aria-labelledby="research-session-limit-title"><h2 id="research-session-limit-title">本机记录已达上限</h2><p>最多保存 20 条会话。请先删除不再需要的本机记录。</p><div><button id="research-session-limit-cancel" class="research-secondary-button" type="button">取消</button><button id="research-session-limit-manage" class="research-primary-button" type="button">管理会话</button></div></dialog>
+    <dialog id="research-session-rename-dialog" class="research-confirm-dialog" aria-labelledby="research-session-rename-title"><h2 id="research-session-rename-title">重命名本机会话</h2><label class="research-rename-field"><span>会话名称</span><input id="research-session-rename-input" type="text" maxlength="48" autocomplete="off"></label><div><button id="research-session-rename-cancel" class="research-secondary-button" type="button">取消</button><button id="research-session-rename-confirm" class="research-primary-button" type="button">保存</button></div></dialog>
+    <dialog id="research-session-delete-dialog" class="research-confirm-dialog" aria-labelledby="research-session-delete-title"><h2 id="research-session-delete-title">删除本机会话</h2><p id="research-session-delete-copy"></p><div><button id="research-session-delete-cancel" class="research-secondary-button" type="button">取消</button><button id="research-session-delete-confirm" class="research-danger-button" type="button">删除</button></div></dialog>
+
+    <div id="research-toast" class="research-toast" role="status" aria-live="polite"></div>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+    <script src="/static/model_gateway/research_archive.js?v=research-command-desk-v1"></script>
+    <script src="/static/model_gateway/research.js?v=research-command-desk-v1"></script>
+</body>
+</html>

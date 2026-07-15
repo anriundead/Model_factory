@@ -1,0 +1,36 @@
+{
+  "task_id": "eec970f3",
+  "output_dir_name": "Qwen2.5-VL-7B-TextOnly_HuatuoGPT-Vision-TextOnly_20260712-132400",
+  "custom_name": "serving-smoke-7b-natural-confirm-20260712",
+  "model_paths": [
+    "/data/Models/Qwen2.5-VL-7B-TextOnly",
+    "/data/Models/HuatuoGPT-Vision-TextOnly"
+  ],
+  "parent_names": [
+    "Qwen2.5-VL-7B-TextOnly",
+    "HuatuoGPT-Vision-TextOnly"
+  ],
+  "best_genotype": [
+    0.9330062518115968,
+    0.7137616614235619
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "college_medicine"
+  ],
+  "hf_subset_group": "",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 2,
+  "n_iter": 1,
+  "max_samples": 4,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 2,
+  "eval_mode": "text",
+  "completed_at": "2026-07-12T13:24:13.679034",
+  "current_best_acc": 1.0,
+  "final_test_acc": "skipped",
+  "final_test_duration": null
+}

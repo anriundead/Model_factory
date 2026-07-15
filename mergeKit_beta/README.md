@@ -68,10 +68,21 @@ npx -y @mermaid-js/mermaid-cli -i model_factory_system_architecture.mmd -o model
 | 文档 | 说明 |
 |------|------|
 | `DEVELOPMENT.md` | 开发进度、注意事项、运行规范、依赖与兼容性；外网访问、可追踪与日志、开发步骤细化、单机双 worker/双集群、新服务器迁移与部署 |
+| `docs/API.md` | **HTTP 接口层**：路径与方法、任务/测试集/配方等 API 约定与代码锚点 |
+| `docs/DATABASE.md` | **数据库与文件**：表结构、双写矩阵、`merges/` 与 `testset_repo/` 存放与使用规范 |
+| `evolution/contracts.md` | 进化融合 Runner、Ray 并行与显存、进度文件与 API 终态对齐 |
 | `docs/DEVELOPMENT_LOG.md` | 阶段性开发记录（VLM 评测接入、LLM 评测修复等） |
 | `docs/PLAN_SYSTEM_HEALTH.md` | 系统健康监控/自动发现的规划文档（未落地，作为需求草案） |
 
 ## 进化融合（text + vLLM TP + Ray）使用注意
+
+### 进化融合并行与用卡说明
+
+- **更快（并行）**：你传 `ray_num_gpus>1` 且 `tp_size=1` 时，系统会让 Ray 起多个 worker，**基本等价于“几张卡同时做评测”**。
+- **更稳（不乱用卡）**：`ray_num_gpus` 只是“你希望用几张卡”。Runner 会在启动子进程前先看每张卡的空闲显存，按“单次评测峰值门槛”（默认 18GiB）挑出够用的卡：
+  - 实际并行数写到 `metadata.json.ray_num_gpus_effective`
+  - 实际暴露给子进程的卡写到 `metadata.json.evolution_cuda_visible_devices`
+  - 为什么被裁剪写到 `metadata.json.ray_cap_reason`
 
 - **可以正常使用**：标准融合、配方、lm_eval 评测、进化融合 API（`/api/merge_evolutionary` 等）在更新后仍按原流程工作；text 进化在 **TP>1** 时默认走 **子进程 vLLM**，单次任务总时间可能变长，但应避免此前「第二代评测 TCPStore 长时间卡住」类问题。
 - **单机 Docker（推荐）**：在 `docker-compose` 或环境中设置 `MERGEKIT_RAY_SINGLE_NODE_LOOPBACK=1`；若仍有网络解析问题，可再加 `MERGEKIT_DOCKER_HOSTS_LOOPBACK_FIX=1`（见 `DEVELOPMENT.md`）。
@@ -79,10 +90,24 @@ npx -y @mermaid-js/mermaid-cli -i model_factory_system_architecture.mmd -o model
 - **回滚子进程**：`MERGEKIT_VLLM_TP_SUBPROCESS=0` 恢复进程内 vLLM（存在第二轮 c10d 风险，仅建议对比排障）。
 - **兜底**：仍可用 `MERGEKIT_VLLM_TP_SERIALIZE=1`、`MERGEKIT_VLLM_ENABLE=0`、`MERGEKIT_EVOLUTION_TP2=0` 等（详见 `DEVELOPMENT.md` 环境表）。
 
+### 进化融合评测数据集字段兼容（MMLU/CMMLU/CMMMU）速查
+
+近期已完成一次关键修复：评测侧增加了**样本字段归一化**与 **chat template tokenization 修正**，以避免出现“看似模型变差、实为评测管线错误”的情况。
+
+- **覆盖的数据集形态**：
+  - `cais/mmlu`：`question/choices/answer(0-3)`（其中 `choices` 可能是 `numpy.ndarray`）
+  - `haonan-li/cmmlu`：`Question/A/B/C/D/Answer('A'..'D')`
+  - `m-a-p/CMMMU`：`question/option1..4/answer('A'..'D')`（含 `image_*` 字段）
+- **代码位置**：`evolution/vendor/vlm_merge/run_vlm_search.py::_normalize_mcq_sample`
+- **验证建议**（提交正式进化任务前）：
+  - 先跑 20 样本 dry-run，观察 `gold_dist` 不极端偏斜、`pred_hist` 不塌缩；
+  - 若评测为 **text 模式**，`CMMMU` 的图像字段不会进入模型（这是预期边界，不是 bug）。
+
 ## 文档变更历史
 
 | 日期       | 变更摘要 |
 |------------|----------|
+| 2026-04-16 | 补充评测管线关键修复速查：Chat Template tokenization（BatchEncoding）与 MMLU/CMMLU/CMMMU 字段归一化；增加提交进化任务前 dry-run 验证要点与 text 模式边界说明。 |
 | 2026-04-09 | 补充进化融合 vLLM TP=2 + Ray 子进程隔离、`MERGEKIT_RAY_SINGLE_NODE_LOOPBACK` / hosts 门禁等运维说明；与 `DEVELOPMENT.md`、`docs/DEVELOPMENT_LOG.md` 同步。 |
 | 2025-03-04 | 与 DEVELOPMENT/ROADMAP 同步：数据主源 DB、测试集自动补全、文档索引与变更历史；架构约定中补充维护脚本说明；快速开始后增加外网访问说明，文档表补充 DEVELOPMENT 中迁移与部署等章节说明。 |
 | 此前       | 统一入口与端口；已实现能力与架构约定收敛。 |

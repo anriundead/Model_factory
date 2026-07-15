@@ -10,6 +10,10 @@
 
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 ENV DEBIAN_FRONTEND=noninteractive \
     CONDA_DIR=/opt/conda \
     PATH=/opt/conda/bin:/opt/conda/envs/mergenetic/bin:${PATH} \
@@ -50,8 +54,12 @@ RUN sed -e '/lm-eval==0.4.11/d' \
     && conda run -n mergenetic pip install --upgrade \
         'huggingface-hub==1.5.0' 'transformers==5.3.0' 'lm_eval[hf]==0.4.11' \
     && conda run -n mergenetic pip install --no-deps 'mergekit>=0.1.4' \
+    && conda run -n mergenetic pip install 'sphinx==7.4.7' \
     && conda clean -afy \
     && rm -f /tmp/environment.yml /tmp/environment.docker.yml
+
+# Keep CPU-only ONNX retrieval isolated from the Torch/vLLM dependency stack.
+RUN conda run -n mergenetic pip install --no-cache-dir 'onnxruntime==1.20.1'
 
 # 与宿主机路径对齐
 WORKDIR /app/ServiceEndFiles/Workspaces/mergeKit_beta

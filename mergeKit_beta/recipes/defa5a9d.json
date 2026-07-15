@@ -1,0 +1,49 @@
+{
+  "task_id": "defa5a9d",
+  "output_dir_name": "Qwen2.5-7B-Instruct_Qwen2.5-Math-7B-CFT_20260413-150545",
+  "custom_name": "进化融合-1776083750597",
+  "model_paths": [
+    "/data/Models/Qwen2.5-7B-Instruct",
+    "/data/Models/Qwen2.5-Math-7B-CFT"
+  ],
+  "parent_names": [
+    "Qwen2.5-7B-Instruct",
+    "Qwen2.5-Math-7B-CFT"
+  ],
+  "best_genotype": [
+    0.6293170420411625,
+    0.033386228639889166
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "high_school_government",
+    "high_school_macroeconomics",
+    "high_school_microeconomics",
+    "high_school_psychology",
+    "high_school_statistics",
+    "high_school_us_history",
+    "high_school_world_history",
+    "international_law",
+    "jurisprudence",
+    "philosophy",
+    "prehistory",
+    "sociology",
+    "us_foreign_policy",
+    "world_religions"
+  ],
+  "hf_subset_group": "humanities_social",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 30,
+  "n_iter": 16,
+  "max_samples": 81,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 4,
+  "eval_mode": "text",
+  "completed_at": "2026-04-13T15:05:50.274082",
+  "current_best_acc": 0.3704,
+  "final_test_acc": 0.2716049382716049,
+  "final_test_duration": 39.9042067527771
+}

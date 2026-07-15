@@ -1174,14 +1174,27 @@ select:focus {
     background: #e5e5ea;
 }
 
+.btn-danger {
+    background: #ff3b30;
+    color: white;
+}
+
+.btn-danger:hover:not(:disabled) {
+    background: #e0352b;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(255, 59, 48, 0.3);
+}
+
 .btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
 }
 
 .task-status {
-    flex-grow: 1;
-    margin-right: 30px;
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: min(100%, calc(100% - 380px));
+    margin-right: 16px;
 }
 
 .status-message {
@@ -1643,6 +1656,17 @@ footer{
 .action-bar .buttons {
     display: flex;
     align-items: center;
+    flex-shrink: 0;
+}
+
+#edit-buttons {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+#edit-buttons .btn-secondary {
+    margin-right: 0;
 }
 
 /* --- 1. 侧边栏样式 --- */

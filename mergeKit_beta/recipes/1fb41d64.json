@@ -1,0 +1,36 @@
+{
+  "task_id": "1fb41d64",
+  "output_dir_name": "Qwen2.5-7B-Instruct_Lingshu-7B_20260416-080043",
+  "custom_name": "Vmed-0.1",
+  "model_paths": [
+    "/data/Models/Qwen2.5-7B-Instruct",
+    "/data/Models/Lingshu-7B"
+  ],
+  "parent_names": [
+    "Qwen2.5-7B-Instruct",
+    "Lingshu-7B"
+  ],
+  "best_genotype": [
+    0.9330062518115968,
+    0.7137616614235619
+  ],
+  "hf_dataset": "m-a-p/CMMMU",
+  "hf_subsets": [
+    "health_and_medicine"
+  ],
+  "hf_subset_group": "health_medicine",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 2,
+  "n_iter": 1,
+  "max_samples": 16,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 4,
+  "eval_mode": "text",
+  "completed_at": "2026-04-16T08:00:48.476112",
+  "current_best_acc": 0.5625,
+  "final_test_acc": 0.375,
+  "final_test_duration": 3.603210210800171
+}

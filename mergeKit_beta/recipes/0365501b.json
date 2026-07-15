@@ -1,0 +1,45 @@
+{
+  "task_id": "0365501b",
+  "output_dir_name": "Qwen2.5-7B-Instruct_Meditron3-Qwen2.5-7B_20260417-111449",
+  "custom_name": "med1.1",
+  "model_paths": [
+    "/data/Models/Qwen2.5-7B-Instruct",
+    "/data/Models/Meditron3-Qwen2.5-7B"
+  ],
+  "parent_names": [
+    "Qwen2.5-7B-Instruct",
+    "Meditron3-Qwen2.5-7B"
+  ],
+  "best_genotype": [
+    0.9449061908370232,
+    0.2985232321821391
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "college_medicine",
+    "college_biology",
+    "clinical_knowledge",
+    "professional_medicine",
+    "anatomy",
+    "medical_genetics",
+    "virology",
+    "high_school_biology",
+    "human_aging",
+    "human_sexuality"
+  ],
+  "hf_subset_group": "biology_medicine",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 20,
+  "n_iter": 15,
+  "max_samples": 64,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 4,
+  "eval_mode": "text",
+  "completed_at": "2026-04-17T11:14:54.864791",
+  "current_best_acc": 0.7812,
+  "final_test_acc": 0.75,
+  "final_test_duration": 6.577782869338989
+}

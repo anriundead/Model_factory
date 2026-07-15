@@ -1,0 +1,36 @@
+{
+  "task_id": "391022cc",
+  "output_dir_name": "Qwen2.5-7B-Instruct_Meditron3-Qwen2.5-7B_20260409-081012",
+  "custom_name": "smoke-max_evals3-skip_final",
+  "model_paths": [
+    "/data/Models/Qwen2.5-7B-Instruct",
+    "/data/Models/Meditron3-Qwen2.5-7B"
+  ],
+  "parent_names": [
+    "Qwen2.5-7B-Instruct",
+    "Meditron3-Qwen2.5-7B"
+  ],
+  "best_genotype": [
+    0.33849955813561483,
+    0.793971655711136
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "college_medicine"
+  ],
+  "hf_subset_group": "",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 4,
+  "n_iter": 2,
+  "max_samples": 4,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 4,
+  "eval_mode": "text",
+  "completed_at": "2026-04-09T08:10:17.655810",
+  "current_best_acc": 0.5,
+  "final_test_acc": "skipped",
+  "final_test_duration": null
+}

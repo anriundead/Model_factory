@@ -7,6 +7,13 @@
 
 或:
   cd /path/to/mergeKit_beta && python scripts/verify_db_integration.py
+
+可选：进化融合 vLLM 导入链验收（需 mergenetic 环境，建议有 GPU 的机器上开启）:
+  MERGEKIT_VERIFY_VLLM_IMPORT=1 python scripts/verify_db_integration.py
+
+未设置该变量时跳过第 9 步，避免无 GPU 的 CI 因 import vllm 失败。须使用 conda env
+``mergenetic`` 的 Python，勿用 base ``python``。失败时若栈中含 ``sphinx`` 属依赖问题；
+若仅为 CUDA/无设备则属运行环境，勿与 sphinx 修复混淆。
 """
 from __future__ import print_function
 
@@ -232,6 +239,31 @@ def run():
         assert "17" in (evo.get("message") or ""), "message 应从 progress.json 读取"
         passed += 1
         print("[PASS] read_evolution_progress 返回 percent=42、message 含 Step，进度机制正常")
+        # 8b. error 终态仍保留步数 / best / percent（与 progress_io 合并语义一致）
+        import json as _json2
+        with open(progress_path, "w", encoding="utf-8") as f:
+            _json2.dump(
+                {
+                    "status": "error",
+                    "error_detail": "subprocess failed",
+                    "message": "subprocess failed",
+                    "current_step": 30,
+                    "total_expected_steps": 100,
+                    "current_best": 0.71,
+                    "percent": 30,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        evo_err = services.read_evolution_progress(fake_task_id)
+        assert evo_err is not None
+        assert evo_err.get("status") == "error"
+        assert evo_err.get("current_step") == 30
+        assert evo_err.get("percent") == 30
+        assert abs(float(evo_err.get("current_best", 0)) - 0.71) < 1e-6
+        passed += 1
+        print("[PASS] read_evolution_progress error 态保留 current_step/percent/current_best")
     except Exception as ex:
         failed += 1
         print("[FAIL] 进化任务进度机制:", ex)
@@ -245,6 +277,24 @@ def run():
                 os.rmdir(task_dir)
         except Exception:
             pass
+
+    # -------------------------------------------------------------------------
+    # 9. （可选）vLLM / Sphinx 导入链 — 与进化 Runner 数据集验证前栈一致
+    # -------------------------------------------------------------------------
+    if os.environ.get("MERGEKIT_VERIFY_VLLM_IMPORT", "").strip().lower() in ("1", "true", "yes", "on"):
+        print("\n--- 9. vLLM 导入链（MERGEKIT_VERIFY_VLLM_IMPORT=1）---")
+        try:
+            import vllm  # noqa: F401
+            import lm_eval.models.vllm_causallms  # noqa: F401
+
+            passed += 1
+            print("[PASS] import vllm 与 lm_eval.models.vllm_causallms 成功")
+        except Exception as ex:
+            failed += 1
+            print("[FAIL] vLLM 导入链:", ex)
+            import traceback
+
+            traceback.print_exc()
 
     return passed, failed
 

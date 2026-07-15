@@ -153,6 +153,16 @@ def register_routes(app, state, services, dataset_service):
     def model_repo_page():
         return render_template("model_repo.html") if (app.template_folder and os.path.isfile(os.path.join(app.template_folder, "model_repo.html"))) else "<p>model_repo</p>", 200
 
+    @app.route("/model-gateway")
+    def model_gateway_page():
+        template = "model_gateway/console.html"
+        return render_template(template) if (app.template_folder and os.path.isfile(os.path.join(app.template_folder, template))) else "<p>model gateway</p>", 200
+
+    @app.route("/research")
+    def research_page():
+        template = "model_gateway/research.html"
+        return render_template(template) if (app.template_folder and os.path.isfile(os.path.join(app.template_folder, template))) else "<p>research</p>", 200
+
     @app.route("/static/<path:filename>")
     def serve_static(filename):
         return send_from_directory(app.static_folder or "static", filename)
@@ -162,7 +172,7 @@ def register_routes(app, state, services, dataset_service):
         try:
             refresh = request.args.get("refresh", "0") == "1"
             if refresh:
-                services.scan_base_models_to_db()
+                services.sync_models_db_from_disk()
 
             from .repositories import model_list_all
             from .models import Model
@@ -175,7 +185,7 @@ def register_routes(app, state, services, dataset_service):
                         "name": m.name,
                         "size": m.size_bytes or 0,
                         "details": {"family": "HuggingFace Local"},
-                        "path": m.path,
+                        "path": services.display_model_path(m.path or m.name),
                         "is_vlm": m.is_vlm or False,
                         "source": "base",
                     })
@@ -373,9 +383,10 @@ def register_routes(app, state, services, dataset_service):
             resolved = []
             for p in model_paths:
                 path = p if isinstance(p, str) else str(p)
-                if not os.path.isabs(path) or not os.path.isdir(path):
+                ab = services.resolve_model_path(path)
+                if not ab:
                     return jsonify({"status": "error", "message": "模型路径不存在或无效: %s" % p}), 400
-                resolved.append(os.path.abspath(path))
+                resolved.append(ab)
             data["model_paths"] = resolved
         elif models:
             # 将模型名解析为绝对路径，与前端/模型列表一致，避免 worker 中 MODEL_POOL_PATH 不一致导致立即失败
@@ -723,6 +734,47 @@ def register_routes(app, state, services, dataset_service):
                         resp["is_active"] = False
                         if meta.get("message"):
                             resp["message"] = meta["message"]
+                    elif meta.get("status") == "error":
+                        resp["status"] = "error"
+                        resp["is_active"] = False
+                        resp["progress"] = 0
+                        err_msg = meta.get("error") or meta.get("message") or ""
+                        if err_msg:
+                            resp["message"] = err_msg
+                        res = resp.get("result")
+                        res = dict(res) if isinstance(res, dict) else {}
+                        res["status"] = "error"
+                        if meta.get("error"):
+                            res["error"] = meta["error"]
+                        elif err_msg:
+                            res["error"] = err_msg
+                        resp["result"] = res
+                        if task.get("original_data", {}).get("type") == "merge_evolutionary" or task.get("type") == "merge_evolutionary":
+                            evo_disk = services.read_evolution_progress(task_id)
+                            if evo_disk is not None:
+                                resp["evolution_progress"] = evo_disk
+                    elif task.get("type") == "merge_evolutionary" or (task.get("original_data") or {}).get("type") == "merge_evolutionary":
+                        # 磁盘 metadata 尚未标 error，但 progress.json 已由 Runner 标失败（Worker 写 metadata 失败等）
+                        if resp.get("status") in ("running", "queued"):
+                            pp = os.path.join(state.merge_dir, task_id, "progress.json")
+                            if os.path.isfile(pp):
+                                try:
+                                    with open(pp, "r", encoding="utf-8") as pf:
+                                        pd = json.load(pf)
+                                    if pd.get("status") == "error":
+                                        resp["status"] = "error"
+                                        resp["is_active"] = False
+                                        resp["message"] = pd.get("message") or pd.get("error_detail") or "进化任务失败"
+                                        evo_disk = services.read_evolution_progress(task_id)
+                                        if evo_disk is not None:
+                                            resp["evolution_progress"] = evo_disk
+                                        r = resp.get("result")
+                                        r = dict(r) if isinstance(r, dict) else {}
+                                        r["status"] = "error"
+                                        r["error"] = resp["message"]
+                                        resp["result"] = r
+                                except Exception:
+                                    pass
                 except Exception:
                     pass
             return jsonify(resp)
@@ -734,17 +786,15 @@ def register_routes(app, state, services, dataset_service):
 
     @app.route("/api/stop/<task_id>", methods=["POST"])
     def stop_task(task_id):
-        if task_id not in state.tasks:
-            return jsonify({"status": "error", "message": "任务不存在"}), 404
-        with state.scheduler_lock:
-            state.tasks[task_id]["status"] = "stopped"
-            state.tasks[task_id]["message"] = "任务已手动停止"
-            if state.running_task_info["id"] == task_id:
-                state.tasks[task_id].get("control", {})["aborted"] = True
-                if state.running_task_info.get("process"):
-                    services.kill_process_tree_by_pid(state.running_task_info["process"].pid)
-                state.running_task_info["id"] = None
-        return jsonify({"status": "success"})
+        result = services.stop_task_with_cleanup(task_id)
+        if not result.get("ok"):
+            return jsonify({"status": "error", "message": result.get("message", "停止失败")}), 404
+        return jsonify({"status": "success", **result})
+
+    @app.route("/api/stop_all", methods=["POST"])
+    def stop_all_tasks():
+        result = services.stop_all_active_tasks()
+        return jsonify({"status": "success", **result})
 
     @app.route("/api/resume/<task_id>", methods=["POST"])
     def resume_task(task_id):
@@ -1478,6 +1528,7 @@ def register_routes(app, state, services, dataset_service):
                 with open(path, "r", encoding="utf-8") as fp:
                     r = json.load(fp)
                 r["recipe_id"] = os.path.splitext(f)[0]
+                r = services.normalize_recipe_model_paths(r)
                 model_paths = r.get("model_paths") or []
                 is_vlm = any(services.model_is_vlm(p) for p in model_paths if p and os.path.isdir(p))
                 r["is_vlm"] = is_vlm
@@ -1496,6 +1547,7 @@ def register_routes(app, state, services, dataset_service):
             with open(path, "r", encoding="utf-8") as f:
                 recipe = json.load(f)
             recipe["recipe_id"] = recipe_id
+            recipe = services.normalize_recipe_model_paths(recipe)
             return jsonify({"status": "success", "recipe": recipe})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500

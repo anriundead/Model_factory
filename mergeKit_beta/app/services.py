@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session as _SaSession
 from core.process_manager import ProcessManager
 import merge_manager
 from merge_manager import run_merge_task, run_eval_only_task, run_recipe_apply_task
+from evolution.progress_io import write_progress_error
 
 
 class BaseService:
@@ -25,23 +26,84 @@ class BaseService:
 
 
 class ModelPathMixin(BaseService):
+    def _is_model_dir_complete(self, model_path: str) -> bool:
+        """
+        判断本地 HF 模型目录是否“可用”（至少包含一份权重，且分片索引引用的文件都存在）。
+        目的：过滤仅有 config/index/tokenizer 但缺少权重分片的目录，避免提交任务后在 merge/eval 阶段报 FileNotFoundError。
+        """
+        if not model_path or not os.path.isdir(model_path):
+            return False
+        if not os.path.isfile(os.path.join(model_path, "config.json")):
+            return False
+
+        def _has_any_weight_file(p: str) -> bool:
+            try:
+                for f in os.listdir(p):
+                    if f.endswith(".safetensors") or f.endswith(".bin"):
+                        return True
+            except OSError:
+                return False
+            return False
+
+        def _index_ok(index_name: str) -> bool:
+            ip = os.path.join(model_path, index_name)
+            if not os.path.isfile(ip):
+                return True  # 无此类索引，不在此处判失败
+            try:
+                with open(ip, "r", encoding="utf-8") as f:
+                    idx = json.load(f)
+            except Exception:
+                return False
+            wm = idx.get("weight_map")
+            if not isinstance(wm, dict) or not wm:
+                return False
+            files = {str(v) for v in wm.values() if v}
+            for fn in files:
+                if not os.path.isfile(os.path.join(model_path, fn)):
+                    return False
+            return True
+
+        # 分片模式：必须满足索引引用的每个分片都存在
+        if not _index_ok("model.safetensors.index.json"):
+            return False
+        if not _index_ok("pytorch_model.bin.index.json"):
+            return False
+
+        # 非分片模式：至少存在一个权重文件
+        if _has_any_weight_file(model_path):
+            return True
+        # 有索引但未找到任何权重文件也视为不完整
+        if os.path.isfile(os.path.join(model_path, "model.safetensors.index.json")):
+            return False
+        if os.path.isfile(os.path.join(model_path, "pytorch_model.bin.index.json")):
+            return False
+        return False
+
     def resolve_model_path(self, name_or_path: str):
         if not name_or_path or not isinstance(name_or_path, str):
             return None
         s = name_or_path.strip()
         if not s:
             return None
-        local_path = getattr(self.config, "LOCAL_MODELS_PATH", None) or self.state.model_pool_path
         extra_paths = getattr(self.config, "LOCAL_MODELS_EXTRA_PATHS", None) or []
+        from core.path_utils import resolve_to_absolute
+
+        candidate = resolve_to_absolute(s, extra_bases=extra_paths)
+        if candidate and self._is_model_dir_complete(candidate):
+            return os.path.abspath(candidate)
+
+        local_path = getattr(self.config, "LOCAL_MODELS_PATH", None) or self.state.model_pool_path
         bases = [local_path, self.state.model_pool_path] + list(extra_paths)
         if os.path.isabs(s) and os.path.isdir(s):
-            return os.path.abspath(s)
+            ab = os.path.abspath(s)
+            return ab if self._is_model_dir_complete(ab) else None
         for base in bases:
             if not base:
                 continue
             candidate = os.path.join(base, s)
             if os.path.isdir(candidate):
-                return os.path.abspath(candidate)
+                ab = os.path.abspath(candidate)
+                return ab if self._is_model_dir_complete(ab) else None
         name = os.path.basename(s)
         for base in bases:
             if not base or not os.path.isdir(base):
@@ -50,10 +112,30 @@ class ModelPathMixin(BaseService):
                 for item in os.listdir(base):
                     full = os.path.join(base, item)
                     if os.path.isdir(full) and item == name:
-                        return os.path.abspath(full)
+                        ab = os.path.abspath(full)
+                        return ab if self._is_model_dir_complete(ab) else None
             except OSError:
                 continue
         return None
+
+    def display_model_path(self, name_or_path: str) -> str:
+        """返回供 API/前端使用的绝对路径；legacy 路径会按 config/paths.json 前缀重写。"""
+        resolved = self.resolve_model_path(name_or_path)
+        if resolved:
+            return resolved
+        from core.path_utils import configured_local_models_path, join_under_base, strip_legacy_prefix
+
+        rel = strip_legacy_prefix(name_or_path) or os.path.basename((name_or_path or "").strip())
+        if rel:
+            return join_under_base(configured_local_models_path(), rel)
+        return (name_or_path or "").strip()
+
+    def normalize_recipe_model_paths(self, recipe: dict) -> dict:
+        paths = recipe.get("model_paths") or []
+        if paths:
+            recipe = dict(recipe)
+            recipe["model_paths"] = [self.display_model_path(p) for p in paths]
+        return recipe
 
     def list_models_from_dir(self, root_path):
         out = []
@@ -69,7 +151,7 @@ class ModelPathMixin(BaseService):
                         break
             except OSError:
                 pass
-        if has_weights:
+        if has_weights and self._is_model_dir_complete(root_path):
             size_bytes = 0
             try:
                 for f in os.listdir(root_path):
@@ -87,6 +169,8 @@ class ModelPathMixin(BaseService):
             full_path = os.path.join(root_path, item)
             if not os.path.isdir(full_path) or not os.path.isfile(os.path.join(full_path, "config.json")):
                 continue
+            if not self._is_model_dir_complete(full_path):
+                continue
             size_bytes = 0
             try:
                 for f in os.listdir(full_path):
@@ -102,26 +186,156 @@ class ModelPathMixin(BaseService):
             })
         return out
 
-    def scan_base_models_to_db(self):
-        """扫描基座模型目录并 upsert 到 Model 表（source='base'）。"""
-        app = getattr(self, "app", None)
-        if not app:
-            return 0
+    def _base_model_scan_dirs(self):
         extra_paths = getattr(self.config, "LOCAL_MODELS_EXTRA_PATHS", None) or []
-        scan_dirs = [
+        return [
             getattr(self.config, "LOCAL_MODELS_PATH", None),
             getattr(self.state, "model_pool_path", None),
         ] + list(extra_paths)
+
+    def _collect_base_models_on_disk(self) -> list[dict]:
+        """扫描基座模型目录，返回完整模型条目（按路径去重）。"""
         seen_paths = set()
-        count = 0
-        for base_path in scan_dirs:
+        out = []
+        for base_path in self._base_model_scan_dirs():
             if not base_path or not os.path.isdir(base_path):
                 continue
             for m in self.list_models_from_dir(base_path):
-                path = (m.get("path") or "").strip()
+                path = os.path.abspath((m.get("path") or "").strip()).rstrip("/")
                 if not path or path in seen_paths:
                     continue
                 seen_paths.add(path)
+                out.append({
+                    "path": path,
+                    "name": m.get("name", os.path.basename(path)),
+                    "size_bytes": m.get("size"),
+                    "source": "base",
+                })
+        return out
+
+    def _resolve_merge_model_path(self, task_dir: str, task_id: str | None = None) -> str | None:
+        """解析融合任务目录下的模型产物路径（output  symlink 或命名子目录）。"""
+        if not task_dir or not os.path.isdir(task_dir):
+            return None
+        output_path = os.path.join(task_dir, "output")
+        if os.path.lexists(output_path):
+            resolved = os.path.realpath(output_path) if os.path.islink(output_path) else os.path.abspath(output_path)
+            if os.path.isdir(resolved) and (
+                self.output_has_safetensors(resolved)
+                or self._is_model_dir_complete(resolved)
+                or os.path.isfile(os.path.join(resolved, "config.json"))
+            ):
+                return resolved.rstrip("/")
+        skip = {"output", "vlm_search_results", "__pycache__"}
+        for item in sorted(os.listdir(task_dir)):
+            if item in skip or item.startswith("."):
+                continue
+            full = os.path.join(task_dir, item)
+            if not os.path.isdir(full):
+                continue
+            if self.output_has_safetensors(full) or self._is_model_dir_complete(full):
+                return os.path.abspath(full).rstrip("/")
+            if os.path.isfile(os.path.join(full, "config.json")) and (
+                os.path.isfile(os.path.join(full, "model.safetensors.index.json"))
+                or os.path.isfile(os.path.join(full, "pytorch_model.bin.index.json"))
+            ):
+                return os.path.abspath(full).rstrip("/")
+        return None
+
+    def _collect_merged_models_on_disk(self) -> list[dict]:
+        """扫描 merges/ 下已成功任务的融合产物。"""
+        merge_dir = getattr(self.state, "merge_dir", None)
+        if not merge_dir or not os.path.isdir(merge_dir):
+            return []
+        out = []
+        seen_paths = set()
+        for tid in os.listdir(merge_dir):
+            task_dir = os.path.join(merge_dir, tid)
+            if not os.path.isdir(task_dir):
+                continue
+            meta_path = os.path.join(task_dir, "metadata.json")
+            if not os.path.isfile(meta_path):
+                continue
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                if meta.get("status") != "success":
+                    continue
+            except Exception:
+                continue
+            model_path = self._resolve_merge_model_path(task_dir, tid)
+            if not model_path or model_path in seen_paths:
+                continue
+            seen_paths.add(model_path)
+            out.append({
+                "path": model_path,
+                "name": meta.get("custom_name") or os.path.basename(model_path) or tid,
+                "task_id": tid,
+                "parent_model_ids": meta.get("model_paths") or [],
+                "source": "merged",
+            })
+        return out
+
+    def sync_models_db_from_disk(self) -> dict:
+        """
+        全量同步 models 表：删除磁盘已不存在的 base/merged 记录，upsert 新扫描到的模型。
+        容器每次启动（docker compose up）时调用，保证 UI 列表与磁盘一致。
+        """
+        stats = {"removed": 0, "upserted_base": 0, "upserted_merged": 0}
+        app = getattr(self, "app", None)
+        if not app:
+            return stats
+
+        base_on_disk = self._collect_base_models_on_disk()
+        merged_on_disk = self._collect_merged_models_on_disk()
+        base_by_name = {(m["name"] or "").strip().lower(): m for m in base_on_disk if m.get("name")}
+        merged_paths = {m["path"] for m in merged_on_disk}
+        merged_by_task = {m["task_id"]: m for m in merged_on_disk if m.get("task_id")}
+
+        with app.app_context():
+            from app.extensions import db
+            from app.models import Model
+            from app.repositories import model_list_by_sources, model_register
+
+            rows = model_list_by_sources(["base", "merged"])
+            for row in rows:
+                keep = False
+                canonical_path = None
+
+                if row.source == "base":
+                    name_key = (row.name or "").strip().lower()
+                    disk = base_by_name.get(name_key)
+                    if disk and os.path.isdir(disk["path"]):
+                        keep = True
+                        canonical_path = disk["path"]
+                elif row.source == "merged":
+                    stored = os.path.abspath((row.path or "").rstrip("/"))
+                    if stored in merged_paths and os.path.isdir(stored):
+                        keep = True
+                        canonical_path = stored
+                    elif row.task_id and row.task_id in merged_by_task:
+                        keep = True
+                        canonical_path = merged_by_task[row.task_id]["path"]
+                    else:
+                        resolved = self.resolve_model_path(row.path or "") or self._resolve_merge_model_path(
+                            os.path.join(getattr(self.state, "merge_dir", ""), row.task_id or ""),
+                            row.task_id,
+                        )
+                        if resolved and resolved in merged_paths:
+                            keep = True
+                            canonical_path = resolved
+
+                if keep:
+                    if canonical_path and canonical_path != (row.path or "").rstrip("/"):
+                        row.path = canonical_path
+                else:
+                    db.session.delete(row)
+                    stats["removed"] += 1
+
+            db.session.commit()
+
+            for m in base_on_disk:
+                path = m["path"]
                 is_vlm = self.model_is_vlm(path)
                 arch = None
                 try:
@@ -130,21 +344,38 @@ class ModelPathMixin(BaseService):
                         arch = "hs%d_nhl%d" % (hs, nhl)
                 except Exception:
                     pass
-                try:
-                    with app.app_context():
-                        from app.repositories import model_register
-                        model_register(
-                            path=path,
-                            name=m.get("name", os.path.basename(path)),
-                            source="base",
-                            is_vlm=is_vlm,
-                            size_bytes=m.get("size"),
-                            architecture=arch,
-                        )
-                        count += 1
-                except Exception as e:
-                    self.logger.debug("[scan_base_models_to_db] 跳过 %s: %s", path, e)
-        return count
+                model_register(
+                    path=path,
+                    name=m["name"],
+                    source="base",
+                    is_vlm=is_vlm,
+                    size_bytes=m.get("size_bytes"),
+                    architecture=arch,
+                )
+                stats["upserted_base"] += 1
+
+            for m in merged_on_disk:
+                model_register(
+                    path=m["path"],
+                    name=m["name"],
+                    source="merged",
+                    task_id=m.get("task_id"),
+                    parent_model_ids=m.get("parent_model_ids") or [],
+                )
+                stats["upserted_merged"] += 1
+
+        if getattr(self, "logger", None):
+            self.logger.info(
+                "[sync_models_db_from_disk] 完成: removed=%d base=%d merged=%d",
+                stats["removed"],
+                stats["upserted_base"],
+                stats["upserted_merged"],
+            )
+        return stats
+
+    def scan_base_models_to_db(self):
+        """扫描基座模型目录并 upsert 到 Model 表（source='base'）。"""
+        return self.sync_models_db_from_disk().get("upserted_base", 0)
 
     def output_has_safetensors(self, output_path):
         if not output_path or not os.path.isdir(output_path):
@@ -774,7 +1005,31 @@ class HistoryMixin(BaseService):
             with open(progress_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if data.get("status") == "error":
-                return {"error": data.get("message", ""), "step": 0}
+                err_text = data.get("error_detail") or data.get("message") or ""
+                result = {
+                    "status": "error",
+                    "error": err_text,
+                    "message": data.get("message") or err_text,
+                    "step": int(data.get("step", 0) or 0),
+                }
+                for k in (
+                    "current_step",
+                    "total_expected_steps",
+                    "current_best",
+                    "global_best",
+                    "best_genotype",
+                    "percent",
+                    "eta_seconds",
+                    "estimated_completion",
+                    "failed_at",
+                ):
+                    if k in data:
+                        result[k] = data[k]
+                if result.get("percent") is None and result.get("current_step") is not None and result.get("total_expected_steps"):
+                    total = result["total_expected_steps"]
+                    if total and int(total) > 0:
+                        result["percent"] = min(99, round(100 * int(result["current_step"]) / int(total)))
+                return result
             result = {
                 "step": data.get("step", 0),
                 "current_best": data.get("current_best"),
@@ -822,6 +1077,169 @@ class HistoryMixin(BaseService):
 class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
     def kill_process_tree_by_pid(self, pid):
         ProcessManager.kill_process_tree(pid)
+
+    def _mark_task_stopped_on_disk(self, task_id: str, message: str = "任务已手动停止"):
+        task_dir = os.path.join(self.state.merge_dir, task_id)
+        for fname in ("progress.json", "metadata.json"):
+            path = os.path.join(task_dir, fname)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if (data.get("status") or "").strip() in ("completed", "success", "error", "stopped"):
+                    continue
+                data["status"] = "stopped"
+                if fname == "progress.json":
+                    data["message"] = message
+                else:
+                    data["error"] = message
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                self.logger.warning("更新 %s 失败: %s", path, e)
+
+    def _db_cleanup_stopped_task(self, task_id: str) -> dict:
+        app = getattr(self, "app", None)
+        if not app:
+            return {"models_deleted": 0, "steps_deleted": 0}
+        try:
+            with app.app_context():
+                from app.repositories import (
+                    task_mark_stopped,
+                    evolution_steps_delete_for_task,
+                    models_delete_by_task_id,
+                )
+                task_mark_stopped(task_id)
+                steps = evolution_steps_delete_for_task(task_id)
+                models = models_delete_by_task_id(task_id)
+                return {"models_deleted": models, "steps_deleted": steps}
+        except Exception as e:
+            self.logger.warning("[stop] DB 清理失败 task_id=%s: %s", task_id, e)
+            return {"models_deleted": 0, "steps_deleted": 0}
+
+    def _collect_active_task_ids(self) -> list:
+        active_statuses = ("running", "queued", "interrupted")
+        ids = []
+        for task_id, task in self.state.tasks.items():
+            if task.get("status") in active_statuses:
+                ids.append(task_id)
+        app = getattr(self, "app", None)
+        if app:
+            try:
+                with app.app_context():
+                    from app.extensions import db
+                    from app.models import Task
+                    rows = (
+                        db.session.query(Task.id)
+                        .filter(Task.status.in_(["running", "queued"]))
+                        .all()
+                    )
+                    for (tid,) in rows:
+                        if tid not in ids:
+                            ids.append(tid)
+            except Exception as e:
+                self.logger.warning("[stop] 读取 DB 活跃任务失败: %s", e)
+        if os.path.isdir(self.state.merge_dir):
+            for name in os.listdir(self.state.merge_dir):
+                task_dir = os.path.join(self.state.merge_dir, name)
+                if not os.path.isdir(task_dir):
+                    continue
+                for fname in ("progress.json", "metadata.json"):
+                    path = os.path.join(task_dir, fname)
+                    if not os.path.isfile(path):
+                        continue
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        if (data.get("status") or "").strip() == "running" and name not in ids:
+                            ids.append(name)
+                            break
+                    except Exception:
+                        pass
+        return ids
+
+    def stop_task_with_cleanup(self, task_id: str, message: str = "任务已手动停止") -> dict:
+        if task_id not in self.state.tasks:
+            return {"ok": False, "message": "任务不存在"}
+        with self.state.scheduler_lock:
+            task = self.state.tasks[task_id]
+            task["status"] = "stopped"
+            task["message"] = message
+            control = task.get("control") or {}
+            control["aborted"] = True
+            proc = control.get("process")
+            if proc:
+                try:
+                    self.kill_process_tree_by_pid(proc.pid)
+                except Exception:
+                    pass
+            if self.state.running_task_info.get("id") == task_id:
+                run_proc = self.state.running_task_info.get("process")
+                if run_proc:
+                    try:
+                        self.kill_process_tree_by_pid(run_proc.pid)
+                    except Exception:
+                        pass
+                self.state.running_task_info["id"] = None
+                self.state.running_task_info["priority"] = None
+                self.state.running_task_info["process"] = None
+        self._mark_task_stopped_on_disk(task_id, message)
+        cleanup = self._db_cleanup_stopped_task(task_id)
+        return {"ok": True, "task_id": task_id, **cleanup}
+
+    def stop_all_active_tasks(self, message: str = "任务已手动停止") -> dict:
+        stopped_ids = self._collect_active_task_ids()
+        killed_pids = set()
+
+        with self.state.scheduler_lock:
+            run_proc = self.state.running_task_info.get("process")
+            if run_proc and run_proc.pid not in killed_pids:
+                try:
+                    self.kill_process_tree_by_pid(run_proc.pid)
+                    killed_pids.add(run_proc.pid)
+                except Exception:
+                    pass
+
+            active_statuses = ("running", "queued", "interrupted")
+            for task_id, task in list(self.state.tasks.items()):
+                if task.get("status") not in active_statuses and task_id not in stopped_ids:
+                    continue
+                if task_id not in stopped_ids:
+                    stopped_ids.append(task_id)
+                task["status"] = "stopped"
+                task["message"] = message
+                control = task.get("control") or {}
+                control["aborted"] = True
+                proc = control.get("process")
+                if proc and proc.pid not in killed_pids:
+                    try:
+                        self.kill_process_tree_by_pid(proc.pid)
+                        killed_pids.add(proc.pid)
+                    except Exception:
+                        pass
+
+            import queue as _queue
+            while True:
+                try:
+                    self.state.task_queue.get_nowait()
+                    self.state.task_queue.task_done()
+                except _queue.Empty:
+                    break
+                except Exception:
+                    break
+
+            self.state.running_task_info["id"] = None
+            self.state.running_task_info["priority"] = None
+            self.state.running_task_info["process"] = None
+
+        details = []
+        for task_id in sorted(set(stopped_ids)):
+            self._mark_task_stopped_on_disk(task_id, message)
+            cleanup = self._db_cleanup_stopped_task(task_id)
+            details.append({"task_id": task_id, **cleanup})
+
+        return {"stopped": details, "count": len(details)}
 
     def interrupt_current_task(self, reason="被高优先级任务打断"):
         current_id = self.state.running_task_info["id"]
@@ -1227,17 +1645,28 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                                     _mm.cleanup_recipe_temp_dirs(task_id, _temp_suffixes)
                             except Exception as e:
                                 self.logger.exception("[worker] 完全融合失败 task_id=%s error=%s", task_id, e)
-                                with open(progress_path, "w", encoding="utf-8") as f:
-                                    json.dump({"status": "error", "message": str(e)}, f, ensure_ascii=False)
                                 try:
-                                    with open(meta_path, "r", encoding="utf-8") as f:
-                                        m = json.load(f)
-                                    m["status"] = "error"
-                                    m["error"] = str(e)
-                                    m["duration_seconds"] = time.time() - task_start_time
-                                    merge_manager._write_metadata(task_id, merge_dir, m)
-                                except Exception:
-                                    pass
+                                    write_progress_error(progress_path, str(e))
+                                except Exception as pe:
+                                    self.logger.warning("[worker] 写 progress error 失败 task_id=%s: %s", task_id, pe)
+                                for attempt in range(2):
+                                    try:
+                                        with open(meta_path, "r", encoding="utf-8") as f:
+                                            m = json.load(f)
+                                        m["status"] = "error"
+                                        m["error"] = str(e)
+                                        m["duration_seconds"] = time.time() - task_start_time
+                                        merge_manager._write_metadata(task_id, merge_dir, m)
+                                        break
+                                    except Exception as meta_err:
+                                        self.logger.warning(
+                                            "[worker] 写 metadata error 态失败 attempt=%s task_id=%s: %s",
+                                            attempt,
+                                            task_id,
+                                            meta_err,
+                                        )
+                                else:
+                                    self.logger.error("[worker] 写 metadata error 态最终失败 task_id=%s", task_id)
                                 _result = {"status": "error", "error": str(e)}
                                 if _temp_suffixes:
                                     _mm.cleanup_recipe_temp_dirs(task_id, _temp_suffixes)
@@ -2414,8 +2843,10 @@ class RecipeMixin(AutomationMixin, ModelRepoMixin):
             with open(recipe_path, "r", encoding="utf-8") as f:
                 r = json.load(f)
             model_paths = r.get("model_paths") or []
-            if model_paths and os.path.isdir(model_paths[0]):
-                return model_paths[0]
+            if model_paths:
+                resolved = self.resolve_model_path(model_paths[0])
+                if resolved:
+                    return resolved
         except Exception:
             pass
         return None

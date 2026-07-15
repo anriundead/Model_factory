@@ -1,0 +1,45 @@
+{
+  "task_id": "f872ccfe",
+  "output_dir_name": "Bio-Medical-Llama-3-8B_llama3-8B-slerp-med-chinese_20260414-214640",
+  "custom_name": "testmed-0.98",
+  "model_paths": [
+    "/data/Models/Bio-Medical-Llama-3-8B",
+    "/data/Models/llama3-8B-slerp-med-chinese"
+  ],
+  "parent_names": [
+    "Bio-Medical-Llama-3-8B",
+    "llama3-8B-slerp-med-chinese"
+  ],
+  "best_genotype": [
+    0.7916082747617561,
+    0.37657826706607683
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "college_medicine",
+    "college_biology",
+    "clinical_knowledge",
+    "professional_medicine",
+    "anatomy",
+    "medical_genetics",
+    "virology",
+    "high_school_biology",
+    "human_aging",
+    "human_sexuality"
+  ],
+  "hf_subset_group": "biology_medicine",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 42,
+  "n_iter": 18,
+  "max_samples": 81,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 4,
+  "eval_mode": "text",
+  "completed_at": "2026-04-14T21:46:45.311587",
+  "current_best_acc": 0.3827,
+  "final_test_acc": 0.2222222222222222,
+  "final_test_duration": 201.6716103553772
+}

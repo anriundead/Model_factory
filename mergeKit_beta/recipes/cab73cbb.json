@@ -1,0 +1,45 @@
+{
+  "task_id": "cab73cbb",
+  "output_dir_name": "llama3-8B-slerp-med-chinese_Bio-Medical-Llama-3-8B_20260410-083822",
+  "custom_name": "进化融合-1775809864430",
+  "model_paths": [
+    "/data/Models/llama3-8B-slerp-med-chinese",
+    "/data/Models/Bio-Medical-Llama-3-8B"
+  ],
+  "parent_names": [
+    "llama3-8B-slerp-med-chinese",
+    "Bio-Medical-Llama-3-8B"
+  ],
+  "best_genotype": [
+    0.33849955813561483,
+    0.793971655711136
+  ],
+  "hf_dataset": "cais/mmlu",
+  "hf_subsets": [
+    "college_medicine",
+    "college_biology",
+    "clinical_knowledge",
+    "professional_medicine",
+    "anatomy",
+    "medical_genetics",
+    "virology",
+    "high_school_biology",
+    "human_aging",
+    "human_sexuality"
+  ],
+  "hf_subset_group": "biology_medicine",
+  "hf_split": "validation",
+  "hf_split_final": "test",
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "pop_size": 2,
+  "n_iter": 1,
+  "max_samples": 4,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 4,
+  "eval_mode": "text",
+  "completed_at": "2026-04-10T08:38:27.836328",
+  "current_best_acc": 0.25,
+  "final_test_acc": 0.25,
+  "final_test_duration": 4.87857985496521
+}

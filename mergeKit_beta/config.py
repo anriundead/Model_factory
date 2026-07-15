@@ -4,10 +4,17 @@
 import os
 from pathlib import Path
 
+from core.path_utils import (
+    configured_local_models_path,
+    configured_merge_dir,
+    configured_model_pool_path,
+    project_root,
+)
+
 
 # 项目根目录（mergenetic 会使用当前工作目录，此处用于解析相对路径）
 def _project_root() -> Path:
-    return Path(__file__).resolve().parent
+    return project_root()
 
 
 class Config:
@@ -15,18 +22,14 @@ class Config:
 
     # ==================== 路径配置 ====================
     PROJECT_ROOT = str(_project_root())
-    # 融合模型池路径：优先使用环境变量或绝对路径，否则相对项目上级 mergeKit
-    MODEL_POOL_PATH = os.environ.get(
-        "MERGEKIT_MODEL_POOL",
-        os.path.join(os.path.dirname(PROJECT_ROOT), "..", "mergeKit", "models_pool"),
-    )
-    MODEL_POOL_PATH = os.path.abspath(MODEL_POOL_PATH)
-    # 基座模型（本地可融合模型）的正式存放路径，界面「本地基座模型」列表由此读取
-    LOCAL_MODELS_PATH = os.path.abspath(os.environ.get("LOCAL_MODELS_PATH", "/home/a/ServiceEndFiles/Models"))
+    # 融合模型池路径：优先环境变量，否则 config/paths.json 相对路径
+    MODEL_POOL_PATH = configured_model_pool_path()
+    # 基座模型目录：优先环境变量，否则 config/paths.json 相对路径
+    LOCAL_MODELS_PATH = configured_local_models_path()
     # 额外模型目录（可与主目录同级，如 Models-local_dir）；仅包含存在的目录
     _extra = os.path.join(os.path.dirname(LOCAL_MODELS_PATH), "Models-local_dir")
     LOCAL_MODELS_EXTRA_PATHS = [os.path.abspath(_extra)] if os.path.isdir(_extra) else []
-    MERGE_DIR = os.path.join(PROJECT_ROOT, "merges")
+    MERGE_DIR = configured_merge_dir()
     LOGS_DIR = os.path.join(PROJECT_ROOT, "logs", "merge")
     # 测试集仓库：用户下载的 HF 数据集在此登记，测试集列表与评估页共用
     TESTSET_REPO = os.path.join(PROJECT_ROOT, "testset_repo")
@@ -87,6 +90,12 @@ class Config:
     # 默认使用 SQLite，文件存储在项目根目录下
     SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL") or "sqlite:///" + os.path.join(PROJECT_ROOT, "app.db")
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    # Gateway state may move to its own PostgreSQL database without migrating the
+    # model-factory SQLite registry. Empty keeps today's single-file deployment.
+    MERGEKIT_MODEL_GATEWAY_DATABASE_URL = os.environ.get("MERGEKIT_MODEL_GATEWAY_DATABASE_URL", "").strip()
+    SQLALCHEMY_BINDS = {
+        "model_gateway": MERGEKIT_MODEL_GATEWAY_DATABASE_URL or SQLALCHEMY_DATABASE_URI,
+    }
 
     # ==================== 运行时门禁/超时 ====================
     # 全局任务超时（秒）：从「子进程 Popen 后进入 stdout 读循环」起算（monotonic），默认 14400=4h。
@@ -99,6 +108,45 @@ class Config:
     if not os.path.isfile(_default_mergenetic_python):
         _default_mergenetic_python = "python"
     MERGENETIC_PYTHON = os.environ.get("MERGENETIC_PYTHON", _default_mergenetic_python)
+
+    # ==================== 模型服务（vLLM Gateway） ====================
+    MERGEKIT_MODEL_GATEWAY_ENABLED = (os.environ.get("MERGEKIT_MODEL_GATEWAY_ENABLED") or "1").strip().lower() not in ("0", "false", "no", "off")
+    MERGEKIT_MODEL_GATEWAY_ADMIN_TOKEN = (os.environ.get("MERGEKIT_MODEL_GATEWAY_ADMIN_TOKEN") or "").strip()
+    MERGEKIT_MODEL_GATEWAY_VLLM_BIN = os.environ.get("MERGEKIT_MODEL_GATEWAY_VLLM_BIN", "/opt/conda/envs/mergenetic/bin/vllm")
+    MERGEKIT_MODEL_GATEWAY_PYTHON = os.environ.get("MERGEKIT_MODEL_GATEWAY_PYTHON", MERGENETIC_PYTHON)
+    MERGEKIT_MODEL_GATEWAY_VLLM_USE_COMPAT_WRAPPER = (os.environ.get("MERGEKIT_MODEL_GATEWAY_VLLM_USE_COMPAT_WRAPPER") or "1").strip().lower() not in ("0", "false", "no", "off")
+    MERGEKIT_MODEL_GATEWAY_PORT_START = int(float(os.environ.get("MERGEKIT_MODEL_GATEWAY_PORT_START", "18000") or 18000))
+    MERGEKIT_MODEL_GATEWAY_PORT_END = int(float(os.environ.get("MERGEKIT_MODEL_GATEWAY_PORT_END", "18999") or 18999))
+    MERGEKIT_MODEL_GATEWAY_SYNC_WAIT_SECONDS = float(os.environ.get("MERGEKIT_MODEL_GATEWAY_SYNC_WAIT_SECONDS", "60") or 60)
+    MERGEKIT_MODEL_GATEWAY_LOG_DIR = os.path.join(PROJECT_ROOT, "logs", "model_gateway")
+    # Research sources are ephemeral and never share model-factory output paths.
+    MERGEKIT_MODEL_GATEWAY_RESEARCH_ROOT = os.environ.get(
+        "MERGEKIT_MODEL_GATEWAY_RESEARCH_ROOT", os.path.join(PROJECT_ROOT, "runtime", "model_gateway")
+    )
+    MERGEKIT_MODEL_GATEWAY_EMBEDDING_MODEL_PATH = os.environ.get(
+        "MERGEKIT_MODEL_GATEWAY_EMBEDDING_MODEL_PATH",
+        os.path.join(MERGEKIT_MODEL_GATEWAY_RESEARCH_ROOT, "embedding_models", "bge-m3"),
+    )
+    MERGEKIT_MODEL_GATEWAY_RESEARCH_RECONCILE_SECONDS = int(
+        os.environ.get("MERGEKIT_MODEL_GATEWAY_RESEARCH_RECONCILE_SECONDS", "30") or 30
+    )
+    MERGEKIT_MODEL_GATEWAY_QUEUE_BACKEND = os.environ.get("MERGEKIT_MODEL_GATEWAY_QUEUE_BACKEND", "db").strip().lower()
+    MERGEKIT_MODEL_GATEWAY_REDIS_URL = os.environ.get("MERGEKIT_MODEL_GATEWAY_REDIS_URL", "").strip()
+    MERGEKIT_MODEL_GATEWAY_WORKER_TOKEN = os.environ.get("MERGEKIT_MODEL_GATEWAY_WORKER_TOKEN", "").strip()
+    MERGEKIT_MODEL_GATEWAY_CLAMAV_HOST = os.environ.get("MERGEKIT_MODEL_GATEWAY_CLAMAV_HOST", "model-gateway-clamav").strip()
+    MERGEKIT_MODEL_GATEWAY_CLAMAV_PORT = int(os.environ.get("MERGEKIT_MODEL_GATEWAY_CLAMAV_PORT", "3310") or 3310)
+    MERGEKIT_MODEL_GATEWAY_FILE_RECONCILE_SECONDS = int(os.environ.get("MERGEKIT_MODEL_GATEWAY_FILE_RECONCILE_SECONDS", "30") or 30)
+    MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_URL = os.environ.get("MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_URL", "").strip()
+    MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_TOKEN = os.environ.get("MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_TOKEN", "").strip()
+    MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_TIMEOUT_SECONDS = int(
+        os.environ.get("MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_TIMEOUT_SECONDS", "45") or 45
+    )
+    MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_MAX_MIB = int(
+        os.environ.get("MERGEKIT_MODEL_GATEWAY_LEGACY_PARSER_MAX_MIB", "50") or 50
+    )
+    MERGEKIT_MODEL_GATEWAY_MAX_SOURCES = int(os.environ.get("MERGEKIT_MODEL_GATEWAY_MAX_SOURCES", "10"))
+    MERGEKIT_MODEL_GATEWAY_MAX_SOURCE_MIB = int(os.environ.get("MERGEKIT_MODEL_GATEWAY_MAX_SOURCE_MIB", "50"))
+    MERGEKIT_MODEL_GATEWAY_SOURCE_TTL_HOURS = int(os.environ.get("MERGEKIT_MODEL_GATEWAY_SOURCE_TTL_HOURS", "24"))
 
     # 进化融合：为真时使用 scripts/run_vlm_search_bridge.py 作为子进程入口；默认使用 python -m evolution.runner
     _evo_legacy = os.environ.get("MERGEKIT_EVOLUTION_LEGACY_BRIDGE", "").strip().lower()
@@ -184,6 +232,8 @@ class Config:
         os.environ["NUMEXPR_MAX_THREADS"] = str(cls.NUMEXPR_MAX_THREADS)
         os.makedirs(cls.MERGE_DIR, exist_ok=True)
         os.makedirs(cls.LOGS_DIR, exist_ok=True)
+        os.makedirs(cls.MERGEKIT_MODEL_GATEWAY_LOG_DIR, exist_ok=True)
+        os.makedirs(cls.MERGEKIT_MODEL_GATEWAY_RESEARCH_ROOT, exist_ok=True)
         os.makedirs(cls.RECIPES_DIR, exist_ok=True)
         if not os.path.isdir(cls.MODEL_POOL_PATH):
             os.makedirs(cls.MODEL_POOL_PATH, exist_ok=True)

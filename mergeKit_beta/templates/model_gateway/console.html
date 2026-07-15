@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mergenetic Pro - 模型访问网关</title>
+    <link rel="stylesheet" href="https://font.sec.miui.com/font/css?family=MiSans:200,300,400,500,600,700&display=swap">
+    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/model_gateway/console.css">
+    <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/misans-webfont/misans-style.css">
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+</head>
+<body class="gateway-body">
+    <header class="gateway-shell-header">
+        <div class="gateway-header-inner">
+            <div class="gateway-brand">
+                <button id="gateway-menu-btn" class="gateway-icon-btn" aria-label="打开菜单">
+                    <i class="ri-menu-line"></i>
+                </button>
+                <a href="/" class="gateway-wordmark">Mergenetic <span>Pro</span></a>
+            </div>
+            <nav class="gateway-top-nav" aria-label="模型服务导航">
+                <a href="#gateway-admin-panel"><i class="ri-rocket-line" aria-hidden="true"></i>发布</a>
+                <a href="#gateway-playground"><i class="ri-terminal-window-line" aria-hidden="true"></i>验证</a>
+                <a href="#gateway-developer-panel"><i class="ri-code-s-slash-line" aria-hidden="true"></i>接入</a>
+            </nav>
+            <div class="gateway-runtime-pill" id="gateway-runtime-pill">
+                <span class="gateway-live-dot"></span>
+                <span id="gateway-runtime-text">等待连接</span>
+            </div>
+        </div>
+    </header>
+
+    <aside id="gateway-sidebar" class="sidebar">
+        <div class="sidebar-header">
+            <h3>工程菜单</h3>
+            <button id="gateway-close-sidebar"><i class="ri-close-line"></i></button>
+        </div>
+        <nav class="sidebar-nav">
+            <a href="/" class="nav-item"><i class="ri-git-merge-line"></i><span>模型融合</span></a>
+            <a href="/evaluation" class="nav-item"><i class="ri-flask-line"></i><span>模型测试</span></a>
+            <a href="/testsets" class="nav-item"><i class="ri-database-2-line"></i><span>测试集仓库</span></a>
+            <a href="/test_history" class="nav-item"><i class="ri-history-line"></i><span>测试历史记录</span></a>
+            <a href="/model_repo" class="nav-item"><i class="ri-archive-line"></i><span>模型仓库</span></a>
+            <a href="/fusion_history" class="nav-item"><i class="ri-time-line"></i><span>融合历史</span></a>
+            <a href="/model-gateway" class="nav-item active"><i class="ri-terminal-window-line"></i><span>模型访问网关</span></a>
+        </nav>
+    </aside>
+    <div id="gateway-sidebar-overlay" class="sidebar-overlay"></div>
+
+    <main class="gateway-page" id="gateway-page">
+        <section class="gateway-hero" aria-labelledby="gateway-hero-title">
+            <div class="gateway-hero-copy">
+                <p class="gateway-kicker"><i class="ri-command-line" aria-hidden="true"></i> MODEL DELIVERY</p>
+                <h1 id="gateway-hero-title">模型服务<br>控制台</h1>
+                <p class="gateway-hero-text">发布、手动启动并验证融合模型。</p>
+                <div class="gateway-hero-actions">
+                    <a href="#gateway-admin-panel" class="gateway-btn gateway-btn-primary">
+                        <i class="ri-rocket-line"></i>
+                        <span>发布模型</span>
+                    </a>
+                    <a href="#gateway-playground" class="gateway-btn gateway-btn-secondary">
+                        <i class="ri-chat-3-line"></i>
+                        <span>测试调用</span>
+                    </a>
+                </div>
+            </div>
+            <div class="gateway-runtime-board" aria-label="服务状态总览">
+                <div class="gateway-board-rail">
+                    <span></span><span></span><span></span>
+                </div>
+                <div class="gateway-board-main">
+                    <div>
+                        <span class="gateway-board-label">运行服务</span>
+                        <strong id="gateway-stat-running">0</strong>
+                    </div>
+                    <div>
+                        <span class="gateway-board-label">有效密钥</span>
+                        <strong id="gateway-stat-keys">0</strong>
+                    </div>
+                    <div>
+                        <span class="gateway-board-label">可调用模型</span>
+                        <strong id="gateway-stat-models">0</strong>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="gateway-section gateway-control-strip" aria-label="管理员连接">
+            <div class="gateway-panel-title">
+                <span class="gateway-panel-title-icon"><i class="ri-shield-keyhole-line" aria-hidden="true"></i></span>
+                <div>
+                    <h2>管理员连接</h2>
+                    <p>连接后可管理服务和长期 API Key。</p>
+                </div>
+            </div>
+            <form id="gateway-admin-token-form" class="gateway-token-form">
+                <label for="gateway-admin-token">Admin Token</label>
+                <div class="gateway-inline-field">
+                    <input id="gateway-admin-token" type="password" autocomplete="off" placeholder="Bearer token">
+                    <button class="gateway-btn gateway-btn-primary" type="submit">连接</button>
+                </div>
+            </form>
+        </section>
+
+        <section class="gateway-grid">
+            <div class="gateway-panel gateway-panel-wide" id="gateway-admin-panel">
+                <div class="gateway-panel-header">
+                    <div class="gateway-panel-title">
+                        <span class="gateway-panel-title-icon"><i class="ri-rocket-2-line" aria-hidden="true"></i></span>
+                        <div>
+                            <h2>发布管理</h2>
+                            <p>创建服务配置后，由管理员手动启动或停止模型进程。</p>
+                        </div>
+                    </div>
+                    <button id="gateway-refresh-services" class="gateway-icon-btn" type="button" title="刷新服务">
+                        <i class="ri-refresh-line"></i>
+                    </button>
+                </div>
+                <ol class="gateway-publication-flow" aria-label="模型发布流程">
+                    <li><span class="gateway-flow-index">01</span><span><strong>选择模型</strong><small>确认输出目录与调用名称</small></span></li>
+                    <li><span class="gateway-flow-index">02</span><span><strong>配置资源</strong><small>设置 GPU、TP 与显存比例</small></span></li>
+                    <li><span class="gateway-flow-index">03</span><span><strong>管理员手动启动</strong><small>服务不会在重启后自动恢复</small></span></li>
+                    <li><span class="gateway-flow-index">04</span><span><strong>API Key 验证</strong><small>在下方发送一次兼容请求</small></span></li>
+                </ol>
+                <div class="gateway-admin-layout">
+                    <form id="gateway-create-service-form" class="gateway-form">
+                        <div class="gateway-field">
+                            <label for="gateway-model-path">模型路径</label>
+                            <input id="gateway-model-path" name="model_path" list="gateway-model-paths" required placeholder="/data/models_pool/.../output">
+                            <datalist id="gateway-model-paths"></datalist>
+                        </div>
+                        <div class="gateway-two-fields">
+                            <div class="gateway-field">
+                                <label for="gateway-display-name">显示名称</label>
+                                <input id="gateway-display-name" name="display_name" required placeholder="Qwen research merge">
+                            </div>
+                            <div class="gateway-field">
+                                <label for="gateway-served-name">调用模型名</label>
+                                <input id="gateway-served-name" name="served_model_name" required placeholder="qwen-research-v1">
+                            </div>
+                        </div>
+                        <div class="gateway-three-fields">
+                            <div class="gateway-field">
+                                <label for="gateway-gpu-ids">GPU ID</label>
+                                <input id="gateway-gpu-ids" name="gpu_ids" required value="0" placeholder="0 或 0,1">
+                            </div>
+                            <div class="gateway-field">
+                                <label for="gateway-tp">TP</label>
+                                <input id="gateway-tp" name="tensor_parallel_size" type="number" min="1" value="1">
+                            </div>
+                            <div class="gateway-field">
+                                <label for="gateway-gpu-memory">显存比例</label>
+                                <input id="gateway-gpu-memory" name="gpu_memory_utilization" type="number" min="0.5" max="0.92" step="0.01" value="0.85">
+                            </div>
+                        </div>
+                        <div class="gateway-two-fields">
+                            <div class="gateway-field">
+                                <label for="gateway-dtype">dtype</label>
+                                <select id="gateway-dtype" name="dtype">
+                                    <option value="auto">auto</option>
+                                    <option value="bfloat16">bfloat16</option>
+                                    <option value="float16">float16</option>
+                                </select>
+                            </div>
+                            <div class="gateway-field">
+                                <label for="gateway-max-seqs">并发序列</label>
+                                <input id="gateway-max-seqs" name="max_num_seqs" type="number" min="1" value="8">
+                            </div>
+                        </div>
+                        <label class="gateway-check">
+                            <input id="gateway-trust-remote-code" name="trust_remote_code" type="checkbox">
+                            <span>允许模型加载自定义代码</span>
+                        </label>
+                        <button class="gateway-btn gateway-btn-primary" type="submit">
+                            <i class="ri-add-circle-line"></i>
+                            <span>创建服务</span>
+                        </button>
+                    </form>
+                    <div>
+                        <div id="gateway-services-list" class="gateway-list" aria-live="polite"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="gateway-panel" id="gateway-key-panel">
+                <div class="gateway-panel-header">
+                    <div class="gateway-panel-title">
+                        <span class="gateway-panel-title-icon"><i class="ri-key-2-line" aria-hidden="true"></i></span>
+                        <div>
+                            <h2>API Key</h2>
+                            <p>创建长期密钥，明文只在创建时显示。</p>
+                        </div>
+                    </div>
+                </div>
+                <form id="gateway-create-key-form" class="gateway-form">
+                    <div class="gateway-field">
+                        <label for="gateway-key-owner">使用方</label>
+                        <input id="gateway-key-owner" name="owner_label" required placeholder="research-team">
+                    </div>
+                    <div class="gateway-field">
+                        <label for="gateway-key-allowlist">模型白名单</label>
+                        <input id="gateway-key-allowlist" name="model_allowlist" placeholder="qwen-research-v1, qwen-lab">
+                    </div>
+                    <button class="gateway-btn gateway-btn-primary" type="submit">生成 Key</button>
+                </form>
+                <div id="gateway-new-key" class="gateway-secret-box" hidden></div>
+                <div id="gateway-api-keys-list" class="gateway-list gateway-compact-list"></div>
+            </div>
+        </section>
+
+        <section class="gateway-grid gateway-grid-bottom">
+            <div class="gateway-panel gateway-panel-wide" id="gateway-playground">
+                <div class="gateway-panel-header">
+                    <div class="gateway-panel-title">
+                        <span class="gateway-panel-title-icon"><i class="ri-terminal-box-line" aria-hidden="true"></i></span>
+                        <div>
+                            <h2>调用验证</h2>
+                            <p>使用 API Key 验证正在运行的文本模型。</p>
+                        </div>
+                    </div>
+                    <button id="gateway-refresh-v1-models" class="gateway-icon-btn" type="button" title="刷新可用模型">
+                        <i class="ri-refresh-line"></i>
+                    </button>
+                </div>
+                <div class="gateway-playground-layout">
+                    <form id="gateway-chat-form" class="gateway-form">
+                        <div class="gateway-field">
+                            <label for="gateway-user-api-key">用户 API Key</label>
+                            <input id="gateway-user-api-key" type="password" autocomplete="off" placeholder="mk_live_...">
+                        </div>
+                        <div class="gateway-two-fields">
+                            <div class="gateway-field">
+                                <label for="gateway-chat-model">模型</label>
+                                <select id="gateway-chat-model"></select>
+                            </div>
+                            <div class="gateway-field">
+                                <label for="gateway-max-tokens">最大 tokens</label>
+                                <input id="gateway-max-tokens" type="number" min="1" max="4096" value="512">
+                            </div>
+                        </div>
+                        <div class="gateway-two-fields">
+                            <div class="gateway-field">
+                                <label for="gateway-temperature">temperature</label>
+                                <input id="gateway-temperature" type="number" min="0" max="2" step="0.1" value="0.7">
+                            </div>
+                            <div class="gateway-field">
+                                <label for="gateway-top-p">top_p</label>
+                                <input id="gateway-top-p" type="number" min="0" max="1" step="0.05" value="0.9">
+                            </div>
+                        </div>
+                        <div class="gateway-field">
+                            <label for="gateway-chat-input">消息</label>
+                            <textarea id="gateway-chat-input" rows="7" required placeholder="请用中文总结量子点在生物成像中的主要优势。"></textarea>
+                        </div>
+                        <button class="gateway-btn gateway-btn-primary" type="submit">
+                            <i class="ri-send-plane-2-line"></i>
+                            <span>发送请求</span>
+                        </button>
+                    </form>
+                    <div class="gateway-response-panel">
+                        <div class="gateway-response-head">
+                            <span>响应</span>
+                            <span id="gateway-usage-line">usage: waiting</span>
+                        </div>
+                        <pre id="gateway-chat-output">等待请求。</pre>
+                    </div>
+                </div>
+                <form id="gateway-cancel-request-form" class="gateway-request-control" aria-label="取消请求">
+                    <div class="gateway-panel-title">
+                        <span class="gateway-panel-title-icon"><i class="ri-stop-circle-line" aria-hidden="true"></i></span>
+                        <div>
+                            <h3>请求控制</h3>
+                            <p>仅取消仍在排队或运行中的非流式请求。</p>
+                        </div>
+                    </div>
+                    <div class="gateway-inline-field">
+                        <input id="gateway-cancel-request-id" type="text" autocomplete="off" placeholder="request_id">
+                        <button class="gateway-btn gateway-btn-secondary" type="submit">
+                            <i class="ri-stop-circle-line"></i>
+                            <span>取消请求</span>
+                        </button>
+                        <button id="gateway-check-request-status" class="gateway-btn gateway-btn-secondary" type="button">
+                            <i class="ri-search-eye-line"></i>
+                            <span>查询状态</span>
+                        </button>
+                    </div>
+                    <pre id="gateway-request-status-output" class="gateway-request-status-output">等待 request_id。</pre>
+                </form>
+            </div>
+
+            <div class="gateway-panel" id="gateway-developer-panel">
+                <div class="gateway-panel-header">
+                    <div class="gateway-panel-title">
+                        <span class="gateway-panel-title-icon"><i class="ri-code-s-slash-line" aria-hidden="true"></i></span>
+                        <div>
+                            <h2>OpenAI 兼容接入</h2>
+                            <p>兼容 Chat Completions 的最小调用方式。</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="gateway-code-card">
+                    <button id="gateway-copy-curl" class="gateway-copy-btn" type="button">复制</button>
+                    <pre><code>curl http://127.0.0.1:5000/v1/chat/completions \
+  -H "Authorization: Bearer mk_live_xxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen-research-v1",
+    "messages": [
+      {"role": "user", "content": "hello"}
+    ],
+    "max_tokens": 512
+  }'</code></pre>
+                </div>
+                <div class="gateway-guidance">
+                    <div><i class="ri-route-line" aria-hidden="true"></i><span><strong>Base URL</strong><span>http://127.0.0.1:5000/v1</span></span></div>
+                    <div><i class="ri-key-2-line" aria-hidden="true"></i><span><strong>鉴权</strong><span>Authorization: Bearer API_KEY</span></span></div>
+                    <div><i class="ri-bar-chart-box-line" aria-hidden="true"></i><span><strong>计量</strong><span>优先读取 vLLM 返回的 usage 字段</span></span></div>
+                    <div><i class="ri-search-eye-line" aria-hidden="true"></i><span><strong>查询请求</strong><span>GET /v1/requests/&lt;request_id&gt;</span></span></div>
+                    <div><i class="ri-stop-circle-line" aria-hidden="true"></i><span><strong>取消请求</strong><span>POST /v1/requests/&lt;request_id&gt;/cancel</span></span></div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div id="gateway-toast" class="gateway-toast" role="status" aria-live="polite"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+    <script src="/static/model_gateway/console.js"></script>
+</body>
+</html>
