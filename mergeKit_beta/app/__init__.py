@@ -29,17 +29,14 @@ def create_app():
     with app.app_context():
         from . import models  # noqa: F401  # 确保 ORM 已加载
         from .model_gateway import models as model_gateway_models  # noqa: F401  # 确保 gateway ORM 已加载
-        # 方案 B：先执行迁移，由迁移统一建表（不再依赖 db.create_all）
-        try:
-            from flask_migrate import upgrade
-            upgrade()
-        except BaseException as e:
-            import logging
-            logger = logging.getLogger("mergeKit_beta")
-            logger.warning("启动时自动迁移跳过: %s", e)
-            # Docker/新环境若未携带 migrations/env.py，回退为直接建表，避免服务因无表而不可用
+        gateway_database_url = app.config.get("MERGEKIT_MODEL_GATEWAY_DATABASE_URL")
+        if gateway_database_url:
+            from .model_gateway.migration import upgrade_gateway_schema
+
+            upgrade_gateway_schema(root, gateway_database_url)
+        else:
+            # Local SQLite development keeps the legacy zero-configuration path.
             db.create_all()
-            logger.warning("迁移不可用，已执行 db.create_all() 作为回退")
         # SQLite 增量列：TestSet.cached_configs / cached_splits（无 Alembic 迁移时）
         try:
             from sqlalchemy import inspect, text

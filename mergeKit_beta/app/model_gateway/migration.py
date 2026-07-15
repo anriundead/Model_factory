@@ -1,7 +1,12 @@
 """One-time, repeatable copy from the legacy Gateway SQLite tables."""
 from __future__ import annotations
 
+import os
+
+from alembic import command
+from alembic.config import Config as AlembicConfig
 from sqlalchemy import MetaData, Table, inspect, select
+from sqlalchemy import create_engine
 
 from app.extensions import db
 
@@ -15,7 +20,28 @@ GATEWAY_TABLES = (
     "research_files",
     "research_jobs",
     "research_chunks",
+    "gateway_quota_buckets",
 )
+
+
+def upgrade_gateway_schema(project_root: str, database_url: str) -> None:
+    """Upgrade only the Gateway schema, stamping a complete legacy schema once."""
+    config = AlembicConfig(os.path.join(project_root, "gateway_alembic.ini"))
+    config.set_main_option("sqlalchemy.url", database_url)
+    engine = create_engine(database_url)
+    try:
+        existing = set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
+    managed = set(db.metadatas["model_gateway"].tables)
+    present = existing & managed
+    if present and present != managed:
+        missing = ", ".join(sorted(managed - present))
+        raise RuntimeError(f"Gateway schema is incomplete; missing tables: {missing}")
+    if present and "alembic_version" not in existing:
+        command.stamp(config, "head")
+    command.upgrade(config, "head")
+    command.check(config)
 
 
 def copy_legacy_gateway_rows(source_engine, target_engine) -> dict[str, int]:

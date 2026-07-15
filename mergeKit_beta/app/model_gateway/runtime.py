@@ -237,6 +237,7 @@ def _with_model_gateway_pythonpath(env: dict[str, str], config) -> dict[str, str
     # Keep spawn-based vLLM engine processes patched without exposing project
     # modules (notably queue.py) as stdlib import candidates.
     env["PYTHONPATH"] = hooks_dir if not old else hooks_dir + os.pathsep + old
+    env["MERGEKIT_CLI_SCRIPT"] = "1"
     return env
 
 

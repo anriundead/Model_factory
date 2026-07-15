@@ -268,6 +268,16 @@ class TestRuntimeCommand(RuntimeTestCase):
 
         self.assertEqual(env["PYTHONPATH"], "/app/project/app/model_gateway/runtime_hooks:/old")
 
+    def test_vllm_subprocess_is_marked_as_cli_to_skip_runtime_recovery(self):
+        from app.model_gateway.runtime import _with_model_gateway_pythonpath
+
+        class Config:
+            PROJECT_ROOT = "/app/project"
+
+        env = _with_model_gateway_pythonpath({}, Config)
+
+        self.assertEqual(env["MERGEKIT_CLI_SCRIPT"], "1")
+
 
 class TestRestartRecovery(RuntimeTestCase):
     def test_stop_service_recovers_marked_process_when_persisted_pid_is_missing(self):

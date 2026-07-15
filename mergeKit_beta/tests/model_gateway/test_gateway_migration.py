@@ -7,6 +7,24 @@ os.environ["MERGEKIT_CLI_SCRIPT"] = "1"
 
 
 class TestGatewayLegacyMigration(unittest.TestCase):
+    def test_existing_complete_gateway_schema_is_stamped_then_checked(self):
+        from unittest.mock import MagicMock, patch
+
+        from app.model_gateway import migration
+
+        existing = MagicMock()
+        existing.get_table_names.return_value = list(migration.GATEWAY_TABLES)
+        with patch("app.model_gateway.migration.create_engine"), \
+             patch("app.model_gateway.migration.inspect", return_value=existing), \
+             patch("app.model_gateway.migration.command.stamp") as stamp, \
+             patch("app.model_gateway.migration.command.upgrade") as upgrade, \
+             patch("app.model_gateway.migration.command.check") as check:
+            migration.upgrade_gateway_schema("/project", "postgresql+psycopg://gateway")
+
+        stamp.assert_called_once()
+        upgrade.assert_called_once()
+        check.assert_called_once()
+
     def test_copy_is_idempotent_and_preserves_key_hash(self):
         from sqlalchemy import create_engine, insert, select
         from app.extensions import db

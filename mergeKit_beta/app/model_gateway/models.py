@@ -151,6 +151,23 @@ class ServingUsageRecord(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 
+class GatewayQuotaBucket(db.Model):
+    """Durable per-Key quota usage for one fixed time window."""
+
+    __bind_key__ = "model_gateway"
+    __tablename__ = "gateway_quota_buckets"
+    __table_args__ = (
+        db.UniqueConstraint("api_key_id", "scope", "window_start", name="uq_gateway_quota_window"),
+    )
+
+    id = db.Column(db.String(36), primary_key=True, default=_uuid)
+    api_key_id = db.Column(db.String(36), db.ForeignKey("serving_api_keys.id", ondelete="CASCADE"), nullable=False, index=True)
+    scope = db.Column(db.String(64), nullable=False, index=True)
+    window_start = db.Column(db.DateTime, nullable=False, index=True)
+    used_units = db.Column(db.BigInteger, default=0, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class ServingEvent(db.Model):
     __bind_key__ = "model_gateway"
     __tablename__ = "serving_events"

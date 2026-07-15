@@ -15,9 +15,11 @@
 |----|------|
 | 环境变量 | `DATABASE_URL`（Flask `SQLALCHEMY_DATABASE_URI`） |
 | 默认 | `sqlite:///<PROJECT_ROOT>/app.db`（`PROJECT_ROOT` 为 `mergeKit_beta` 根目录，见 `config.py`） |
-| 迁移 | Flask-Migrate / Alembic（见项目迁移目录与 `DEVELOPMENT.md`） |
+| Gateway PostgreSQL 迁移 | 专用 Alembic 链：`gateway_alembic.ini`、`gateway_migrations/`；不管理核心 SQLite 表 |
 
 生产可切换 PostgreSQL 等；**时间字段在模型层使用 UTC**（`datetime.utcnow`），便于多时区与迁移。
+
+Gateway 已有完整表首次纳管时会先校验表完整性并 `stamp head`，不会重建或删除数据；缺少任一 Gateway 表时启动失败，禁止用 `create_all()` 掩盖 schema 漂移。
 
 ---
 

@@ -86,8 +86,21 @@
         const response = await fetch(path, options);
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {
-            const error = new Error(body.error?.message || `HTTP ${response.status}`);
+            const code = body.error?.code || "";
+            const retryAfter = Number(response.headers.get("Retry-After") || 0);
+            const quotaCopy = {
+                chat_rate_limit_exceeded: "提问频率已到上限",
+                research_submission_limit_exceeded: "本小时研究次数已到上限",
+                research_concurrency_limit_exceeded: "已有研究任务正在进行",
+                daily_import_quota_exceeded: "今日资料导入量已到上限",
+            };
+            const message = response.status === 429 && quotaCopy[code]
+                ? `${quotaCopy[code]}${retryAfter ? `，请在 ${retryAfter} 秒后重试` : "，请稍后重试"}`
+                : (body.error?.message || `HTTP ${response.status}`);
+            const error = new Error(message);
             error.status = response.status;
+            error.code = code;
+            error.retryAfter = retryAfter;
             throw error;
         }
         return body;
@@ -106,6 +119,7 @@
             name: String(file.name || file.original_name || file.url || "未命名资料"),
             status: String(file.status || "received"),
             sourceKind: String(file.source_kind || file.sourceKind || "upload"),
+            sourceUrl: typeof file.source_url === "string" ? file.source_url : "",
         };
     }
 
@@ -114,7 +128,7 @@
         const locator = source.locator && typeof source.locator === "object"
             ? source.locator
             : (source.kind && Number.isFinite(Number(source.value)) ? { kind: source.kind, value: Number(source.value) } : null);
-        return { file_id: String(source.file_id || ""), locator };
+        return { file_id: String(source.file_id || ""), locator, url: typeof source.url === "string" ? source.url : "" };
     }
 
     function normalizeTurn(turn) {
@@ -375,8 +389,9 @@
 
     function locatorLabel(locator) {
         if (!locator || typeof locator !== "object") return "来源定位不可用";
-        const labels = { page: "第", slide: "第", paragraph: "第" };
-        const units = { page: "页", slide: "张幻灯片", paragraph: "段" };
+        const labels = { page: "第", slide: "第", paragraph: "第", web_title: "网页标题", web_paragraph: "网页第", web_table: "网页表格", web_figure: "网页图注", web_image_context: "网页图片说明" };
+        const units = { page: "页", slide: "张幻灯片", paragraph: "段", web_paragraph: "段" };
+        if (["web_title", "web_table", "web_figure", "web_image_context"].includes(locator.kind)) return `${labels[locator.kind]} ${locator.value}`;
         return labels[locator.kind] ? `${labels[locator.kind]} ${locator.value} ${units[locator.kind]}` : "来源定位不可用";
     }
 
@@ -400,6 +415,14 @@
             summary.textContent = `${index + 1}. ${locatorLabel(source.locator)}`;
             copy.textContent = file ? file.name : "资料定位已保留";
             details.append(summary, copy);
+            if (source.url) {
+                const link = document.createElement("a");
+                link.href = source.url;
+                link.target = "_blank";
+                link.rel = "noopener noreferrer";
+                link.textContent = "打开网页来源";
+                details.append(link);
+            }
             evidence.append(details);
         });
         message.append(evidence);

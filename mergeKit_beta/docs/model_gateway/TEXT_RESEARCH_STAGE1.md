@@ -25,9 +25,9 @@
 - Implemented and runtime-verified: PostgreSQL Gateway bind, repeatable SQLite-to-PostgreSQL
   copy, Redis AOF profile, and the candidate image dependencies for document parsing,
   PostgreSQL and Redis.
-- Implemented but not yet connected to a Worker: CPU text extraction with stable
-  page, paragraph and slide locators for PDF/DOCX/PPTX. Legacy DOC/PPT deliberately
-  require isolated conversion rather than unsafe in-process binary parsing.
+- Implemented and runtime-verified: CPU text extraction with stable page,
+  paragraph and slide locators for PDF/DOCX/PPTX. Legacy DOC/PPT use the private
+  Apache POI parser rather than unsafe in-process binary parsing.
 - Implemented and runtime-verified: a private ClamAV `clamd` service, standard
   INSTREAM client, and scan-first file processor. Clean sources become `ready`
   only after chunk persistence; infected, encrypted, damaged or textless sources
@@ -57,8 +57,17 @@
   short-lived, citation-required document workflow. Conversation messages are
   held only in browser memory, while the selected `chat`/`research`/`focus`
   layout is the sole new browser-local preference.
-- Pending: isolated legacy conversion, persistent indexing, rate limits, Nginx
-  public-edge profile and Stage 2 VLM document research.
+- Implemented and runtime-verified: public URL ingestion, Key quotas and
+  TTL-bound BGE-M3 vector sidecars. Query-time retrieval embeds only the
+  question; a missing sidecar falls back to lexical retrieval.
+- Implemented and runtime-verified: research prompts are context-budgeted and
+  a loopback model connection failure pauses the job for manual recovery.
+- Implemented and runtime-verified: research vLLM token usage is written in
+  the same terminal database transition as a completed job using
+  `vllm_research_response`; canceled and failed jobs create no usage record.
+- Implemented and runtime-verified: vLLM child processes use CLI import mode,
+  preventing the Flask restart-recovery hook from erasing their PID/PGID.
+- Pending: Nginx public-edge profile and Stage 2 VLM document research.
 
 ## Research Execution Boundary
 

@@ -61,6 +61,27 @@ class RetrievalTestCase(unittest.TestCase):
 
 
 class TestResearchRetrieval(RetrievalTestCase):
+    def test_uses_persisted_chunk_vectors_and_only_encodes_the_question(self):
+        from app.model_gateway.retrieval import retrieve_research_evidence
+        from app.model_gateway.vectors import save_chunk_vectors
+
+        save_chunk_vectors(self.root, "file-a", np.asarray([[0.9, 0.1], [0.0, 1.0]], dtype=np.float32))
+
+        class QueryOnlyEncoder:
+            def encode(self, texts):
+                self.assertEqual(texts, ["query"])
+                return np.asarray([[1.0, 0.0]], dtype=np.float32)
+
+            def assertEqual(self, actual, expected):
+                if actual != expected:
+                    raise AssertionError(f"unexpected embedding batch: {actual}")
+
+        evidence = retrieve_research_evidence(
+            self.db.session, QueryOnlyEncoder(), "key-a", ["file-a"], "query", limit=2, runtime_root=self.root
+        )
+
+        self.assertEqual([item["chunk_id"] for item in evidence], ["chunk-a1", "chunk-a2"])
+
     def test_returns_ranked_citation_evidence_only_from_key_owned_files(self):
         from app.model_gateway.retrieval import retrieve_research_evidence
 

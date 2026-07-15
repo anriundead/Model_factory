@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from datetime import datetime, timedelta
 from io import BytesIO
 from unittest.mock import patch
 
@@ -245,6 +246,139 @@ class TestAdminRoutes(ServingRoutesTestCase):
 
 
 class TestResearchRoutes(ServingRoutesTestCase):
+    def test_source_ttl_uses_configured_duration(self):
+        from app.model_gateway.models import ResearchFile
+
+        self.create_running_service_and_key()
+        self.app.config["MERGEKIT_MODEL_GATEWAY_SOURCE_TTL_HOURS"] = 1
+        before = datetime.utcnow()
+        response = self.client.post(
+            "/api/model-gateway/files",
+            headers={"Authorization": "Bearer mk_live_usersecret"},
+            data={"file": (BytesIO(b"%PDF-1.4\nresearch"), "report.pdf")},
+            content_type="multipart/form-data",
+        )
+        row = self.db.session.get(ResearchFile, response.get_json()["file"]["id"])
+
+        self.assertEqual(response.status_code, 201)
+        self.assertLess(abs((row.expires_at - before - timedelta(hours=1)).total_seconds()), 3)
+
+    def test_hourly_research_limit_remains_after_active_slot_is_canceled(self):
+        self.create_running_service_and_key()
+        self.app.config["MERGEKIT_MODEL_GATEWAY_MAX_ACTIVE_RESEARCH_JOBS"] = 1
+        self.app.config["MERGEKIT_MODEL_GATEWAY_RESEARCH_SUBMISSIONS_PER_HOUR"] = 1
+        upload = self.client.post(
+            "/api/model-gateway/files",
+            headers={"Authorization": "Bearer mk_live_usersecret"},
+            data={"file": (BytesIO(b"%PDF-1.4\nresearch"), "report.pdf")},
+            content_type="multipart/form-data",
+        )
+        file_id = upload.get_json()["file"]["id"]
+        self.mark_research_file_ready(file_id)
+        headers = {"Authorization": "Bearer mk_live_usersecret", "Content-Type": "application/json"}
+        first = self.client.post(
+            "/api/model-gateway/research/jobs", headers=headers,
+            json={"model": "qwen-demo", "task_type": "summary", "file_ids": [file_id], "input": "第一项研究"},
+        )
+        self.client.post(
+            f"/api/model-gateway/research/jobs/{first.get_json()['job']['id']}/cancel",
+            headers={"Authorization": "Bearer mk_live_usersecret"},
+        )
+        blocked = self.client.post(
+            "/api/model-gateway/research/jobs", headers=headers,
+            json={"model": "qwen-demo", "task_type": "summary", "file_ids": [file_id], "input": "第二项研究"},
+        )
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(blocked.get_json()["error"]["code"], "research_submission_limit_exceeded")
+        self.assertIn("Retry-After", blocked.headers)
+
+    def test_active_research_limit_rejects_then_cancel_releases_slot(self):
+        self.create_running_service_and_key()
+        self.app.config["MERGEKIT_MODEL_GATEWAY_MAX_ACTIVE_RESEARCH_JOBS"] = 1
+        upload = self.client.post(
+            "/api/model-gateway/files",
+            headers={"Authorization": "Bearer mk_live_usersecret"},
+            data={"file": (BytesIO(b"%PDF-1.4\nresearch"), "report.pdf")},
+            content_type="multipart/form-data",
+        )
+        file_id = upload.get_json()["file"]["id"]
+        self.mark_research_file_ready(file_id)
+        headers = {"Authorization": "Bearer mk_live_usersecret", "Content-Type": "application/json"}
+        first = self.client.post(
+            "/api/model-gateway/research/jobs", headers=headers,
+            json={"model": "qwen-demo", "task_type": "summary", "file_ids": [file_id], "input": "第一项研究"},
+        )
+        blocked = self.client.post(
+            "/api/model-gateway/research/jobs", headers=headers,
+            json={"model": "qwen-demo", "task_type": "summary", "file_ids": [file_id], "input": "第二项研究"},
+        )
+        canceled = self.client.post(
+            f"/api/model-gateway/research/jobs/{first.get_json()['job']['id']}/cancel",
+            headers={"Authorization": "Bearer mk_live_usersecret"},
+        )
+        next_job = self.client.post(
+            "/api/model-gateway/research/jobs", headers=headers,
+            json={"model": "qwen-demo", "task_type": "summary", "file_ids": [file_id], "input": "第三项研究"},
+        )
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(blocked.get_json()["error"]["code"], "research_concurrency_limit_exceeded")
+        self.assertEqual(canceled.status_code, 200)
+        self.assertEqual(next_job.status_code, 202)
+
+    def test_upload_over_daily_byte_quota_is_rejected_without_record(self):
+        from app.model_gateway.models import ResearchFile
+
+        self.create_running_service_and_key()
+        self.app.config["MERGEKIT_MODEL_GATEWAY_IMPORT_BYTES_PER_DAY"] = 1
+        response = self.client.post(
+            "/api/model-gateway/files",
+            headers={"Authorization": "Bearer mk_live_usersecret"},
+            data={"file": (BytesIO(b"%PDF-1.4\nresearch"), "report.pdf")},
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.get_json()["error"]["code"], "daily_import_quota_exceeded")
+        self.assertEqual(self.db.session.query(ResearchFile).count(), 0)
+
+    @patch("app.model_gateway.routes._complete_non_streaming_request")
+    def test_chat_request_rate_limit_returns_retry_after(self, _complete):
+        self.create_running_service_and_key()
+        self.app.config["MERGEKIT_MODEL_GATEWAY_CHAT_REQUESTS_PER_MINUTE"] = 1
+        self.app.config["MERGEKIT_MODEL_GATEWAY_SYNC_WAIT_SECONDS"] = 0
+        headers = {"Authorization": "Bearer mk_live_usersecret", "Content-Type": "application/json"}
+        payload = {"model": "qwen-demo", "messages": [{"role": "user", "content": "hello"}]}
+
+        first = self.client.post("/v1/chat/completions", headers=headers, json=payload)
+        blocked = self.client.post("/v1/chat/completions", headers=headers, json=payload)
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(blocked.get_json()["error"]["code"], "chat_rate_limit_exceeded")
+        self.assertIn("Retry-After", blocked.headers)
+
+    def test_invalid_chat_request_id_does_not_consume_rate_quota(self):
+        self.create_running_service_and_key()
+        self.app.config["MERGEKIT_MODEL_GATEWAY_CHAT_REQUESTS_PER_MINUTE"] = 1
+        headers = {
+            "Authorization": "Bearer mk_live_usersecret",
+            "Content-Type": "application/json",
+            "X-Request-Id": "not-a-uuid",
+        }
+        payload = {"model": "qwen-demo", "messages": [{"role": "user", "content": "hello"}]}
+
+        first = self.client.post("/v1/chat/completions", headers=headers, json=payload)
+        second = self.client.post("/v1/chat/completions", headers=headers, json=payload)
+
+        self.assertEqual(first.status_code, 400)
+        self.assertEqual(first.get_json()["error"]["code"], "invalid_request_id")
+        self.assertEqual(second.status_code, 400)
+        self.assertEqual(second.get_json()["error"]["code"], "invalid_request_id")
+
     def test_uploaded_file_status_is_visible_only_to_its_owner(self):
         self.create_running_service_and_key()
         upload = self.client.post(
@@ -395,11 +529,13 @@ class TestResearchRoutes(ServingRoutesTestCase):
         self.assertEqual(response.status_code, 202)
         enqueue.assert_called_once()
 
+    @patch("app.model_gateway.routes._enqueue_research_file")
     @patch("app.model_gateway.routes.validate_public_source_url")
-    def test_user_can_enqueue_public_url_source(self, validate_url):
+    def test_user_can_enqueue_public_url_source(self, validate_url, enqueue):
         from urllib.parse import urlparse
 
         self.create_running_service_and_key()
+        self.app.config["MERGEKIT_MODEL_GATEWAY_QUEUE_BACKEND"] = "redis"
         validate_url.return_value = urlparse("https://example.test/paper.pdf")
 
         response = self.client.post(
@@ -410,6 +546,8 @@ class TestResearchRoutes(ServingRoutesTestCase):
 
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.get_json()["file"]["source_kind"], "url")
+        self.assertEqual(response.get_json()["file"]["status"], "received")
+        enqueue.assert_called_once()
 
     def test_user_can_upload_pdf_and_create_owned_research_job(self):
         self.create_running_service_and_key()
@@ -457,7 +595,7 @@ class TestResearchRoutes(ServingRoutesTestCase):
         self.assertEqual(canceled.get_json()["job"]["status"], "canceled")
 
     def test_completed_research_job_exposes_answer_and_source_locators_only(self):
-        from app.model_gateway.models import ResearchJob
+        from app.model_gateway.models import ResearchFile, ResearchJob
 
         self.create_running_service_and_key()
         upload = self.client.post(
@@ -468,6 +606,9 @@ class TestResearchRoutes(ServingRoutesTestCase):
         )
         file_id = upload.get_json()["file"]["id"]
         self.mark_research_file_ready(file_id)
+        source = self.db.session.get(ResearchFile, file_id)
+        source.source_url = "https://papers.example.org/verified-study"
+        self.db.session.commit()
         created = self.client.post(
             "/api/model-gateway/research/jobs",
             headers={"Authorization": "Bearer mk_live_usersecret", "Content-Type": "application/json"},
@@ -495,7 +636,11 @@ class TestResearchRoutes(ServingRoutesTestCase):
         result = response.get_json()["job"]["result"]
         self.assertEqual(result["answer"], "效率提升为 42%。[S1]")
         self.assertEqual(result["citations"], [1])
-        self.assertEqual(result["sources"], [{"file_id": file_id, "locator": {"kind": "page", "value": 2}}])
+        self.assertEqual(result["sources"], [{
+            "file_id": file_id,
+            "locator": {"kind": "page", "value": 2},
+            "url": "https://papers.example.org/verified-study",
+        }])
         self.assertNotIn("private source text", str(response.get_json()))
 
 

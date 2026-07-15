@@ -3,6 +3,21 @@ from types import SimpleNamespace
 
 
 class TestResearchCitationContract(unittest.TestCase):
+    def test_evidence_budget_keeps_one_chunk_per_source_without_exceeding_context(self):
+        from app.model_gateway.research_execution import budget_research_evidence
+
+        evidence = [
+            {"file_id": "pdf", "locator": {"kind": "page", "value": 1}, "text": "P" * 600},
+            {"file_id": "pdf", "locator": {"kind": "page", "value": 2}, "text": "Q" * 600},
+            {"file_id": "web", "locator": {"kind": "web_paragraph", "value": 1}, "text": "W" * 600},
+        ]
+
+        selected = budget_research_evidence(evidence, max_context_chars=500)
+
+        self.assertEqual({item["file_id"] for item in selected}, {"pdf", "web"})
+        self.assertLessEqual(sum(len(item["text"]) for item in selected), 500)
+        self.assertTrue(all(item["text"] for item in selected))
+
     def test_prompt_numbers_evidence_and_accepts_only_known_citations(self):
         from app.model_gateway.research_execution import build_research_messages, validate_research_answer
 
@@ -37,9 +52,10 @@ class TestResearchCitationContract(unittest.TestCase):
             return Response()
 
         service = SimpleNamespace(vllm_host="127.0.0.1", vllm_port=18001, internal_api_key="internal", served_model_name="qwen")
-        answer = call_research_model(service, [{"role": "user", "content": "question"}], post=post)
+        answer, usage = call_research_model(service, [{"role": "user", "content": "question"}], post=post)
 
         self.assertEqual(answer, "Verified [S1].")
+        self.assertEqual(usage, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
         self.assertEqual(captured["url"], "http://127.0.0.1:18001/v1/chat/completions")
         self.assertEqual(captured["headers"]["Authorization"], "Bearer internal")
         self.assertEqual(captured["json"]["model"], "qwen")

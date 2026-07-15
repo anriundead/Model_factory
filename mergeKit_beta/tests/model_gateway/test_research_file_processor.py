@@ -5,6 +5,8 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
+import numpy as np
+
 os.environ["MERGEKIT_CLI_SCRIPT"] = "1"
 
 
@@ -78,6 +80,94 @@ class ResearchFileProcessorTestCase(unittest.TestCase):
 
 
 class TestResearchFileProcessor(ResearchFileProcessorTestCase):
+    @patch("app.model_gateway.file_processor._runtime_root")
+    @patch("app.model_gateway.file_processor.save_chunk_vectors", create=True)
+    @patch("app.model_gateway.file_processor.encode_chunk_vectors", create=True)
+    @patch("app.model_gateway.file_processor._get_embedding_encoder", create=True)
+    @patch("app.model_gateway.file_processor.scan_quarantined_file")
+    def test_ready_source_persists_batched_vectors_in_research_runtime(self, scan, get_encoder, encode, save, runtime_root):
+        from app.model_gateway.file_processor import process_research_file
+
+        runtime_root.return_value = self.root
+        encode.return_value = np.asarray([[1.0, 0.0]], dtype=np.float32)
+        _, path = self.make_file()
+
+        self.assertEqual(process_research_file(self.db.session, "file-1"), "ready")
+
+        get_encoder.assert_called_once()
+        encode.assert_called_once_with(get_encoder.return_value, ["verified finding"])
+        save.assert_called_once_with(self.root, "file-1", encode.return_value)
+        scan.assert_called_once_with(path)
+
+    @patch("app.model_gateway.file_processor.scan_quarantined_file")
+    @patch("app.model_gateway.file_processor.reserve_quota", create=True)
+    @patch("app.model_gateway.file_processor.fetch_public_web_source")
+    def test_web_source_over_daily_quota_is_removed_before_scan(self, fetch, reserve, scan):
+        from app.model_gateway.models import ResearchFile, ServingApiKey
+        from app.model_gateway.quotas import QuotaExceeded
+        from app.model_gateway.web_sources import FetchedWebSource
+        from app.model_gateway.file_processor import process_research_file
+
+        path = os.path.join(self.root, "oversize.html")
+        with open(path, "wb") as handle:
+            handle.write(b"<p>quota limited source</p>")
+        key = ServingApiKey(id="quota-key", key_hash="quota-digest", prefix="mk_live", last4="0000", owner_label="quota")
+        source = ResearchFile(
+            id="quota-file", api_key_id=key.id, original_name="article", source_kind="url",
+            source_url="https://example.org/article", status="received",
+            expires_at=datetime.utcnow() + timedelta(hours=24),
+        )
+        self.db.session.add_all([key, source])
+        self.db.session.commit()
+        fetch.return_value = FetchedWebSource(
+            canonical_url=source.source_url, media_type="text/html", path=path, content_sha256="b" * 64,
+        )
+        reserve.side_effect = QuotaExceeded("import_bytes", 1, 60)
+
+        self.assertEqual(process_research_file(self.db.session, source.id), "rejected")
+        row = self.db.session.get(ResearchFile, source.id)
+
+        self.assertEqual(row.status, "rejected")
+        self.assertEqual(row.error_code, "daily_import_quota_exceeded")
+        self.assertFalse(os.path.exists(path))
+        scan.assert_not_called()
+
+    @patch("app.model_gateway.file_processor.scan_quarantined_file")
+    @patch("app.model_gateway.file_processor.fetch_public_web_source", create=True)
+    def test_web_source_is_fetched_scanned_chunked_and_original_removed(self, fetch, scan):
+        from app.model_gateway.models import ResearchChunk, ResearchFile, ServingApiKey
+        from app.model_gateway.web_sources import FetchedWebSource
+        from app.model_gateway.file_processor import process_research_file
+
+        path = os.path.join(self.root, "article.html")
+        with open(path, "wb") as handle:
+            handle.write(b"<title>Alloy study</title><p>Mass remained stable.</p><img alt='surface image'>")
+        key = ServingApiKey(id="web-key", key_hash="web-digest", prefix="mk_live", last4="9999", owner_label="web")
+        source = ResearchFile(
+            id="web-file", api_key_id=key.id, original_name="article", source_kind="url",
+            source_url="https://example.org/article", status="received",
+            expires_at=datetime.utcnow() + timedelta(hours=24),
+        )
+        self.db.session.add_all([key, source])
+        self.db.session.commit()
+        fetch.return_value = FetchedWebSource(
+            canonical_url="https://papers.example.org/article",
+            media_type="text/html", path=path, content_sha256="a" * 64,
+        )
+
+        self.assertEqual(process_research_file(self.db.session, source.id), "ready")
+        row = self.db.session.get(ResearchFile, source.id)
+        chunks = self.db.session.query(ResearchChunk).filter_by(file_id=source.id).all()
+
+        self.assertEqual(row.status, "ready")
+        self.assertEqual(row.source_url, "https://papers.example.org/article")
+        self.assertEqual(row.media_type, "text/html")
+        self.assertIsNone(row.quarantine_path)
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(any(chunk.locator["kind"] == "web_title" for chunk in chunks))
+        self.assertTrue(any("surface image" in chunk.text for chunk in chunks))
+        scan.assert_called_once_with(path)
+
     @patch("app.model_gateway.file_processor.scan_quarantined_file")
     def test_clean_file_becomes_ready_with_ttl_chunks_and_no_original(self, scan):
         from app.model_gateway.file_processor import process_research_file

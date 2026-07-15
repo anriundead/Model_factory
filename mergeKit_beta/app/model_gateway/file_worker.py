@@ -10,6 +10,7 @@ os.environ.setdefault("MERGEKIT_CLI_SCRIPT", "1")
 from flask import Flask
 
 from app.extensions import db
+from app.model_gateway.cleanup import purge_expired_research_data
 from app.model_gateway.file_processor import process_research_file
 from app.model_gateway.models import ResearchFile
 from app.model_gateway.queue import FILE_CONSUMER_GROUP, FILE_STREAM, enqueue_research_file
@@ -42,7 +43,7 @@ def reconcile_received_files(session, redis_client) -> list[str]:
     """DB is authoritative, so a restart can safely re-deliver received files."""
     files = (
         session.query(ResearchFile)
-        .filter_by(source_kind="upload", status="received")
+        .filter(ResearchFile.status.in_(("received", "queued_download")))
         .order_by(ResearchFile.created_at.asc())
         .all()
     )
@@ -89,9 +90,15 @@ def run_file_worker() -> None:
     ensure_file_consumer_group(client)
     consumer = f"{socket.gethostname()}:{os.getpid()}"
     interval_s = max(1, int(Config.MERGEKIT_MODEL_GATEWAY_FILE_RECONCILE_SECONDS))
+    cleanup_interval_s = max(1, int(Config.MERGEKIT_MODEL_GATEWAY_CLEANUP_INTERVAL_SECONDS))
     next_reconcile = 0.0
+    next_cleanup = 0.0
     while True:
         now = time.monotonic()
+        if now >= next_cleanup:
+            with app.app_context():
+                purge_expired_research_data(db.session, Config.MERGEKIT_MODEL_GATEWAY_RESEARCH_ROOT)
+            next_cleanup = now + cleanup_interval_s
         if now >= next_reconcile:
             with app.app_context():
                 reconcile_received_files(db.session, client)

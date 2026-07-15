@@ -7,16 +7,30 @@ import socket
 import threading
 import time
 
+import requests
+
 from app.model_gateway.embeddings import OnnxDenseEmbedder
-from app.model_gateway.lifecycle import claim_research_job, complete_research_job, fail_research_job, reconcile_research_jobs
+from app.model_gateway.lifecycle import (
+    claim_research_job,
+    complete_research_job,
+    fail_research_job,
+    pause_research_job,
+    reconcile_research_jobs,
+)
 from app.model_gateway.models import ResearchJob, ServingModelService
 from app.model_gateway.queue import RESEARCH_STREAM, enqueue_research_job
-from app.model_gateway.research_execution import build_research_messages, call_research_model, validate_research_answer
+from app.model_gateway.research_execution import (
+    budget_research_evidence,
+    build_research_messages,
+    call_research_model,
+    validate_research_answer,
+)
 from app.model_gateway.retrieval import retrieve_research_evidence
 
 
 RESEARCH_CONSUMER_GROUP = "model-gateway-research-workers"
 _encoder = None
+MODEL_RUNTIME_UNAVAILABLE = "model_runtime_unavailable"
 
 
 def _text(value) -> str:
@@ -48,10 +62,26 @@ def execute_research_job(session, job_id: str, worker_id: str, config=None) -> s
         if not service or service.status != "running":
             raise ValueError("model_offline")
         evidence = retrieve_research_evidence(
-            session, _get_encoder(config), job.api_key_id, job.file_ids or [], question
+            session, _get_encoder(config), job.api_key_id, job.file_ids or [], question,
+            runtime_root=config.MERGEKIT_MODEL_GATEWAY_RESEARCH_ROOT,
+        )
+        model_context = max(1024, int(getattr(service, "max_model_len", None) or 4096))
+        completion_tokens = min(512, max(128, model_context // 4))
+        evidence = budget_research_evidence(
+            evidence,
+            max_context_chars=max(256, model_context - completion_tokens - 512),
         )
         messages = build_research_messages(job.task_type, question, evidence, output_format=job.output_format)
-        answer = call_research_model(service, messages)
+        try:
+            answer, usage = call_research_model(service, messages, max_tokens=completion_tokens)
+        except requests.RequestException:
+            service.status = "stopped"
+            service.vllm_pid = None
+            service.vllm_pgid = None
+            service.last_error = MODEL_RUNTIME_UNAVAILABLE
+            session.add(service)
+            session.commit()
+            return pause_research_job(session, job.id, worker_id, MODEL_RUNTIME_UNAVAILABLE)
         citations = validate_research_answer(answer, evidence, bool(job.require_citations), output_format=job.output_format)
         result_dir = os.path.join(config.MERGEKIT_MODEL_GATEWAY_RESEARCH_ROOT, "results")
         os.makedirs(result_dir, exist_ok=True)
@@ -60,7 +90,7 @@ def execute_research_job(session, job_id: str, worker_id: str, config=None) -> s
         with open(temporary_path, "w", encoding="utf-8") as handle:
             json.dump({"answer": answer, "citations": citations, "evidence": evidence}, handle, ensure_ascii=False)
         os.replace(temporary_path, result_path)
-        outcome = complete_research_job(session, job.id, worker_id, result_path=result_path)
+        outcome = complete_research_job(session, job.id, worker_id, result_path=result_path, usage=usage)
         if outcome != "completed":
             try:
                 os.unlink(result_path)

@@ -66,6 +66,87 @@ class ResearchLifecycleTestCase(unittest.TestCase):
 
 
 class TestResearchLifecycle(ResearchLifecycleTestCase):
+    def test_completion_clears_a_stale_error_from_a_previous_attempt(self):
+        from app.model_gateway.lifecycle import complete_research_job
+        from app.model_gateway.models import ResearchJob
+
+        job = self.make_job(job_status="running")
+        job.lease_owner = "worker-a"
+        job.error_code = "user_canceled"
+        job.error_message = "user_canceled"
+        self.db.session.commit()
+
+        outcome = complete_research_job(
+            self.db.session, job.id, "worker-a", result_path="/tmp/research-result.json"
+        )
+        row = self.db.session.get(ResearchJob, job.id)
+
+        self.assertEqual(outcome, "completed")
+        self.assertEqual(row.status, "completed")
+        self.assertIsNone(row.error_code)
+        self.assertIsNone(row.error_message)
+
+    def test_completion_records_research_usage_in_the_same_terminal_transition(self):
+        from app.model_gateway.lifecycle import complete_research_job
+        from app.model_gateway.models import ServingUsageRecord
+
+        job = self.make_job(job_status="running")
+        job.lease_owner = "worker-a"
+        self.db.session.commit()
+
+        outcome = complete_research_job(
+            self.db.session,
+            job.id,
+            "worker-a",
+            result_path="/tmp/research-result.json",
+            usage={"prompt_tokens": 13, "completion_tokens": 7, "total_tokens": 20},
+        )
+
+        usage = self.db.session.query(ServingUsageRecord).one()
+        self.assertEqual(outcome, "completed")
+        self.assertEqual(usage.api_key_id, "key-1")
+        self.assertEqual(usage.model_service_id, "service-1")
+        self.assertEqual(usage.served_model_name, "qwen-test")
+        self.assertEqual(usage.prompt_tokens, 13)
+        self.assertEqual(usage.completion_tokens, 7)
+        self.assertEqual(usage.total_tokens, 20)
+        self.assertEqual(usage.usage_source, "vllm_research_response")
+
+    def test_pause_for_model_offline_preserves_payload_and_active_slot(self):
+        from app.model_gateway.lifecycle import claim_research_job, pause_research_job
+        from app.model_gateway.quotas import QuotaExceeded, reserve_quota
+        from app.model_gateway.models import ResearchJob
+
+        self.make_job()
+        reserve_quota(self.db.session, "key-1", "active_research_jobs", amount=1, limit=1, window_seconds=0)
+        self.db.session.commit()
+        self.assertEqual(claim_research_job(self.db.session, "job-1", "worker-a"), "claimed")
+
+        self.assertEqual(
+            pause_research_job(self.db.session, "job-1", "worker-a", "model_runtime_unavailable"),
+            "paused_model_offline",
+        )
+        job = self.db.session.get(ResearchJob, "job-1")
+        self.assertEqual(job.status, "paused_model_offline")
+        self.assertEqual(job.error_code, "model_runtime_unavailable")
+        self.assertIsNone(job.lease_owner)
+        with self.assertRaises(QuotaExceeded):
+            reserve_quota(self.db.session, "key-1", "active_research_jobs", amount=1, limit=1, window_seconds=0)
+
+    def test_completion_releases_reserved_active_job_slot(self):
+        from app.model_gateway.lifecycle import claim_research_job, complete_research_job
+        from app.model_gateway.quotas import QuotaExceeded, reserve_quota
+
+        self.make_job()
+        reserve_quota(self.db.session, "key-1", "active_research_jobs", amount=1, limit=1, window_seconds=0)
+        self.db.session.commit()
+        self.assertEqual(claim_research_job(self.db.session, "job-1", "worker-a"), "claimed")
+        self.assertEqual(complete_research_job(self.db.session, "job-1", "worker-a"), "completed")
+        try:
+            reserve_quota(self.db.session, "key-1", "active_research_jobs", amount=1, limit=1, window_seconds=0)
+        except QuotaExceeded as exc:
+            self.fail(f"completed job retained active quota slot: {exc.code}")
+
     def test_fail_records_reason_and_clears_running_lease(self):
         from app.model_gateway.lifecycle import fail_research_job
         from app.model_gateway.models import ResearchJob

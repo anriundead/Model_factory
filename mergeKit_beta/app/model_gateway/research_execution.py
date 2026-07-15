@@ -16,6 +16,38 @@ _TASK_INSTRUCTIONS = {
 }
 
 
+def budget_research_evidence(evidence: list[dict], max_context_chars: int) -> list[dict]:
+    """Fit temporary evidence into a conservative context budget without losing a source."""
+    if max_context_chars < 1:
+        raise ValueError("research_context_budget_must_be_positive")
+    first_per_file = []
+    remaining = []
+    seen_files = set()
+    for item in evidence:
+        file_id = item.get("file_id")
+        if file_id not in seen_files:
+            first_per_file.append(item)
+            seen_files.add(file_id)
+        else:
+            remaining.append(item)
+    ordered = first_per_file + remaining
+    selected = []
+    remaining_chars = int(max_context_chars)
+    for index, item in enumerate(ordered):
+        if remaining_chars < 1:
+            break
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        slots = max(1, len(ordered) - index)
+        text_limit = max(1, remaining_chars // slots)
+        copy = dict(item)
+        copy["text"] = text[:text_limit]
+        selected.append(copy)
+        remaining_chars -= len(copy["text"])
+    return selected
+
+
 def _locator_label(locator: dict) -> str:
     return f"{locator.get('kind', 'source')} {locator.get('value', '?')}"
 
@@ -75,7 +107,7 @@ def validate_research_answer(answer: str, evidence: list[dict], require_citation
     return citations
 
 
-def call_research_model(service, messages: list[dict], *, post=requests.post) -> str:
+def call_research_model(service, messages: list[dict], *, max_tokens: int = 1024, post=requests.post) -> tuple[str, dict]:
     """Invoke a manually started vLLM service through its private loopback API."""
     if getattr(service, "vllm_host", "127.0.0.1") != "127.0.0.1":
         raise ValueError("model_not_loopback")
@@ -91,7 +123,7 @@ def call_research_model(service, messages: list[dict], *, post=requests.post) ->
             "model": service.served_model_name,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": 1024,
+            "max_tokens": max(1, int(max_tokens)),
             "stream": False,
         },
         timeout=(30, 300),
@@ -99,9 +131,15 @@ def call_research_model(service, messages: list[dict], *, post=requests.post) ->
     if response.status_code >= 400:
         raise ValueError("model_upstream_error")
     try:
-        content = response.json()["choices"][0]["message"]["content"].strip()
+        body = response.json()
+        content = body["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError, TypeError, ValueError, AttributeError) as exc:
         raise ValueError("model_invalid_response") from exc
     if not content:
         raise ValueError("model_empty_response")
-    return content
+    usage = body.get("usage") or {}
+    return content, {
+        "prompt_tokens": max(0, int(usage.get("prompt_tokens") or 0)),
+        "completion_tokens": max(0, int(usage.get("completion_tokens") or 0)),
+        "total_tokens": max(0, int(usage.get("total_tokens") or 0)),
+    }

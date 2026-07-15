@@ -31,6 +31,7 @@ from app.model_gateway.models import (
 )
 from app.model_gateway.documents import save_upload, validate_public_source_url
 from app.model_gateway.queue import enqueue_research_file, enqueue_research_job
+from app.model_gateway.quotas import QuotaExceeded, release_quota, reserve_quota
 from app.model_gateway.runtime import start_service, stop_service, validate_model_path
 
 
@@ -57,6 +58,17 @@ RESEARCH_TASK_TYPES = {"document_qa", "summary", "compare", "extract"}
 
 def _error(status: int, code: str, message: str):
     return jsonify({"error": {"code": code, "message": message}}), status
+
+
+def _quota_error(exc: QuotaExceeded):
+    response, status = _error(429, exc.code, "Quota exceeded; retry after the indicated interval")
+    response.headers["Retry-After"] = str(exc.retry_after_seconds)
+    response.headers["X-RateLimit-Limit"] = str(exc.limit)
+    return response, status
+
+
+def _quota_limit(name: str, default: int) -> int:
+    return max(1, int(current_app.config.get(name, default) or default))
 
 
 def _response_with_request_id(body: dict, request_id: str, status: int = 200):
@@ -130,11 +142,17 @@ def _research_root() -> str:
     return os.path.abspath(root)
 
 
+def _research_expiry(now: datetime | None = None) -> datetime:
+    hours = max(1 / 3600, float(current_app.config.get("MERGEKIT_MODEL_GATEWAY_SOURCE_TTL_HOURS", 24) or 24))
+    return (now or datetime.utcnow()) + timedelta(hours=hours)
+
+
 def _research_file_to_dict(file_row: ResearchFile) -> dict:
     return {
         "id": file_row.id,
         "name": file_row.original_name,
         "source_kind": file_row.source_kind,
+        "source_url": file_row.source_url,
         "status": file_row.status,
         "expires_at": file_row.expires_at.isoformat(),
         "error_code": file_row.error_code,
@@ -158,13 +176,23 @@ def _research_job_to_dict(job: ResearchJob) -> dict:
         try:
             with open(job.result_path, encoding="utf-8") as handle:
                 result = json.load(handle)
+            evidence = result.get("evidence") or []
+            source_urls = {
+                row.id: row.source_url
+                for row in db.session.query(ResearchFile).filter(
+                    ResearchFile.id.in_([item.get("file_id") for item in evidence if item.get("file_id")])
+                ).all()
+            }
+            sources = []
+            for item in evidence:
+                source = {"file_id": item.get("file_id"), "locator": item.get("locator")}
+                if source_urls.get(item.get("file_id")):
+                    source["url"] = source_urls[item["file_id"]]
+                sources.append(source)
             data["result"] = {
                 "answer": result.get("answer", ""),
                 "citations": result.get("citations") or [],
-                "sources": [
-                    {"file_id": item.get("file_id"), "locator": item.get("locator")}
-                    for item in result.get("evidence") or []
-                ],
+                "sources": sources,
             }
         except (OSError, ValueError, TypeError):
             data["error_code"] = data["error_code"] or "result_unavailable"
@@ -381,6 +409,20 @@ def create_research_file():
         quarantine_path, digest = save_upload(upload, _research_root())
     except ValueError as exc:
         return _error(413, "file_rejected", str(exc))
+    upload_bytes = os.path.getsize(quarantine_path)
+    try:
+        reserve_quota(
+            db.session, key.id, "import_bytes", amount=upload_bytes,
+            limit=_quota_limit("MERGEKIT_MODEL_GATEWAY_IMPORT_BYTES_PER_DAY", 500 * 1024 * 1024),
+            window_seconds=86400,
+        )
+    except QuotaExceeded as exc:
+        db.session.rollback()
+        try:
+            os.unlink(quarantine_path)
+        except FileNotFoundError:
+            pass
+        return _quota_error(exc)
     file_row = ResearchFile(
         api_key_id=key.id,
         original_name=os.path.basename(upload.filename),
@@ -388,7 +430,7 @@ def create_research_file():
         status="received",
         content_sha256=digest,
         quarantine_path=quarantine_path,
-        expires_at=datetime.utcnow() + timedelta(hours=24),
+        expires_at=_research_expiry(),
     )
     db.session.add(file_row)
     db.session.commit()
@@ -400,6 +442,7 @@ def create_research_file():
         except FileNotFoundError:
             pass
         db.session.delete(file_row)
+        release_quota(db.session, key.id, "import_bytes", amount=upload_bytes, window_seconds=86400)
         db.session.commit()
         return _error(503, "queue_unavailable", str(exc))
     return jsonify({"status": "success", "file": _research_file_to_dict(file_row)}), 201
@@ -421,11 +464,17 @@ def create_research_url_source():
         original_name=name[:512],
         source_kind="url",
         source_url=parsed.geturl(),
-        status="queued_download",
-        expires_at=datetime.utcnow() + timedelta(hours=24),
+        status="received",
+        expires_at=_research_expiry(),
     )
     db.session.add(file_row)
     db.session.commit()
+    try:
+        _enqueue_research_file(file_row)
+    except Exception as exc:
+        db.session.delete(file_row)
+        db.session.commit()
+        return _error(503, "queue_unavailable", str(exc))
     return jsonify({"status": "accepted", "file": _research_file_to_dict(file_row)}), 202
 
 
@@ -475,6 +524,18 @@ def create_research_job():
         return _error(404, "file_not_found", "One or more research files were not found")
     if any(file_row.status != "ready" for file_row in files):
         return _error(409, "source_not_ready", "Research sources must complete scanning and parsing before use")
+    try:
+        reserve_quota(
+            db.session, key.id, "active_research_jobs", amount=1,
+            limit=_quota_limit("MERGEKIT_MODEL_GATEWAY_MAX_ACTIVE_RESEARCH_JOBS", 1), window_seconds=0,
+        )
+        reserve_quota(
+            db.session, key.id, "research_submissions", amount=1,
+            limit=_quota_limit("MERGEKIT_MODEL_GATEWAY_RESEARCH_SUBMISSIONS_PER_HOUR", 4), window_seconds=3600,
+        )
+    except QuotaExceeded as exc:
+        db.session.rollback()
+        return _quota_error(exc)
     job = ResearchJob(
         id=str(uuid.uuid4()),
         api_key_id=key.id,
@@ -487,7 +548,7 @@ def create_research_job():
         require_citations=bool(data.get("require_citations", True)),
         idempotency_key=idempotency_key,
         request_fingerprint=fingerprint,
-        expires_at=datetime.utcnow() + timedelta(hours=24),
+        expires_at=min(file_row.expires_at for file_row in files),
     )
     payload_dir = os.path.join(_research_root(), "payloads")
     os.makedirs(payload_dir, exist_ok=True)
@@ -516,6 +577,8 @@ def create_research_job():
             except FileNotFoundError:
                 pass
         db.session.delete(job)
+        release_quota(db.session, key.id, "active_research_jobs", amount=1, window_seconds=0)
+        release_quota(db.session, key.id, "research_submissions", amount=1, window_seconds=3600)
         db.session.commit()
         return _error(503, "queue_unavailable", str(exc))
     return jsonify({"status": "accepted", "job": _research_job_to_dict(job)}), 202
@@ -550,6 +613,7 @@ def cancel_research_job(job_id):
             except FileNotFoundError:
                 pass
             job.payload_path = None
+        release_quota(db.session, key.id, "active_research_jobs", amount=1, window_seconds=0)
         db.session.add(job)
         db.session.commit()
         return jsonify({"status": "success", "job": _research_job_to_dict(job)})
@@ -784,6 +848,15 @@ def v1_chat_completions():
             return _error(400, "invalid_request_id", "X-Request-Id must be a UUID")
         if db.session.get(ServingRequest, request_id):
             return _error(409, "request_id_exists", "X-Request-Id already exists")
+
+    try:
+        reserve_quota(
+            db.session, key.id, "chat_requests", amount=1,
+            limit=_quota_limit("MERGEKIT_MODEL_GATEWAY_CHAT_REQUESTS_PER_MINUTE", 20), window_seconds=60,
+        )
+    except QuotaExceeded as exc:
+        db.session.rollback()
+        return _quota_error(exc)
 
     req_row = ServingRequest(
         id=request_id or None,
