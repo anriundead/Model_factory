@@ -586,7 +586,7 @@ class PublicationTaskTest(unittest.TestCase):
                 with self.assertRaisesRegex(PublicationError, "gpu_selection_required"):
                     _normalize_gpu_ids([invalid])
 
-    def test_functional_validation_scopes_cuda_only_to_cancellable_child(self):
+    def test_functional_validation_scopes_environment_to_cancellable_child(self):
         from app.model_publication_tasks import validate_model_functionally
 
         process = mock.Mock()
@@ -599,6 +599,7 @@ class PublicationTaskTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "passed")
         self.assertEqual(popen.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "1,3")
+        self.assertEqual(popen.call_args.kwargs["env"]["MERGEKIT_CLI_SCRIPT"], "1")
         self.assertEqual(os.environ.get("CUDA_VISIBLE_DEVICES"), original)
         self.assertEqual(
             popen.call_args.args[0][:2],
@@ -609,7 +610,8 @@ class PublicationTaskTest(unittest.TestCase):
     def test_functional_validation_module_import_smoke_reaches_cuda_requirement(self):
         package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         env = os.environ.copy()
-        env.pop("CUDA_VISIBLE_DEVICES", None)
+        env["MERGEKIT_CLI_SCRIPT"] = "1"
+        env["CUDA_VISIBLE_DEVICES"] = ""
 
         result = subprocess.run(
             [sys.executable, "-m", "app.model_publication_tasks", "--functional-validation", self.source],
@@ -622,6 +624,7 @@ class PublicationTaskTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("functional validation requires visible CUDA devices", result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertNotIn("ModuleNotFoundError", result.stderr)
 
     def test_vlm_cmmmu_requests_explicit_one_row_boundary(self):

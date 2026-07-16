@@ -408,6 +408,7 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
 def validate_model_functionally(staging: str, gpu_ids: list[int], task_control: dict) -> dict:
     """Run real validation in a child whose CUDA visibility is explicitly scoped."""
     env = os.environ.copy()
+    env["MERGEKIT_CLI_SCRIPT"] = "1"
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(value) for value in gpu_ids)
     process = subprocess.Popen(
         [sys.executable, "-m", "app.model_publication_tasks", "--functional-validation", staging],
