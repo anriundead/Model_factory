@@ -155,6 +155,12 @@ def _materialize_recipe(task_id: str, params: dict, staging: str, progress: Call
         task_control,
         skip_register=True,
         output_dir_override=output_dir,
+        metadata_type_override="model_publication",
+        metadata_extra={
+            "publication_id": _publication_id(task_id, params),
+            "display_name": params.get("display_name"),
+            "source_type": "recipe",
+        },
     )
     if result.get("status") != "success":
         raise _error("materialization_failed", result.get("error", "recipe materialization failed"))
@@ -296,7 +302,7 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
     uuid_pattern = re.compile(r"GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
     topology = {}
     for gpu in topology_rows:
-        if gpu.index in topology or gpu.mem_total_mib <= 0 or not 0 <= gpu.mem_free_mib <= gpu.mem_total_mib:
+        if gpu.index in topology or gpu.mem_total_mib <= 0:
             raise _error("gpu_preflight_failed", "GPU topology is invalid")
         topology[gpu.index] = gpu
     snapshots = {}
@@ -324,6 +330,7 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
                 "uuid": uuid,
                 "memory_used_mib": used,
                 "memory_total_mib": total,
+                "memory_free_mib": total - used,
             }
     except (TypeError, ValueError) as exc:
         raise _error("gpu_preflight_failed", "GPU inventory output is invalid") from exc
@@ -346,9 +353,9 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
     # Weight bytes plus 10% (at least 1 GiB) covers loading overhead; every
     # selected device also retains a 1 GiB CUDA/runtime reserve.
     required_mib = model_mib + max(1024, (model_mib + 9) // 10)
-    if any(gpu.mem_free_mib < 1024 for _snapshot, gpu in selected):
+    if any(snapshot["memory_free_mib"] < 1024 for snapshot, _gpu in selected):
         raise _error("insufficient_gpu_memory", "selected GPU lacks runtime reserve")
-    if sum(gpu.mem_free_mib - 1024 for _snapshot, gpu in selected) < required_mib:
+    if sum(snapshot["memory_free_mib"] - 1024 for snapshot, _gpu in selected) < required_mib:
         raise _error("insufficient_gpu_memory", "selected GPUs lack validated model headroom")
 
     try:

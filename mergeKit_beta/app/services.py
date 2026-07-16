@@ -1055,8 +1055,40 @@ class HistoryMixin(BaseService):
 
 
 class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
+    _ACTIVE_PUBLICATION_STATUSES = {"queued", "materializing", "validating", "registration_pending", "running"}
+
     def kill_process_tree_by_pid(self, pid):
         ProcessManager.kill_process_tree(pid)
+
+    def _memory_task_type(self, task: dict | None) -> str:
+        if not isinstance(task, dict):
+            return ""
+        return str(task.get("type") or (task.get("original_data") or {}).get("type") or "").strip()
+
+    def _publication_stop_denied(self, task_id: str | None = None) -> dict | None:
+        publication_message = "Use the admin model publication cancel endpoint."
+        if task_id:
+            task = self.state.tasks.get(task_id)
+            if self._memory_task_type(task) == "model_publication":
+                return {"ok": False, "error_code": "publication_cancel_required", "message": publication_message}
+        app = getattr(self, "app", None)
+        if not app:
+            return None
+        try:
+            with app.app_context():
+                from app.extensions import db
+                from app.models import Task
+                from app.repositories import active_publication_tasks
+
+                if task_id:
+                    row = db.session.get(Task, task_id)
+                    if row is not None and row.task_type == "model_publication":
+                        return {"ok": False, "error_code": "publication_cancel_required", "message": publication_message}
+                elif active_publication_tasks():
+                    return {"ok": False, "error_code": "publication_cancel_required", "message": publication_message}
+        except Exception as exc:
+            self.logger.warning("[stop] publication guard lookup failed: %s", exc)
+        return None
 
     def _mark_task_stopped_on_disk(self, task_id: str, message: str = "任务已手动停止"):
         task_dir = os.path.join(self.state.merge_dir, task_id)
@@ -1140,6 +1172,9 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
         return ids
 
     def stop_task_with_cleanup(self, task_id: str, message: str = "任务已手动停止") -> dict:
+        denied = self._publication_stop_denied(task_id)
+        if denied is not None:
+            return denied
         if task_id not in self.state.tasks:
             return {"ok": False, "message": "任务不存在"}
         with self.state.scheduler_lock:
@@ -1169,6 +1204,9 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
         return {"ok": True, "task_id": task_id, **cleanup}
 
     def stop_all_active_tasks(self, message: str = "任务已手动停止") -> dict:
+        denied = self._publication_stop_denied()
+        if denied is not None:
+            return denied
         stopped_ids = self._collect_active_task_ids()
         killed_pids = set()
 
@@ -2883,9 +2921,9 @@ class Services(RecipeMixin, TaskQueueMixin, TestsetMixin):
             return
         try:
             with app.app_context():
-                from app.repositories import publication_tasks_for_restart, task_set_status
+                from app.repositories import publication_tasks_for_recovery, task_set_status
 
-                for task in publication_tasks_for_restart():
+                for task in publication_tasks_for_recovery():
                     config = dict(task.config or {})
                     if task.status == "queued":
                         created_at = time.time()
@@ -2894,6 +2932,9 @@ class Services(RecipeMixin, TaskQueueMixin, TestsetMixin):
                             "created_at": created_at, "original_data": config, "priority": "common",
                         }
                         self.state.task_queue.put((self.state.priority_map.get("common", 10), created_at, task.id, config))
+                    elif task.status == "validating":
+                        if config.get("validation_enqueued"):
+                            task_set_status(task.id, "validating", config_patch={"validation_enqueued": False})
                     else:
                         # Do not delete staging: Task 3 recovery keeps inactive staging diagnosable.
                         task_set_status(

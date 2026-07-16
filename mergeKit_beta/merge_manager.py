@@ -648,6 +648,8 @@ def run_recipe_apply_task(
     task_control=None,
     skip_register=False,
     output_dir_override=None,
+    metadata_type_override=None,
+    metadata_extra=None,
 ):
     """
     按配方执行一次合并（固定 genotype，不进化）。用于「根据配方直接融合出最终模型」或中间物化。
@@ -699,7 +701,7 @@ def run_recipe_apply_task(
     meta_path = os.path.join(task_dir, "metadata.json")
     metadata = {
         "id": task_id,
-        "type": "recipe_apply",
+        "type": metadata_type_override or "recipe_apply",
         "recipe_id": recipe_id,
         "custom_name": custom_name,
         "model_paths": model_paths,
@@ -707,6 +709,8 @@ def run_recipe_apply_task(
         "dtype": dtype,
         "status": "pending",
     }
+    if isinstance(metadata_extra, dict):
+        metadata.update(metadata_extra)
     _write_metadata(task_id, task_dir, metadata)
 
     def _write_error_status(err_msg):

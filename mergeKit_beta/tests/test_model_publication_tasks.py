@@ -422,6 +422,22 @@ class PublicationTaskTest(unittest.TestCase):
                 with self.assertRaisesRegex(PublicationError, "gpu_preflight_failed"):
                     publication_gpu_preflight([0], required_bytes=1)
 
+    def test_preflight_uses_new_inventory_snapshot_not_topology_free_memory(self):
+        from core.gpu_topology import GpuInfo
+        from app.model_publication import PublicationError
+        from app.model_publication_tasks import publication_gpu_preflight
+
+        topology = [GpuInfo(index=0, mem_free_mib=24000, mem_total_mib=24576)]
+        gpu_line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 24000, 24576\n"
+
+        def completed(stdout="", returncode=0, stderr=""):
+            return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+        with mock.patch("core.gpu_topology.query_gpus", return_value=topology):
+            with mock.patch("app.model_publication_tasks.subprocess.run", side_effect=[completed(gpu_line), completed()]):
+                with self.assertRaisesRegex(PublicationError, "insufficient_gpu_memory"):
+                    publication_gpu_preflight([0], required_bytes=1024**3)
+
     def test_gpu_ids_are_exact_non_boolean_integers(self):
         from app.model_publication import PublicationError
         from app.model_publication_tasks import _normalize_gpu_ids
@@ -519,6 +535,45 @@ class PublicationTaskTest(unittest.TestCase):
                         with mock.patch("evolution.vendor.vlm_merge.model_composition.materialize_full_vlm") as materialize:
                             _materialize_recipe("task-vlm", params, os.path.join(self.root, ".staging", "vlm"), self.progress, {})
         self.assertEqual(materialize.call_args.args[1], os.path.realpath(self.current_source))
+
+    def test_recipe_apply_metadata_override_marks_publication_fallback(self):
+        import merge_manager
+
+        task_id = "recipe-publication-meta"
+        recipe_id = "recipe-publication-meta"
+        recipe_path = os.path.join(self.tmpdir.name, "%s.json" % recipe_id)
+        with open(recipe_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "model_paths": [self.source, self.current_source],
+                "best_genotype": [0.5, 0.5],
+                "custom_name": "Recipe publication",
+            }, handle)
+        task_root = os.path.join(self.tmpdir.name, "merge-root")
+        output_root = os.path.join(task_root, task_id, "output")
+        publication_recipe_path = os.path.join(self.tmpdir.name, "secret-publication.json")
+        old_merge_dir = merge_manager.MERGE_DIR
+        old_recipes_dir = merge_manager.RECIPES_DIR
+        merge_manager.MERGE_DIR = task_root
+        merge_manager.RECIPES_DIR = self.tmpdir.name
+        try:
+            with mock.patch("merge_manager.subprocess.run", return_value=SimpleNamespace(returncode=1, stdout="", stderr="failed")):
+                merge_manager.run_recipe_apply_task(
+                    task_id,
+                    {"recipe_id": recipe_id},
+                    self.progress,
+                    output_dir_override=output_root,
+                    metadata_type_override="model_publication",
+                    metadata_extra={"publication_id": "publication-meta", "recipe_path": publication_recipe_path},
+                )
+            with open(os.path.join(task_root, task_id, "metadata.json"), encoding="utf-8") as handle:
+                metadata = json.load(handle)
+        finally:
+            merge_manager.MERGE_DIR = old_merge_dir
+            merge_manager.RECIPES_DIR = old_recipes_dir
+
+        self.assertEqual(metadata["type"], "model_publication")
+        self.assertEqual(metadata["publication_id"], "publication-meta")
+        self.assertEqual(metadata["recipe_path"], publication_recipe_path)
 
 
 if __name__ == "__main__":

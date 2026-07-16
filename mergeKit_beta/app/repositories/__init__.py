@@ -120,10 +120,17 @@ def publication_task_by_idempotency_key(key: str) -> Task | None:
     return None
 
 
-def publication_tasks_for_restart() -> list[Task]:
+def publication_tasks_for_recovery() -> list[Task]:
     return db.session.query(Task).filter(
         Task.task_type == "model_publication",
-        Task.status.in_(("queued", "materializing", "running")),
+        Task.status.in_(("queued", "materializing", "running", "validating")),
+    ).all()
+
+
+def active_publication_tasks() -> list[Task]:
+    return db.session.query(Task).filter(
+        Task.task_type == "model_publication",
+        Task.status.in_(("queued", "materializing", "validating", "registration_pending", "running")),
     ).all()
 
 

@@ -650,7 +650,8 @@ def register_routes(app, state, services, dataset_service):
 
     @app.route("/api/history", methods=["GET"])
     def list_history():
-        return jsonify({"status": "success", "history": services.get_all_history()})
+        history = services.get_all_history() or []
+        return jsonify({"status": "success", "history": [_public_history_item(item) for item in history]})
 
     @app.route("/api/history/<task_id>", methods=["DELETE"])
     def delete_history(task_id):
@@ -820,12 +821,16 @@ def register_routes(app, state, services, dataset_service):
     def stop_task(task_id):
         result = services.stop_task_with_cleanup(task_id)
         if not result.get("ok"):
+            if result.get("error_code") == "publication_cancel_required":
+                return jsonify({"status": "error", "error": {"code": result["error_code"], "message": result.get("message", "停止失败")}}), 409
             return jsonify({"status": "error", "message": result.get("message", "停止失败")}), 404
         return jsonify({"status": "success", **result})
 
     @app.route("/api/stop_all", methods=["POST"])
     def stop_all_tasks():
         result = services.stop_all_active_tasks()
+        if not result.get("ok", True) and result.get("error_code") == "publication_cancel_required":
+            return jsonify({"status": "error", "error": {"code": result["error_code"], "message": result.get("message", "停止失败")}}), 409
         return jsonify({"status": "success", **result})
 
     @app.route("/api/resume/<task_id>", methods=["POST"])
@@ -1967,6 +1972,28 @@ def register_routes(app, state, services, dataset_service):
             "display_name": config.get("display_name"),
             "error_code": config.get("error_code"),
         }
+
+    def _public_history_item(item):
+        if not isinstance(item, dict):
+            return item
+        task_type = (item.get("type") or item.get("task_type") or "").strip()
+        if task_type != "model_publication":
+            return item
+        config = item.get("config") if isinstance(item.get("config"), dict) else {}
+        display_name = item.get("display_name") or item.get("custom_name") or config.get("display_name")
+        redacted = {
+            "id": item.get("id"),
+            "type": "model_publication",
+            "status": item.get("status"),
+            "created_at": item.get("created_at"),
+            "fusion_method": item.get("fusion_method") or "Publication",
+            "publication_id": item.get("publication_id") or config.get("publication_id"),
+            "display_name": display_name,
+        }
+        error_code = item.get("error_code") or config.get("error_code")
+        if error_code is not None:
+            redacted["error_code"] = error_code
+        return {key: value for key, value in redacted.items() if value is not None}
 
     def _history_metadata(task_id):
         path = os.path.join(state.merge_dir, task_id, "metadata.json")

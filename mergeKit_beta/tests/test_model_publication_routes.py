@@ -30,9 +30,10 @@ class PublicationRouteTest(unittest.TestCase):
             scheduler_lock=threading.Lock(),
             running_task_info={"id": None, "priority": None, "process": None},
             priority_map={"common": 10},
+            logger=mock.Mock(),
+            model_pool_path=self.model_path,
             config=SimpleNamespace(PUBLISHED_MODELS_PATH=self.published),
         )
-        self.services = SimpleNamespace(status_from_disk=lambda _task_id: None)
         app = Flask(__name__)
         app.config.update(
             TESTING=True,
@@ -44,12 +45,16 @@ class PublicationRouteTest(unittest.TestCase):
         from app.extensions import db
         from app.models import Model, Task
         from app.routes import register_routes
+        from app.services import Services
 
         db.init_app(app)
         with app.app_context():
             db.create_all()
             db.session.add(Model(id="model-1", name="core", path=self.model_path, source="base"))
             db.session.commit()
+        self.services = Services(self.state)
+        self.services.app = app
+        self.services.logger = self.state.logger
         register_routes(app, self.state, self.services, SimpleNamespace())
         self.app = app
         self.db = db
@@ -176,6 +181,74 @@ class PublicationRouteTest(unittest.TestCase):
         self.assertEqual(response.get_json()["task"]["status"], "canceled")
         self.assertFalse(os.path.exists(staging))
 
+    def test_generic_stop_route_rejects_publication_without_canceling_it(self):
+        task_id = "generic-stop-publication"
+        publication_id = "generic-stop-publication"
+        staging = os.path.join(self.published, ".staging", publication_id)
+        os.makedirs(staging)
+        config = {"publication_id": publication_id, "publication_root": self.published, "staging_path": staging}
+        self._add_publication_task(task_id, "validating", config)
+        process = mock.Mock(pid=1234)
+        control = {"aborted": False, "process": process}
+        self.state.tasks[task_id] = {
+            "status": "running",
+            "type": "model_publication",
+            "original_data": {"type": "model_publication"},
+            "control": control,
+        }
+        self.state.running_task_info["id"] = task_id
+        self.state.running_task_info["process"] = process
+
+        response = self.app.test_client().post("/api/stop/%s" % task_id)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"]["code"], "publication_cancel_required")
+        self.assertFalse(control["aborted"])
+        process.terminate.assert_not_called()
+        self.assertTrue(os.path.isdir(staging))
+        with self.app.app_context():
+            self.assertEqual(self.db.session.get(self.Task, task_id).status, "validating")
+
+    def test_generic_stop_all_fails_atomically_when_publication_is_active(self):
+        publication_id = "publication-active"
+        staging = os.path.join(self.published, ".staging", publication_id)
+        os.makedirs(staging)
+        self._add_publication_task(
+            "publication-task",
+            "validating",
+            {"publication_id": publication_id, "publication_root": self.published, "staging_path": staging},
+        )
+        publication_process = mock.Mock(pid=111)
+        merge_process = mock.Mock(pid=222)
+        self.state.tasks["publication-task"] = {
+            "status": "running",
+            "type": "model_publication",
+            "original_data": {"type": "model_publication"},
+            "control": {"aborted": False, "process": publication_process},
+        }
+        self.state.tasks["merge-task"] = {
+            "status": "queued",
+            "type": "merge",
+            "original_data": {"type": "merge"},
+            "control": {"aborted": False, "process": merge_process},
+        }
+        self.state.task_queue.put((10, 1.0, "publication-task", {"type": "model_publication"}))
+        self.state.task_queue.put((10, 2.0, "merge-task", {"type": "merge"}))
+        self.state.running_task_info["id"] = "publication-task"
+        self.state.running_task_info["process"] = publication_process
+
+        response = self.app.test_client().post("/api/stop_all")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"]["code"], "publication_cancel_required")
+        self.assertEqual(self.state.task_queue.qsize(), 2)
+        self.assertFalse(self.state.tasks["publication-task"]["control"]["aborted"])
+        self.assertFalse(self.state.tasks["merge-task"]["control"]["aborted"])
+        publication_process.terminate.assert_not_called()
+        merge_process.terminate.assert_not_called()
+        self.assertEqual(self.state.tasks["publication-task"]["status"], "running")
+        self.assertEqual(self.state.tasks["merge-task"]["status"], "queued")
+
     def test_validate_is_single_flight_and_marks_the_durable_enqueue(self):
         task_id = "single-flight"
         self._add_publication_task(task_id, "validating", {"publication_id": "single-flight", "display_name": "published"})
@@ -199,6 +272,100 @@ class PublicationRouteTest(unittest.TestCase):
         self.assertTrue(self.state.tasks[task_id]["validation_enqueued"])
         with self.app.app_context():
             self.assertTrue(self.db.session.get(self.Task, task_id).config["validation_enqueued"])
+
+    def test_recovery_clears_stale_validation_enqueue_and_allows_validate_again(self):
+        from app.services import Services
+
+        task_id = "stale-validation-enqueue"
+        self._add_publication_task(task_id, "validating", {
+            "publication_id": "stale-validation-enqueue",
+            "display_name": "published",
+            "validation_enqueued": False,
+        })
+
+        first = self._post(
+            "/api/model-publications/%s/validate" % task_id,
+            {"gpu_ids": [0]},
+            **self.headers,
+        )
+        self.assertEqual(first.status_code, 202)
+        with self.app.app_context():
+            self.assertTrue(self.db.session.get(self.Task, task_id).config["validation_enqueued"])
+
+        self.state.task_queue = queue.PriorityQueue()
+        self.state.tasks = {}
+        self.state.running_task_info = {"id": None, "priority": None, "process": None}
+        services = Services(self.state)
+        services.app = self.app
+        services.logger = mock.Mock()
+
+        services.recover_publication_tasks_on_startup()
+
+        with self.app.app_context():
+            recovered = self.db.session.get(self.Task, task_id)
+            self.assertEqual(recovered.status, "validating")
+            self.assertFalse(recovered.config["validation_enqueued"])
+
+        second = self._post(
+            "/api/model-publications/%s/validate" % task_id,
+            {"gpu_ids": [0]},
+            **self.headers,
+        )
+        self.assertEqual(second.status_code, 202)
+        self.assertEqual(self.state.task_queue.qsize(), 1)
+
+    def test_history_collection_redacts_publication_db_rows(self):
+        secret = os.path.join(self.tmpdir.name, "secret-publication.json")
+        self._add_publication_task("history-db-publication", "validating", {
+            "publication_id": "history-db-publication",
+            "display_name": "Published",
+            "recipe_path": secret,
+            "publication_root": self.published,
+            "staging_path": secret,
+            "request_fingerprint": "fingerprint",
+        })
+
+        response = self.app.test_client().get("/api/history")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()["history"]
+        text = json.dumps(payload, sort_keys=True)
+        self.assertNotIn(secret, text)
+        item = next(entry for entry in payload if entry["id"] == "history-db-publication")
+        self.assertEqual(item["type"], "model_publication")
+        self.assertNotIn("config", item)
+        self.assertEqual(item["publication_id"], "history-db-publication")
+        self.assertEqual(item["display_name"], "Published")
+
+    def test_history_collection_redacts_publication_disk_metadata_fallback(self):
+        task_id = "history-disk-publication"
+        secret = os.path.join(self.tmpdir.name, "secret-publication.json")
+        task_dir = os.path.join(self.state.merge_dir, task_id)
+        os.makedirs(task_dir)
+        with open(os.path.join(task_dir, "metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump({
+                "id": task_id,
+                "type": "model_publication",
+                "publication_id": "history-disk-publication",
+                "display_name": "Published",
+                "recipe_path": secret,
+                "publication_root": self.published,
+                "staging_path": secret,
+                "error": "failed at %s" % secret,
+                "status": "error",
+            }, handle)
+
+        response = self.app.test_client().get("/api/history")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()["history"]
+        text = json.dumps(payload, sort_keys=True)
+        self.assertNotIn(secret, text)
+        item = next(entry for entry in payload if entry["id"] == task_id)
+        self.assertEqual(item["type"], "model_publication")
+        self.assertNotIn("config", item)
+        self.assertNotIn("error", item)
+        self.assertEqual(item["publication_id"], "history-disk-publication")
 
     def test_publication_disk_fallbacks_redact_history_and_status_paths(self):
         task_id = "restart-publication"
