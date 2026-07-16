@@ -358,6 +358,7 @@ staging 和正式目录必须位于同一文件系统，以保证目录重命名
 POST /api/model-publications
 GET  /api/model-publications/<task_id>
 POST /api/model-publications/<task_id>/cancel
+POST /api/model-publications/<task_id>/validate
 GET  /api/model-publications/<publication_id>/manifest
 DELETE /api/model-publications/<publication_id>
 ```
@@ -393,6 +394,11 @@ DELETE /api/model-publications/<publication_id>
 - `materializing` 和 `validating` 在分片复制、物化和验证阶段边界协作取消；
 - 已进入原子提交临界区时返回 `409 commit_in_progress`，提交完成后由管理员删除正式资产；
 - 取消后保存小型诊断记录并清理大型 staging 文件。
+
+如果物化完成时没有获准使用的空闲 GPU，任务保持 `validating`。管理员随后调用
+`POST /api/model-publications/<task_id>/validate` 并提交显式 `gpu_ids`；后端重新检查
+GPU UUID、外部进程和显存后，只恢复该任务的真实功能验证。该接口不自动选择 GPU，
+也不复用仅面向内存态 `interrupted` 任务的通用 `/api/resume/<task_id>`。
 
 ### 10.2 新增管理员候选接口
 
