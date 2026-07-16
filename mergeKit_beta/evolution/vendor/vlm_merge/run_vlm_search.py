@@ -1311,6 +1311,29 @@ class TextLLMMergingProblem(BaseMergingProblem):
             raise e
 
 
+def _resolve_best_genotype(results_root: Path, problem, result_x, result_f) -> list | None:
+    global_best_file = results_root / "global_best.json"
+    if global_best_file.exists():
+        try:
+            best = json.loads(global_best_file.read_text(encoding="utf-8")).get("best_genotype")
+            if best is not None:
+                return np.asarray(best).flatten().tolist()
+        except Exception:
+            pass
+
+    problem_best = getattr(problem, "best_x", None)
+    if problem_best is not None:
+        return np.asarray(problem_best).flatten().tolist()
+    if result_x is None:
+        return None
+
+    values = np.asarray(result_x)
+    if values.ndim <= 1:
+        return values.flatten().tolist()
+    index = int(np.argmin(result_f)) if result_f is not None else 0
+    return values[index].flatten().tolist()
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="VLM/LLM 进化融合搜索（text 或 vlm 模式）")
     p.add_argument("--run-id", type=str, default="vlm_search")
@@ -1608,20 +1631,7 @@ def main():
 
     # 保存最优到 final_vlm_output
     try:
-        best_x = None
-        global_best_file = results_root / "global_best.json"
-        if global_best_file.exists():
-            try:
-                data = json.loads(global_best_file.read_text(encoding="utf-8"))
-                best_x = data.get("best_genotype")
-            except Exception:
-                pass
-        if best_x is None and result_X is not None:
-            if hasattr(result_X, "__len__") and len(result_X) > 0:
-                idx = int(np.argmin(result_F)) if result_F is not None else 0
-                best_x = np.array(result_X[idx]).flatten().tolist()
-            else:
-                best_x = np.array(result_X).flatten().tolist()
+        best_x = _resolve_best_genotype(results_root, problem, result_X, result_F)
         if best_x is not None and args.final_vlm_output:
             best_x = np.asarray(best_x, dtype=np.float32)
             best_cfg = merger.create_individual_configuration(best_x)
