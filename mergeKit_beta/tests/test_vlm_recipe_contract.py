@@ -34,6 +34,8 @@ class VlmRecipeContractTest(unittest.TestCase):
                 "size_bytes": 7,
                 "sha256": "e" * 64,
             }],
+            "index_bytes": 0,
+            "index_files": [],
         }
         self.fingerprint_patch = mock.patch.object(
             runner,

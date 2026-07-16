@@ -142,6 +142,17 @@ def _weight_file_paths(model_path: str) -> list[str]:
     return paths
 
 
+def _index_file_paths(model_path: str) -> list[str]:
+    paths = sorted(
+        set(glob.glob(os.path.join(model_path, "*.safetensors.index.json")))
+        | set(glob.glob(os.path.join(model_path, "pytorch_model*.bin.index.json")))
+    )
+    for path in paths:
+        if os.path.islink(path) or not os.path.isfile(path):
+            raise ValueError("unsafe model index file: %s" % os.path.basename(path))
+    return paths
+
+
 def _file_sha256(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -157,14 +168,29 @@ def model_weight_fingerprint(path: str) -> dict:
         raise ValueError("model path is not a directory: %s" % path)
 
     entries = []
+    index_entries = []
     combined = hashlib.sha256()
     total_bytes = 0
+    index_bytes = 0
+    for index_path in _index_file_paths(model_path):
+        relative = os.path.relpath(index_path, model_path).replace(os.sep, "/")
+        size_bytes = os.path.getsize(index_path)
+        sha256 = _file_sha256(index_path)
+        index_entries.append({"path": relative, "size_bytes": size_bytes, "sha256": sha256})
+        index_bytes += size_bytes
+        combined.update(b"index\0")
+        combined.update(relative.encode("utf-8"))
+        combined.update(b"\0")
+        combined.update(str(size_bytes).encode("ascii"))
+        combined.update(b"\0")
+        combined.update(bytes.fromhex(sha256))
     for weight_path in _weight_file_paths(model_path):
         relative = os.path.relpath(weight_path, model_path).replace(os.sep, "/")
         size_bytes = os.path.getsize(weight_path)
         sha256 = _file_sha256(weight_path)
         entries.append({"path": relative, "size_bytes": size_bytes, "sha256": sha256})
         total_bytes += size_bytes
+        combined.update(b"weight\0")
         combined.update(relative.encode("utf-8"))
         combined.update(b"\0")
         combined.update(str(size_bytes).encode("ascii"))
@@ -176,6 +202,8 @@ def model_weight_fingerprint(path: str) -> dict:
         "weights_sha256": combined.hexdigest(),
         "weight_bytes": total_bytes,
         "weight_files": entries,
+        "index_bytes": index_bytes,
+        "index_files": index_entries,
     }
 
 

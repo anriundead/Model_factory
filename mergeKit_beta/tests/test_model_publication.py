@@ -53,6 +53,8 @@ class PublicationFilesystemTest(unittest.TestCase):
                     "size_bytes": 7,
                     "sha256": "c" * 64,
                 }],
+                "index_bytes": 0,
+                "index_files": [],
             }],
             "dtype": "bfloat16",
         }
@@ -107,7 +109,9 @@ class PublicationFilesystemTest(unittest.TestCase):
         )
 
     def test_commit_is_atomic_and_manifest_excludes_itself_from_hashes(self):
-        committed = commit_staging(self.staging, self.root, self._manifest(), register_fn=self._register)
+        manifest = self._manifest()
+        self.assertEqual(manifest["schema_version"], 2)
+        committed = commit_staging(self.staging, self.root, manifest, register_fn=self._register)
 
         final = os.path.join(self.root, committed["publication_id"])
         self.assertFalse(os.path.exists(self.staging))
@@ -121,6 +125,50 @@ class PublicationFilesystemTest(unittest.TestCase):
         self.assertNotIn("publication_manifest.json", paths)
         self.assertEqual(paths, sorted(paths))
         self.assertEqual(len(self.registered), 1)
+
+    def test_schema1_recipe_manifest_remains_readable_without_weight_fingerprints(self):
+        manifest = self._manifest()
+        manifest["schema_version"] = 1
+        manifest["provenance"].pop("parent_fingerprints", None)
+
+        committed = commit_staging(self.staging, self.root, manifest, register_fn=self._register)
+
+        self.assertEqual(committed["schema_version"], 1)
+
+    def test_schema2_existing_model_manifest_requires_source_fingerprint(self):
+        request = {
+            **self.request,
+            "recipe_path": None,
+            "recipe_sha256": None,
+            "recipe_snapshot": {},
+            "parents": [],
+            "parent_fingerprints": [],
+            "source_model": {
+                "model_id": "model-1",
+                "source_path": "/models/source",
+                "weights_sha256": "d" * 64,
+                "weight_bytes": 7,
+                "weight_files": [{
+                    "path": "model.safetensors",
+                    "size_bytes": 7,
+                    "sha256": "e" * 64,
+                }],
+                "index_bytes": 0,
+                "index_files": [],
+            },
+        }
+        manifest = build_manifest(
+            self.staging,
+            request,
+            self.inspection,
+            validation={"structural": {"status": "passed"}},
+            compatibility={"serving": {"status": "ready", "tested_version": "0.7.0"}},
+        )
+        self.assertEqual(manifest["provenance"]["source_model"]["model_id"], "model-1")
+        manifest["provenance"].pop("source_model")
+
+        with self.assertRaisesRegex(PublicationError, "manifest contract is invalid"):
+            commit_staging(self.staging, self.root, manifest, register_fn=self._register)
 
     def test_registration_failure_leaves_valid_pending_asset_for_recovery(self):
         with self.assertRaisesRegex(RuntimeError, "database unavailable"):

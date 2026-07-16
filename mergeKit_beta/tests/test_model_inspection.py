@@ -195,6 +195,18 @@ class ModelInspectionTest(unittest.TestCase):
         self.assertEqual(first["source_path"], os.path.realpath(self.vlm_path))
         self.assertEqual(first["weight_files"][0]["path"], "model-00001-of-00001.safetensors")
 
+    def test_weight_fingerprint_includes_safetensors_index_content(self):
+        first = model_weight_fingerprint(self.vlm_path)
+        index_path = os.path.join(self.vlm_path, "model.safetensors.index.json")
+        with open(index_path, encoding="utf-8") as handle:
+            index = json.load(handle)
+        index["metadata"] = {"total_size": 123}
+        self.write_json(self.vlm_path, "model.safetensors.index.json", index)
+        second = model_weight_fingerprint(self.vlm_path)
+
+        self.assertNotEqual(first["weights_sha256"], second["weights_sha256"])
+        self.assertEqual(second["index_files"][0]["path"], "model.safetensors.index.json")
+
     def test_recorded_vlm_weight_fingerprint_mismatch_fails(self):
         fingerprint = model_weight_fingerprint(self.vlm_path)
         shard = os.path.join(self.vlm_path, "model-00001-of-00001.safetensors")

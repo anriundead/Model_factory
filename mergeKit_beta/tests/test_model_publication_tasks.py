@@ -30,7 +30,10 @@ class PublicationTaskTest(unittest.TestCase):
     def setUp(self):
         self.protected_gpu_env = mock.patch.dict(
             os.environ,
-            {"MERGEKIT_PROTECTED_GPU_UUIDS": "GPU-7eff453d-60f0-37ed-92c1-0aec341c497d"},
+            {
+                "MERGEKIT_PROTECTED_GPU_UUIDS": "GPU-7eff453d-60f0-37ed-92c1-0aec341c497d",
+                "MERGEKIT_PUBLICATION_ALLOWED_GPU_UUIDS": "GPU-23348268-6430-c539-b7e5-762583f50e91",
+            },
             clear=False,
         )
         self.protected_gpu_env.start()
@@ -222,11 +225,38 @@ class PublicationTaskTest(unittest.TestCase):
                 "task-a", self.request, self.progress, {"aborted": False},
                 structural_validate_fn=self.structural_validate,
             )
+            task = self.db.session.get(__import__("app.models", fromlist=["Task"]).Task, "task-a")
 
         staged = os.path.join(self.root, ".staging", "publication-a", "model.safetensors")
         self.assertEqual(result["status"], "validating")
         with open(staged, "rb") as handle:
             self.assertEqual(handle.read(), b"current")
+        self.assertEqual(task.config["source_model"]["model_id"], "model-1")
+        self.assertEqual(task.config["source_model"]["source_path"], os.path.realpath(self.current_source))
+        self.assertEqual(len(task.config["source_model"]["weights_sha256"]), 64)
+
+    def test_existing_model_copy_rejects_source_weight_replacement(self):
+        from app.model_publication_tasks import _copy_tree_cooperatively, run_model_publication_task
+
+        def copy_then_mutate(source, destination):
+            _copy_tree_cooperatively(source, destination, {"aborted": False})
+            with open(os.path.join(source, "model.safetensors"), "wb") as handle:
+                handle.write(b"changed-after-copy")
+
+        with self.app.app_context():
+            self._add_task()
+            result = run_model_publication_task(
+                "task-a",
+                self.request,
+                self.progress,
+                {"aborted": False},
+                copy_fn=copy_then_mutate,
+                structural_validate_fn=self.structural_validate,
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "source_fingerprint_mismatch")
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".staging", "publication-a")))
 
     def test_cancel_before_commit_removes_staging_and_persists(self):
         from app.models import Task
@@ -613,6 +643,28 @@ class PublicationTaskTest(unittest.TestCase):
                     with self.assertRaisesRegex(PublicationError, "protected_gpu"):
                         publication_gpu_preflight([0], required_bytes=1)
 
+    def test_preflight_rejects_selected_uuid_missing_from_allowlist(self):
+        from core.gpu_topology import GpuInfo
+        from app.model_publication import PublicationError
+        from app.model_publication_tasks import publication_gpu_preflight
+
+        selected_uuid = "GPU-23348268-6430-c539-b7e5-762583f50e91"
+        stale_allowed_uuid = "GPU-3f409b14-e414-b97e-346b-5de726e75aaa"
+        topology = [GpuInfo(index=0, mem_free_mib=24476, mem_total_mib=24576)]
+        inventory = "0, %s, 00000000:01:00.0, 100, 24576\n" % selected_uuid
+
+        def completed(stdout="", returncode=0, stderr=""):
+            return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+        with mock.patch.dict(os.environ, {"MERGEKIT_PUBLICATION_ALLOWED_GPU_UUIDS": stale_allowed_uuid}, clear=False):
+            with mock.patch("core.gpu_topology.query_gpus", return_value=topology):
+                with mock.patch(
+                    "app.model_publication_tasks.subprocess.run",
+                    side_effect=[completed(inventory), completed()],
+                ):
+                    with self.assertRaisesRegex(PublicationError, "unapproved_gpu"):
+                        publication_gpu_preflight([0], required_bytes=1)
+
     def test_preflight_uses_new_inventory_snapshot_not_topology_free_memory(self):
         from core.gpu_topology import GpuInfo
         from app.model_publication import PublicationError
@@ -809,6 +861,8 @@ class PublicationTaskTest(unittest.TestCase):
                     "size_bytes": 7,
                     "sha256": marker * 64,
                 }],
+                "index_bytes": 0,
+                "index_files": [],
             }
 
         fingerprints = [
@@ -844,6 +898,8 @@ class PublicationTaskTest(unittest.TestCase):
                 "size_bytes": 7,
                 "sha256": "a" * 64,
             }],
+            "index_bytes": 0,
+            "index_files": [],
         }
         recipe_data = {
             "artifact_type": "text",

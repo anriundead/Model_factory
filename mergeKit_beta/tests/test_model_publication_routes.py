@@ -95,7 +95,7 @@ class PublicationRouteTest(unittest.TestCase):
             self.db.session.commit()
 
     def _published_model(self, publication_id):
-        from app.model_inspection import inspect_model
+        from app.model_inspection import inspect_model, model_weight_fingerprint
         from app.model_publication import build_manifest, commit_staging
 
         staging = os.path.join(self.published, ".staging", publication_id)
@@ -109,7 +109,15 @@ class PublicationRouteTest(unittest.TestCase):
             json.dump({"weight_map": {"model.weight": "model.safetensors"}}, handle)
         manifest = build_manifest(
             staging,
-            {"publication_id": publication_id, "display_name": publication_id, "task_id": "task-%s" % publication_id},
+            {
+                "publication_id": publication_id,
+                "display_name": publication_id,
+                "task_id": "task-%s" % publication_id,
+                "source_model": {
+                    "model_id": "source-%s" % publication_id,
+                    **model_weight_fingerprint(staging),
+                },
+            },
             inspect_model(staging),
             {"structural": {"status": "passed"}},
             {"serving": {"backend": "vllm", "tested_version": "0.7.0", "status": "ready"}},

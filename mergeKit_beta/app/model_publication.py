@@ -238,7 +238,7 @@ def build_manifest(
     manifest_compatibility.update(compatibility or {})
     created_at = request.get("created_at") or _now()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "publication_id": publication_id,
         "display_name": str(request.get("display_name") or publication_id),
         "artifact_type": artifact_type,
@@ -252,6 +252,7 @@ def build_manifest(
             "parents": request.get("parents") or [],
             "parent_fingerprints": request.get("parent_fingerprints") or [],
             "vlm_base": request.get("vlm_base") or {},
+            "source_model": request.get("source_model") or {},
         },
         "model": {
             "model_type": inspection.model_type,
@@ -296,7 +297,9 @@ def _weight_fingerprint(value: object) -> bool:
     if not isinstance(value, dict):
         return False
     files = value.get("weight_files")
+    index_files = value.get("index_files")
     weight_bytes = value.get("weight_bytes")
+    index_bytes = value.get("index_bytes")
     if (
         not isinstance(value.get("source_path"), str)
         or not value["source_path"].strip()
@@ -305,6 +308,9 @@ def _weight_fingerprint(value: object) -> bool:
         or weight_bytes < 1
         or not isinstance(files, list)
         or not files
+        or not isinstance(index_bytes, int)
+        or index_bytes < 0
+        or not isinstance(index_files, list)
     ):
         return False
     if any(
@@ -316,7 +322,19 @@ def _weight_fingerprint(value: object) -> bool:
         for entry in files
     ):
         return False
-    return sum(entry["size_bytes"] for entry in files) == weight_bytes
+    if any(
+        not isinstance(entry, dict)
+        or not _safe_entry_path(entry.get("path"))
+        or not isinstance(entry.get("size_bytes"), int)
+        or entry["size_bytes"] < 0
+        or not _sha256(entry.get("sha256"))
+        for entry in index_files
+    ):
+        return False
+    return (
+        sum(entry["size_bytes"] for entry in files) == weight_bytes
+        and sum(entry["size_bytes"] for entry in index_files) == index_bytes
+    )
 
 
 def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
@@ -324,7 +342,8 @@ def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
         publication_id = _publication_id(manifest.get("publication_id"))
         if os.path.basename(path) != publication_id:
             raise ValueError("directory name")
-        if manifest.get("schema_version") != 1 or manifest.get("publication_state") not in ("registration_pending", "published"):
+        schema_version = manifest.get("schema_version")
+        if schema_version not in (1, 2) or manifest.get("publication_state") not in ("registration_pending", "published"):
             raise ValueError("schema")
         if not isinstance(manifest.get("display_name"), str) or not manifest["display_name"].strip():
             raise ValueError("display_name")
@@ -345,7 +364,6 @@ def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
         if recipe_path is not None:
             recipe_snapshot = provenance.get("recipe_snapshot")
             parents = provenance.get("parents")
-            parent_fingerprints = provenance.get("parent_fingerprints")
             if (
                 not isinstance(recipe_path, str)
                 or not recipe_path.strip()
@@ -354,15 +372,20 @@ def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
                 or not recipe_snapshot
                 or not isinstance(parents, list)
                 or not parents
-                or not isinstance(parent_fingerprints, list)
-                or len(parent_fingerprints) != len(parents)
-                or any(not _weight_fingerprint(value) for value in parent_fingerprints)
-                or any(
-                    fingerprint["source_path"] != parent
-                    for parent, fingerprint in zip(parents, parent_fingerprints)
-                )
             ):
                 raise ValueError("recipe provenance")
+            if schema_version == 2:
+                parent_fingerprints = provenance.get("parent_fingerprints")
+                if (
+                    not isinstance(parent_fingerprints, list)
+                    or len(parent_fingerprints) != len(parents)
+                    or any(not _weight_fingerprint(value) for value in parent_fingerprints)
+                    or any(
+                        fingerprint["source_path"] != parent
+                        for parent, fingerprint in zip(parents, parent_fingerprints)
+                    )
+                ):
+                    raise ValueError("recipe source fingerprints")
             if artifact_type == "vlm":
                 vlm_base = provenance.get("vlm_base")
                 if (
@@ -372,9 +395,18 @@ def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
                     or not _sha256(vlm_base.get("config_sha256"))
                     or not isinstance(vlm_base.get("visual_weight_count"), int)
                     or vlm_base["visual_weight_count"] < 1
-                    or not _weight_fingerprint(vlm_base)
+                    or (schema_version == 2 and not _weight_fingerprint(vlm_base))
                 ):
                     raise ValueError("VLM base provenance")
+        elif schema_version == 2:
+            source_model = provenance.get("source_model")
+            if (
+                not isinstance(source_model, dict)
+                or not isinstance(source_model.get("model_id"), str)
+                or not source_model["model_id"].strip()
+                or not _weight_fingerprint(source_model)
+            ):
+                raise ValueError("existing model provenance")
         if not isinstance(model, dict) or not isinstance(model.get("model_type"), str) or not model["model_type"].strip():
             raise ValueError("model")
         architectures = model.get("architectures")

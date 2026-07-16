@@ -318,10 +318,19 @@ def run_model_publication_task(
         provenance = {}
         if source is None:
             provenance = _materialize_recipe(task_id, params, staging, progress, task_control) or {}
-        elif copy_fn is shutil.copytree:
-            _copy_tree_cooperatively(source, staging, task_control)
         else:
-            copy_fn(source, staging)
+            source_fingerprints = _fingerprint_sources([source])
+            provenance = {
+                "source_model": {
+                    "model_id": str(params.get("model_id") or "").strip(),
+                    **source_fingerprints[source],
+                },
+            }
+            if copy_fn is shutil.copytree:
+                _copy_tree_cooperatively(source, staging, task_control)
+            else:
+                copy_fn(source, staging)
+            _assert_sources_unchanged(source_fingerprints)
         if _cancelled(task_control):
             raise _error("canceled", "publication canceled")
         progress(65, "Validating publication structure")
@@ -384,6 +393,16 @@ def _protected_gpu_uuids() -> set[str]:
     return values
 
 
+def _allowed_gpu_uuids() -> set[str]:
+    raw = (os.environ.get("MERGEKIT_PUBLICATION_ALLOWED_GPU_UUIDS") or "").strip()
+    if not raw:
+        raise _error("allowed_gpu_config_missing", "publication validation GPU UUID allowlist is not configured")
+    values = {value.strip() for value in raw.split(",") if value.strip()}
+    if not values or any(_GPU_UUID_PATTERN.fullmatch(value) is None for value in values):
+        raise _error("allowed_gpu_config_invalid", "publication validation GPU UUID allowlist is invalid")
+    return values
+
+
 def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> list[dict]:
     """Fail-closed GPU check with model bytes + 10%/1 GiB inference headroom."""
     gpu_ids = _normalize_gpu_ids(gpu_ids)
@@ -404,6 +423,9 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
         raise _error("gpu_preflight_failed", "GPU inventory query failed")
 
     protected_uuids = _protected_gpu_uuids()
+    allowed_uuids = _allowed_gpu_uuids()
+    if protected_uuids & allowed_uuids:
+        raise _error("gpu_safety_config_invalid", "protected and allowed GPU UUIDs overlap")
     topology = {}
     for gpu in topology_rows:
         if gpu.index in topology or gpu.mem_total_mib <= 0:
@@ -450,6 +472,8 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
             raise _error("gpu_preflight_failed", "selected GPU inventory changed")
         if snapshot["uuid"] in protected_uuids:
             raise _error("protected_gpu", "selected physical GPU is protected")
+        if snapshot["uuid"] not in allowed_uuids:
+            raise _error("unapproved_gpu", "selected physical GPU is not approved for publication validation")
         selected.append((snapshot, gpu))
 
     try:
