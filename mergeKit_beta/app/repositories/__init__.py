@@ -76,6 +76,56 @@ def task_mark_stopped(task_id: str, error: str = "任务已手动停止") -> boo
     return True
 
 
+_PUBLICATION_TASK_STATUSES = {
+    "queued", "materializing", "validating", "registration_pending",
+    "completed", "failed", "canceled",
+}
+
+
+def task_set_status(
+    task_id: str,
+    status: str,
+    *,
+    error: str | None = None,
+    config_patch: dict | None = None,
+    model_path: str | None = None,
+) -> Task | None:
+    """Persist a model-publication state without replacing its request snapshot."""
+    if status not in _PUBLICATION_TASK_STATUSES:
+        raise ValueError("invalid publication task status: %s" % status)
+    task = db.session.get(Task, task_id)
+    if task is None:
+        return None
+    config = dict(task.config or {})
+    config.update(config_patch or {})
+    task.status = status
+    task.config = config
+    task.updated_at = datetime.utcnow()
+    if error is not None:
+        task.error = error[:2000]
+    if model_path is not None:
+        task.model_path = model_path
+    if status in {"completed", "failed", "canceled"}:
+        task.finished_at = datetime.utcnow()
+    db.session.commit()
+    return task
+
+
+def publication_task_by_idempotency_key(key: str) -> Task | None:
+    """Small SQLite-portable lookup for the JSON idempotency key."""
+    for task in db.session.query(Task).filter_by(task_type="model_publication").all():
+        if isinstance(task.config, dict) and task.config.get("idempotency_key") == key:
+            return task
+    return None
+
+
+def publication_tasks_for_restart() -> list[Task]:
+    return db.session.query(Task).filter(
+        Task.task_type == "model_publication",
+        Task.status.in_(("queued", "materializing", "running")),
+    ).all()
+
+
 def evolution_steps_delete_for_task(task_id: str) -> int:
     """删除指定任务在 DB 中的进化步骤（停止任务时清理中间写入）。"""
     n = db.session.query(EvolutionStep).filter_by(task_id=task_id).delete()

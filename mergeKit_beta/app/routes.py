@@ -1897,3 +1897,211 @@ def register_routes(app, state, services, dataset_service):
     @app.route("/fusion_history")
     def fusion_history_page():
         return render_template("fusion_history.html")
+
+    # Formal publication endpoints intentionally live in the model factory, not
+    # the Gateway. Gateway owns service lifecycle only.
+    def _publication_admin():
+        from .model_gateway.auth import require_admin_token
+
+        try:
+            require_admin_token(app.config, request.headers.get("Authorization"))
+        except RuntimeError:
+            return jsonify({"error": {"code": "admin_unconfigured", "message": "admin access unavailable"}}), 503
+        except PermissionError:
+            return jsonify({"error": {"code": "unauthorized", "message": "admin access required"}}), 401
+        return None
+
+    def _publication_task_view(task):
+        config = task.config if isinstance(task.config, dict) else {}
+        return {
+            "id": task.id,
+            "status": task.status,
+            "publication_id": config.get("publication_id"),
+            "display_name": config.get("display_name"),
+            "source_type": config.get("source_type"),
+            "error_code": config.get("error_code"),
+            "error": task.error,
+        }
+
+    def _queue_publication(task_id, data):
+        created_at = time.time()
+        with state.scheduler_lock:
+            state.tasks[task_id] = {
+                "progress": 0,
+                "message": "Queued for publication",
+                "status": "queued",
+                "created_at": created_at,
+                "original_data": data,
+                "priority": "common",
+            }
+            priority_map = getattr(state, "priority_map", {"common": 10})
+            state.task_queue.put((priority_map.get("common", 10), created_at, task_id, data))
+
+    @app.route("/api/model-publications", methods=["POST"])
+    def create_model_publication():
+        denied = _publication_admin()
+        if denied:
+            return denied
+        idempotency_key = (request.headers.get("Idempotency-Key") or "").strip()
+        if not idempotency_key:
+            return jsonify({"error": {"code": "idempotency_key_required", "message": "Idempotency-Key is required"}}), 400
+        data = request.get_json(silent=True) or {}
+        source_type = (data.get("source_type") or "").strip()
+        display_name = (data.get("display_name") or "").strip()
+        if source_type not in {"recipe", "existing_model"} or not display_name:
+            return jsonify({"error": {"code": "invalid_request", "message": "source_type and display_name are required"}}), 400
+        request_fingerprint = json.dumps(
+            {key: data.get(key) for key in ("source_type", "recipe_path", "model_id", "display_name", "vlm_base_model_id")},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        from .repositories import model_get_by_id, publication_task_by_idempotency_key, task_upsert
+
+        existing = publication_task_by_idempotency_key(idempotency_key)
+        if existing is not None:
+            old = existing.config if isinstance(existing.config, dict) else {}
+            if old.get("request_fingerprint") != request_fingerprint:
+                return jsonify({"error": {"code": "idempotency_conflict", "message": "Idempotency-Key was used for another request"}}), 409
+            return jsonify({"status": "success", "task": _publication_task_view(existing)}), 200
+        task_data = {
+            "type": "model_publication",
+            "source_type": source_type,
+            "display_name": display_name,
+            "publication_id": uuid.uuid4().hex,
+            "idempotency_key": idempotency_key,
+            "request_fingerprint": request_fingerprint,
+            "publication_root": app.config.get("PUBLISHED_MODELS_PATH") or getattr(state.config, "PUBLISHED_MODELS_PATH", None),
+            "vlm_base_model_id": data.get("vlm_base_model_id"),
+        }
+        if source_type == "recipe":
+            recipe_path = (data.get("recipe_path") or "").strip()
+            if not recipe_path or os.path.isabs(recipe_path):
+                return jsonify({"error": {"code": "invalid_recipe", "message": "recipe_path must be a managed relative path"}}), 400
+            recipes_root = os.path.realpath(os.path.abspath(state.recipes_dir))
+            candidate = os.path.realpath(os.path.abspath(os.path.join(recipes_root, recipe_path)))
+            if os.path.commonpath((recipes_root, candidate)) != recipes_root or not os.path.isfile(candidate):
+                return jsonify({"error": {"code": "invalid_recipe", "message": "recipe_path is not managed"}}), 400
+            task_data["recipe_path"] = candidate
+            task_data["recipe_id"] = os.path.splitext(os.path.basename(candidate))[0]
+            vlm_base_model_id = (data.get("vlm_base_model_id") or "").strip()
+            if vlm_base_model_id:
+                vlm_base = model_get_by_id(vlm_base_model_id)
+                if vlm_base is None or not os.path.isdir(vlm_base.path):
+                    return jsonify({"error": {"code": "vlm_base_missing", "message": "vlm_base_model_id is not a managed model"}}), 400
+                task_data["vlm_base_path"] = os.path.realpath(vlm_base.path)
+        else:
+            model = model_get_by_id((data.get("model_id") or "").strip())
+            if model is None or not os.path.isdir(model.path):
+                return jsonify({"error": {"code": "invalid_model", "message": "model_id is not a managed model"}}), 400
+            task_data["model_id"] = model.id
+            task_data["source_path"] = os.path.realpath(model.path)
+        task_id = uuid.uuid4().hex
+        task_data["task_id"] = task_id
+        task = task_upsert(task_id, "model_publication", task_data)
+        _queue_publication(task_id, task_data)
+        return jsonify({"status": "success", "task": _publication_task_view(task)}), 202
+
+    @app.route("/api/model-publications/<task_id>")
+    def get_model_publication(task_id):
+        denied = _publication_admin()
+        if denied:
+            return denied
+        from .extensions import db
+        from .models import Task
+
+        task = db.session.get(Task, task_id)
+        if task is None or task.task_type != "model_publication":
+            return jsonify({"error": {"code": "not_found", "message": "publication task not found"}}), 404
+        return jsonify({"status": "success", "task": _publication_task_view(task)})
+
+    @app.route("/api/model-publications/<task_id>/cancel", methods=["POST"])
+    def cancel_model_publication(task_id):
+        denied = _publication_admin()
+        if denied:
+            return denied
+        from .extensions import db
+        from .models import Task
+        from .repositories import task_set_status
+
+        task = db.session.get(Task, task_id)
+        if task is None or task.task_type != "model_publication":
+            return jsonify({"error": {"code": "not_found", "message": "publication task not found"}}), 404
+        config = dict(task.config or {})
+        if config.get("commit_in_progress"):
+            return jsonify({"error": {"code": "commit_in_progress", "message": "atomic commit has started"}}), 409
+        if task.status == "queued":
+            task_set_status(task_id, "canceled", error="canceled", config_patch={"error_code": "canceled"})
+            if task_id in state.tasks:
+                state.tasks[task_id]["status"] = "stopped"
+            task = db.session.get(Task, task_id)
+            return jsonify({"status": "success", "task": _publication_task_view(task)})
+        if task.status in {"materializing", "validating"}:
+            if task_id in state.tasks:
+                state.tasks[task_id].setdefault("control", {})["aborted"] = True
+            return jsonify({"status": "success", "task": _publication_task_view(task)})
+        return jsonify({"error": {"code": "invalid_publication_state", "message": "publication cannot be canceled"}}), 409
+
+    @app.route("/api/model-publications/<task_id>/validate", methods=["POST"])
+    def validate_model_publication(task_id):
+        denied = _publication_admin()
+        if denied:
+            return denied
+        from .extensions import db
+        from .models import Task
+        from .model_publication import PublicationError
+        from .model_publication_tasks import _normalize_gpu_ids
+
+        try:
+            gpu_ids = _normalize_gpu_ids((request.get_json(silent=True) or {}).get("gpu_ids"))
+        except PublicationError as exc:
+            return jsonify({"error": {"code": exc.code, "message": str(exc)}}), 400
+        task = db.session.get(Task, task_id)
+        if task is None or task.task_type != "model_publication":
+            return jsonify({"error": {"code": "not_found", "message": "publication task not found"}}), 404
+        if task.status != "validating":
+            return jsonify({"error": {"code": "invalid_publication_state", "message": "publication is not awaiting validation"}}), 409
+        data = dict(task.config or {})
+        data.update({"type": "model_publication", "task_id": task_id, "validation_gpu_ids": gpu_ids})
+        _queue_publication(task_id, data)
+        return jsonify({"status": "accepted", "task": _publication_task_view(task)}), 202
+
+    @app.route("/api/model-publications/<publication_id>/manifest")
+    def get_model_publication_manifest(publication_id):
+        denied = _publication_admin()
+        if denied:
+            return denied
+        root = app.config.get("PUBLISHED_MODELS_PATH") or getattr(state.config, "PUBLISHED_MODELS_PATH", "")
+        path = os.path.join(root, publication_id, "publication_manifest.json")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return jsonify({"status": "success", "manifest": json.load(handle)})
+        except (OSError, ValueError):
+            return jsonify({"error": {"code": "not_found", "message": "publication manifest not found"}}), 404
+
+    @app.route("/api/model-publications/<publication_id>", methods=["DELETE"])
+    def delete_model_publication(publication_id):
+        denied = _publication_admin()
+        if denied:
+            return denied
+        from sqlalchemy import or_
+        from .extensions import db
+        from .model_gateway.models import ServingModelService
+        from .model_publication import PublicationError, delete_published_asset
+        from .repositories import model_get_by_path, model_delete_by_path, publication_task_is_active
+
+        root = app.config.get("PUBLISHED_MODELS_PATH") or getattr(state.config, "PUBLISHED_MODELS_PATH", "")
+
+        def reference_check(candidate_id, path):
+            model = model_get_by_path(path)
+            if publication_task_is_active(candidate_id):
+                return True
+            return db.session.query(ServingModelService).filter(
+                ServingModelService.status != "deleted",
+                or_(ServingModelService.model_path == path, ServingModelService.model_id == (model.id if model else "")),
+            ).first() is not None
+
+        try:
+            result = delete_published_asset(publication_id, root, reference_check, model_delete_by_path)
+        except PublicationError as exc:
+            return jsonify({"error": {"code": exc.code, "message": str(exc)}}), 409 if exc.code == "publication_referenced" else 400
+        return jsonify({"status": "success", **result})

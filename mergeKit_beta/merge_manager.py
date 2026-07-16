@@ -641,7 +641,14 @@ def cleanup_recipe_temp_dirs(parent_task_id, suffixes):
                 _logger.warning("[cleanup] 删除临时目录失败 %s: %s", temp_dir, e)
 
 
-def run_recipe_apply_task(task_id, params, update_progress_callback, task_control=None, skip_register=False):
+def run_recipe_apply_task(
+    task_id,
+    params,
+    update_progress_callback,
+    task_control=None,
+    skip_register=False,
+    output_dir_override=None,
+):
     """
     按配方执行一次合并（固定 genotype，不进化）。用于「根据配方直接融合出最终模型」或中间物化。
     params: recipe_id, custom_name（可选）
@@ -682,7 +689,7 @@ def run_recipe_apply_task(task_id, params, update_progress_callback, task_contro
     density = 0.5
 
     task_dir = os.path.join(MERGE_DIR, task_id)
-    output_dir = os.path.join(task_dir, "output")
+    output_dir = os.path.abspath(output_dir_override) if output_dir_override else os.path.join(task_dir, "output")
     yaml_config_dir = os.path.join(task_dir, "yaml_configs")
     config_yaml_path = os.path.join(yaml_config_dir, "config.yaml")
     os.makedirs(task_dir, exist_ok=True)

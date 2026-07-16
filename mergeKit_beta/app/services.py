@@ -1481,8 +1481,10 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                     self.state.running_task_info["id"] = task_id
                     self.state.running_task_info["priority"] = priority_score
 
+                task_type = data.get("type", "merge")
                 merge_dir = os.path.join(self.state.merge_dir, task_id)
-                self._db_mark_running(task_id, log_path=merge_dir)
+                if task_type != "model_publication":
+                    self._db_mark_running(task_id, log_path=merge_dir)
 
                 def update_progress(p, msg):
                     if self.state.tasks.get(task_id, {}).get("status") in ["interrupted", "stopped"]:
@@ -1492,7 +1494,6 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                     if task_control.get("process") and self.state.running_task_info.get("id") == task_id:
                         self.state.running_task_info["process"] = task_control["process"]
 
-                task_type = data.get("type", "merge")
                 self.logger.info(
                     "[worker] 任务开始 task_id=%s type=%s custom_name=%s",
                     task_id,
@@ -1524,6 +1525,8 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                         "[worker] 配方应用 recipe_id=%s",
                         data.get("recipe_id", ""),
                     )
+                elif task_type == "model_publication":
+                    self.logger.info("[worker] model publication task_id=%s", task_id)
 
                 if task_type == "merge_evolutionary":
                     import merge_manager as _mm
@@ -1662,6 +1665,15 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                         self.logger.info("[worker] 配方融合完成 task_id=%s output=%s", task_id, result.get("output_path", ""))
                     else:
                         self.logger.warning("[worker] 配方融合失败 task_id=%s error=%s", task_id, result.get("error", ""))
+                elif task_type == "model_publication":
+                    from app.model_publication_tasks import run_model_publication_task, run_publication_validation
+
+                    if data.get("validation_gpu_ids"):
+                        result = run_publication_validation(
+                            task_id, data["validation_gpu_ids"], update_progress, task_control
+                        )
+                    else:
+                        result = run_model_publication_task(task_id, data, update_progress, task_control)
                 else:
                     import importlib as _importlib
                     _data = dict(data)
@@ -1712,7 +1724,19 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
 
                 if self.state.tasks[task_id]["status"] not in ["interrupted", "queued", "stopped"]:
                     self.state.tasks[task_id]["result"] = result
-                    if result.get("status") == "success":
+                    if task_type == "model_publication" and result.get("status") == "validating":
+                        self.state.tasks[task_id]["status"] = "validating"
+                        self.state.tasks[task_id]["message"] = "Awaiting explicit GPU validation"
+                    elif task_type == "model_publication" and result.get("status") == "canceled":
+                        self.state.tasks[task_id]["status"] = "error"
+                        self.state.tasks[task_id]["message"] = "Canceled"
+                        try:
+                            with self.app.app_context():
+                                from app.repositories import task_set_status
+                                task_set_status(task_id, "canceled", error=result.get("error", "canceled"))
+                        except Exception as exc:
+                            self.logger.warning("[worker] publication cancellation persist failed: %s", exc)
+                    elif result.get("status") == "success":
                         self.state.tasks[task_id]["status"] = "completed"
                         self.state.tasks[task_id]["progress"] = 100
                         self.state.tasks[task_id]["message"] = "任务完成"
@@ -2833,6 +2857,33 @@ class RecipeMixin(AutomationMixin, ModelRepoMixin):
 
 
 class Services(RecipeMixin, TaskQueueMixin, TestsetMixin):
+    def recover_publication_tasks_on_startup(self):
+        """Requeue safe work; leave explicit-GPU and reconciliation states alone."""
+        app = getattr(self, "app", None)
+        if not app:
+            return
+        try:
+            with app.app_context():
+                from app.repositories import publication_tasks_for_restart, task_set_status
+
+                for task in publication_tasks_for_restart():
+                    config = dict(task.config or {})
+                    if task.status == "queued":
+                        created_at = time.time()
+                        self.state.tasks[task.id] = {
+                            "progress": 0, "message": "Queued for publication recovery", "status": "queued",
+                            "created_at": created_at, "original_data": config, "priority": "common",
+                        }
+                        self.state.task_queue.put((self.state.priority_map.get("common", 10), created_at, task.id, config))
+                    else:
+                        # Do not delete staging: Task 3 recovery keeps inactive staging diagnosable.
+                        task_set_status(
+                            task.id, "failed", error="publication interrupted by process restart",
+                            config_patch={"error_code": "interrupted"},
+                        )
+        except Exception as exc:
+            self.logger.warning("[startup-heal] publication recovery failed: %s", exc)
+
     def heal_stale_merge_tasks_on_startup(self):
         """启动自愈：修正重启后遗留的 merge/merge_evolutionary running/queued 脏状态。"""
         app = getattr(self, "app", None)
@@ -2931,4 +2982,5 @@ class Services(RecipeMixin, TaskQueueMixin, TestsetMixin):
     def start_task_worker(self):
         self.heal_stale_eval_tasks_on_startup()
         self.heal_stale_merge_tasks_on_startup()
+        self.recover_publication_tasks_on_startup()
         self.start_worker()
