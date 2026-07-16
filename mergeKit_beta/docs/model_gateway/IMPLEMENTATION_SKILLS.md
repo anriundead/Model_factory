@@ -82,3 +82,21 @@
   at build completion. The parser has no GPU, no published port and only the
   private Worker network. Real fixture checks use disposable files and do not
   start a model, research task, fusion, evaluation or GPU workload.
+
+## Model Publication Real Acceptance (2026-07-17)
+
+- Active skills: `using-superpowers`, `executing-plans`, `ponytail`,
+  `systematic-debugging`, `test-driven-development`,
+  `verification-before-completion`, and `requesting-code-review` from the paths
+  listed above.
+- Scope: formal text/VLM publication, real Gateway text inference, bounded VLM
+  evolution, manifest provenance, restart recovery and deletion guards.
+- Runtime safety: all work ran in worktree
+  `.worktrees/model-publication-pipeline`, Compose project
+  `mergekit_publication_task7`, and host port `5057`. GPU 0 was the only model
+  validation device; physical GPU 2 was protected and the main service remained
+  healthy with restart count zero.
+- Review closure: repeated `requesting-code-review` passes found and closed false-success
+  postprocessing, weak source provenance, index-based GPU identity, legacy schema
+  compatibility, existing-model copy races and metadata backfill coupling. The final
+  focused re-review reported no Critical, Important or Minor findings.

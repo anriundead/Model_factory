@@ -15,7 +15,9 @@ model factory's repository, fusion, evaluation, and evolution workflows.
 | vLLM runtime logs | `mergeKit_beta/logs/model_gateway/` |
 | Architecture | `ARCHITECTURE.md` |
 | Implementation history | `IMPLEMENTATION_HISTORY.md` |
+| Operations and recovery | `OPERATIONS.md` |
 | Real-model acceptance evidence | `ACCEPTANCE_20260712.md` |
+| Text/VLM publication acceptance | `ACCEPTANCE_20260717_MODEL_PUBLICATION.md` |
 
 ## URL Boundaries
 

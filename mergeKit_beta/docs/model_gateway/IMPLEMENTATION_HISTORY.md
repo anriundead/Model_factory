@@ -993,3 +993,28 @@ Do not drop existing `models`, `tasks`, `testsets`, or evaluation tables.
 - 占位扫描：未发现未解决的占位标记。
 - Type consistency: service, key, request and usage names are consistent across tasks.
 - Risk check: only additive DB tables and contained serving module are introduced; high-risk merge/eval/evolution files remain untouched.
+
+---
+
+## 2026-07-17: Model Publication Real Acceptance
+
+- Added formal text/VLM publication acceptance through real HTTP, Transformers, CMMMU,
+  vLLM, restart recovery, idempotency and deletion paths.
+- Preserved the full recipe snapshot, recipe hash, ordered parents and resolved VLM base
+  fingerprint in `publication_manifest.json`; recipe manifests now fail closed when these
+  fields are absent.
+- Reused the evolution pipeline's local CMMMU helpers for publication smoke validation,
+  avoiding an undeclared runtime dependency on `lmms_eval`.
+- Added a double-gated, default-off after-rename crash hook and verified restart recovery
+  from `registration_pending` to one core model row and a completed Task.
+- Verified Qwen text serving and token usage. Qwen2.5-VL publication is accepted, while
+  service creation remains blocked under vLLM 0.7.0 with `unsupported_architecture`.
+- Full evidence and retained asset paths are in
+  [`ACCEPTANCE_20260717_MODEL_PUBLICATION.md`](ACCEPTANCE_20260717_MODEL_PUBLICATION.md).
+- Final review follow-up introduced manifest schema 2 while preserving schema 1 assets,
+  bound evolution, recipe publication and existing-model copies to shard/index hashes,
+  and moved publication recipe diagnostics out of standard `metadata.json`.
+- Publication GPU validation now resolves requested indexes to UUID and PCI bus ID,
+  enforces disjoint allowed/protected UUID sets, and passes UUIDs to CUDA children.
+- A second real VLM task (`4424f954`) and publication
+  (`24c69e3ef8d549e3ae3e72e6e1a0a4bd`) verified the strengthened contract.

@@ -1768,3 +1768,50 @@ payload 清理规则：
 - 联网搜索。
 - 多租户套餐和复杂权限模型。
 - 自动启动模型服务。
+
+---
+
+## 14. 正式模型发布边界
+
+融合完成不等于可服务。正式发布采用独立目录
+`/data/PublishedModels/<publication_id>/`，状态依次为：
+
+```text
+queued -> materializing -> validating -> registration_pending -> completed
+```
+
+- `validating` 前只完成物化、结构检查和全量文件哈希，不自动占用 GPU。
+- 管理员必须显式选择 GPU；preflight 将容器 index 解析为 UUID/PCI bus ID，
+  所选 UUID 必须在 `MERGEKIT_PUBLICATION_ALLOWED_GPU_UUIDS` 且不在
+  `MERGEKIT_PROTECTED_GPU_UUIDS`，子进程也使用 UUID 设置 CUDA 可见设备。
+- rename 前 manifest 为内存对象；rename 后先落盘为 `registration_pending`。
+- 同文件系统原子 rename 完成后才注册 core `models` 行。
+- 重启发现 `registration_pending` 时，reconcile 以 manifest 为权威恢复唯一 Model 行，
+  再把对应 Task 收敛为 `completed`。
+- manifest、Task、正式目录和 Gateway service 分别是资产、任务、文件和运行状态的权威，
+  不互相替代。
+
+schema 1 只兼容升级前的合法资产；所有新发布写 schema 2。schema 2 配方 manifest
+必须 fail-closed 包含完整 `recipe_snapshot`、64 位 `recipe_sha256`、有序 `parents`、
+父模型 shard/index 指纹；VLM 还必须包含实际视觉基座的 config、shard/index 指纹和
+正数 `visual_weight_count`。进化前后、发布前后均比较来源，不允许同路径替换权重。
+existing-model 也记录 core model ID 和复制前后来源指纹。
+
+Publication 调用通用 recipe 物化时，中间诊断只写
+`_publication_recipe_metadata.json`，不得写标准 `metadata.json` 或同步 Task；
+否则 metadata backfill 可能覆盖幂等键、staging inventory 和正式 provenance。
+
+服务创建只接受 `source=published` 且 manifest 校验通过的 core model ID。
+`ready` 可创建服务；`blocked` 显示原因但不可选择；`stale` 必须重新验证运行时版本。
+当前 `vLLM==0.7.0` 对 `Qwen2_5_VLForConditionalGeneration` 返回
+`blocked/unsupported_architecture`，所以用户 API 不展示该 VLM。
+
+仅验收环境允许同时设置：
+
+```text
+MERGEKIT_ENABLE_TEST_FAULTS=1
+MERGEKIT_PUBLICATION_TEST_CRASH_AFTER_RENAME=1
+```
+
+两者同时存在时，进程在 rename 后、注册前以退出码 86 终止，用于验证恢复。
+默认 Compose、`.env` 和生产部署禁止设置这两个变量。
