@@ -10,8 +10,7 @@
 | Frontend design | `/home/a/.codex/skills/frontend-design/SKILL.md` | Research workspace hierarchy and Mergenetic visual language. |
 | Design taste | `/home/a/.codex/skills/taste-skill/SKILL.md` | Anti-template visual review. |
 | GSAP core/performance | `/home/a/.codex/skills/gsap-core/SKILL.md`, `/home/a/.codex/skills/gsap-performance/SKILL.md` | Compositor-safe motion and reduced motion. |
-
-| Model publication pipeline (Task 0) | `/home/a/.codex/skills/executing-plans/SKILL.md`; `/home/a/.codex/skills/test-driven-development/SKILL.md`, `/home/a/.codex/skills/ponytail/SKILL.md`; `/home/a/.codex/skills/systematic-debugging/SKILL.md`; `/home/a/.codex/skills/frontend-design/SKILL.md`, `/home/a/.codex/skills/taste-skill/SKILL.md`, `/home/a/.codex/skills/gsap-core/SKILL.md`, `/home/a/.codex/skills/gsap-performance/SKILL.md`; `/home/a/.codex/skills/verification-before-completion/SKILL.md`; `/home/a/.codex/skills/requesting-code-review/SKILL.md` | Planning; TDD/backend; debugging; frontend; verification; review. |
+| Model publication pipeline (Task 0) | `/home/a/.codex/skills/using-git-worktrees/SKILL.md`, `/home/a/.codex/skills/subagent-driven-development/SKILL.md`; `/home/a/.codex/skills/test-driven-development/SKILL.md`, `/home/a/.codex/skills/ponytail/SKILL.md`; `/home/a/.codex/skills/systematic-debugging/SKILL.md`; `/home/a/.codex/skills/frontend-design/SKILL.md`, `/home/a/.codex/skills/taste-skill/SKILL.md`, `/home/a/.codex/skills/gsap-core/SKILL.md`, `/home/a/.codex/skills/gsap-performance/SKILL.md`; `/home/a/.codex/skills/verification-before-completion/SKILL.md`; `/home/a/.codex/skills/requesting-code-review/SKILL.md` | Worktree/execution planning; TDD/backend; debugging; frontend; verification; review. |
 
 ## Admin Portal Visual Batch (2026-07-14)
 
