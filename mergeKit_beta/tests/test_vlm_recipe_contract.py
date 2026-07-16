@@ -25,9 +25,28 @@ class VlmRecipeContractTest(unittest.TestCase):
             language_signature=(3584, 28, 152064),
             config_sha256="abc123",
         )
+        self.weight_fingerprint = {
+            "source_path": self.inspection.path,
+            "weights_sha256": "d" * 64,
+            "weight_bytes": 7,
+            "weight_files": [{
+                "path": "model.safetensors",
+                "size_bytes": 7,
+                "sha256": "e" * 64,
+            }],
+        }
+        self.fingerprint_patch = mock.patch.object(
+            runner,
+            "model_weight_fingerprint",
+            return_value=self.weight_fingerprint,
+        )
+        self.fingerprint_patch.start()
+
+    def tearDown(self):
+        self.fingerprint_patch.stop()
 
     def test_vlm_recipe_fields_are_additive_and_json_safe(self):
-        meta = {"best_genotype": [0.2, 0.8], "custom_field": "kept"}
+        meta = {"status": "running", "best_genotype": [0.2, 0.8], "custom_field": "kept"}
 
         enriched = runner.build_recipe_vlm_fields(meta, self.inspection)
 
@@ -36,6 +55,8 @@ class VlmRecipeContractTest(unittest.TestCase):
         self.assertEqual(enriched["capabilities"], ["text_generation", "vision_language"])
         self.assertEqual(enriched["vlm_path"], self.inspection.path)
         self.assertEqual(enriched["vlm_base"]["config_sha256"], self.inspection.config_sha256)
+        self.assertEqual(enriched["vlm_base"]["weights_sha256"], "d" * 64)
+        self.assertEqual(enriched["status"], "success")
         self.assertIn("best_genotype", enriched)
         self.assertEqual(enriched["custom_field"], "kept")
         json.dumps(enriched)

@@ -31,6 +31,9 @@ services:
       # 默认 all。若某张卡 PCIe 异常（nvidia-smi 报 Unable to determine device handle / sysfs link Unknown），
       # 在仓库旁 .env 设置 NVIDIA_VISIBLE_DEVICES 为若干 GPU-UUID（逗号分隔），用宿主机 nvidia-smi -L 取健康卡的 UUID，避免 CDI 枚举死卡导致容器无法启动。
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      # Comma-separated immutable UUIDs of physical GPUs reserved from publication validation.
+      # Validation fails closed when this is empty; configure it in the ignored host .env.
+      - MERGEKIT_PROTECTED_GPU_UUIDS=${MERGEKIT_PROTECTED_GPU_UUIDS:-}
       - LOCAL_MODELS_PATH=/data/Models
       - MERGEKIT_MODEL_POOL=/data/models_pool
       - MERGEKIT_PUBLISHED_MODELS_PATH=/data/PublishedModels

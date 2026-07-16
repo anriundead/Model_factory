@@ -720,7 +720,11 @@ class PublicationRouteTest(unittest.TestCase):
                 ))
 
         patches = [
-            mock.patch("app.model_publication_tasks.publication_gpu_preflight", return_value=[{"index": 0}]),
+            mock.patch("app.model_publication_tasks.publication_gpu_preflight", return_value=[{
+                "index": 0,
+                "uuid": "GPU-23348268-6430-c539-b7e5-762583f50e91",
+                "pci_bus_id": "00000000:01:00.0",
+            }]),
             mock.patch("app.model_publication_tasks.inspect_model", return_value=inspection),
             mock.patch("app.model_publication_tasks.inspect_serving_compatibility", return_value={"status": "ready"}),
             mock.patch("app.model_publication_tasks.build_manifest", side_effect=build_manifest),

@@ -13,6 +13,7 @@ if _ROOT not in sys.path:
 from app.model_inspection import (  # noqa: E402
     assert_language_compatible,
     inspect_model,
+    model_weight_fingerprint,
     resolve_vlm_base,
 )
 
@@ -49,6 +50,8 @@ class ModelInspectionTest(unittest.TestCase):
             "model.safetensors.index.json",
             {"weight_map": {key: "model-00001-of-00001.safetensors" for key in weight_keys}},
         )
+        with open(os.path.join(path, "model-00001-of-00001.safetensors"), "wb") as handle:
+            handle.write((name + "-weights").encode("utf-8"))
         return path
 
     def complete_vlm(self, name, visual_key="visual.blocks.0.attn.qkv.weight"):
@@ -178,6 +181,35 @@ class ModelInspectionTest(unittest.TestCase):
                         "config_sha256": expected_hash,
                     },
                     "model_paths": [self.complete_vlm("fallback")],
+                }
+            )
+
+    def test_weight_fingerprint_changes_when_weight_content_is_replaced(self):
+        first = model_weight_fingerprint(self.vlm_path)
+        shard = os.path.join(self.vlm_path, "model-00001-of-00001.safetensors")
+        with open(shard, "wb") as handle:
+            handle.write(b"replacement-weight-content")
+        second = model_weight_fingerprint(self.vlm_path)
+
+        self.assertNotEqual(first["weights_sha256"], second["weights_sha256"])
+        self.assertEqual(first["source_path"], os.path.realpath(self.vlm_path))
+        self.assertEqual(first["weight_files"][0]["path"], "model-00001-of-00001.safetensors")
+
+    def test_recorded_vlm_weight_fingerprint_mismatch_fails(self):
+        fingerprint = model_weight_fingerprint(self.vlm_path)
+        shard = os.path.join(self.vlm_path, "model-00001-of-00001.safetensors")
+        with open(shard, "wb") as handle:
+            handle.write(b"same-path-new-weights")
+
+        with self.assertRaisesRegex(ValueError, "source_fingerprint_mismatch"):
+            resolve_vlm_base(
+                {
+                    "vlm_base": {
+                        "source_path": self.vlm_path,
+                        "config_sha256": inspect_model(self.vlm_path).config_sha256,
+                        "weights_sha256": fingerprint["weights_sha256"],
+                    },
+                    "model_paths": [self.vlm_path],
                 }
             )
 

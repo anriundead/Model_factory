@@ -25,6 +25,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from config import Config
+from app.model_inspection import model_weight_fingerprint
 from evolution.progress_io import write_progress_error
 
 MERGE_DIR = Config.MERGE_DIR
@@ -51,8 +52,25 @@ def _is_vlm_mode(eval_mode: str, hf_dataset: str) -> bool:
     return eval_mode == "vlm" or "cmmmu" in hf_dataset.lower()
 
 
-def _serialize_vlm_base(inspection) -> dict:
-    return {
+def _serialize_vlm_base(inspection, recorded: object = None) -> dict:
+    value = dict(recorded) if isinstance(recorded, dict) else {}
+    fingerprint = None
+    if (
+        value.get("source_path") == inspection.path
+        and value.get("config_sha256") == inspection.config_sha256
+        and isinstance(value.get("weights_sha256"), str)
+        and len(value["weights_sha256"]) == 64
+        and isinstance(value.get("weight_files"), list)
+        and value["weight_files"]
+    ):
+        fingerprint = {
+            key: value[key]
+            for key in ("source_path", "weights_sha256", "weight_bytes", "weight_files")
+            if key in value
+        }
+    if fingerprint is None:
+        fingerprint = model_weight_fingerprint(inspection.path)
+    value.update({
         "source_path": inspection.path,
         "model_type": inspection.model_type,
         "architectures": list(inspection.architectures),
@@ -62,11 +80,14 @@ def _serialize_vlm_base(inspection) -> dict:
         "language_weight_count": inspection.language_weight_count,
         "language_signature": list(inspection.language_signature),
         "config_sha256": inspection.config_sha256,
-    }
+        **fingerprint,
+    })
+    return value
 
 
 def build_recipe_vlm_fields(meta: dict, inspection) -> dict:
     recipe = dict(meta)
+    recipe["status"] = "success"
     recipe["recipe_schema_version"] = 2
     if inspection is None:
         recipe["artifact_type"] = "text"
@@ -75,7 +96,7 @@ def build_recipe_vlm_fields(meta: dict, inspection) -> dict:
     recipe["artifact_type"] = "vlm"
     recipe["capabilities"] = ["text_generation", "vision_language"]
     recipe.setdefault("vlm_path", inspection.path)
-    recipe["vlm_base"] = _serialize_vlm_base(inspection)
+    recipe["vlm_base"] = _serialize_vlm_base(inspection, recipe.get("vlm_base"))
     return recipe
 
 
@@ -748,7 +769,7 @@ def main():
     testset_id = (meta.get("testset_id") or "").strip()
     vlm_mode, eval_mode, resolved_vlm_path, vlm_inspection = resolve_vlm_preflight(meta)
     if vlm_inspection is not None:
-        meta["vlm_base"] = _serialize_vlm_base(vlm_inspection)
+        meta["vlm_base"] = _serialize_vlm_base(vlm_inspection, meta.get("vlm_base"))
         _write_metadata_safe(task_id, merge_dir, meta, logger)
 
     logger.info("=" * 80)

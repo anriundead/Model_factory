@@ -250,6 +250,7 @@ def build_manifest(
             "recipe_sha256": request.get("recipe_sha256"),
             "recipe_snapshot": request.get("recipe_snapshot") or {},
             "parents": request.get("parents") or [],
+            "parent_fingerprints": request.get("parent_fingerprints") or [],
             "vlm_base": request.get("vlm_base") or {},
         },
         "model": {
@@ -291,6 +292,33 @@ def _sha256(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdefABCDEF" for character in value)
 
 
+def _weight_fingerprint(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    files = value.get("weight_files")
+    weight_bytes = value.get("weight_bytes")
+    if (
+        not isinstance(value.get("source_path"), str)
+        or not value["source_path"].strip()
+        or not _sha256(value.get("weights_sha256"))
+        or not isinstance(weight_bytes, int)
+        or weight_bytes < 1
+        or not isinstance(files, list)
+        or not files
+    ):
+        return False
+    if any(
+        not isinstance(entry, dict)
+        or not _safe_entry_path(entry.get("path"))
+        or not isinstance(entry.get("size_bytes"), int)
+        or entry["size_bytes"] < 0
+        or not _sha256(entry.get("sha256"))
+        for entry in files
+    ):
+        return False
+    return sum(entry["size_bytes"] for entry in files) == weight_bytes
+
+
 def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
     try:
         publication_id = _publication_id(manifest.get("publication_id"))
@@ -317,6 +345,7 @@ def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
         if recipe_path is not None:
             recipe_snapshot = provenance.get("recipe_snapshot")
             parents = provenance.get("parents")
+            parent_fingerprints = provenance.get("parent_fingerprints")
             if (
                 not isinstance(recipe_path, str)
                 or not recipe_path.strip()
@@ -325,6 +354,13 @@ def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
                 or not recipe_snapshot
                 or not isinstance(parents, list)
                 or not parents
+                or not isinstance(parent_fingerprints, list)
+                or len(parent_fingerprints) != len(parents)
+                or any(not _weight_fingerprint(value) for value in parent_fingerprints)
+                or any(
+                    fingerprint["source_path"] != parent
+                    for parent, fingerprint in zip(parents, parent_fingerprints)
+                )
             ):
                 raise ValueError("recipe provenance")
             if artifact_type == "vlm":
@@ -336,6 +372,7 @@ def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
                     or not _sha256(vlm_base.get("config_sha256"))
                     or not isinstance(vlm_base.get("visual_weight_count"), int)
                     or vlm_base["visual_weight_count"] < 1
+                    or not _weight_fingerprint(vlm_base)
                 ):
                     raise ValueError("VLM base provenance")
         if not isinstance(model, dict) or not isinstance(model.get("model_type"), str) or not model["model_type"].strip():

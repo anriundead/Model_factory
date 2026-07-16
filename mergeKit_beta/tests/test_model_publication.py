@@ -44,6 +44,16 @@ class PublicationFilesystemTest(unittest.TestCase):
             "recipe_sha256": "a" * 64,
             "recipe_snapshot": {"models": ["parent-a"]},
             "parents": ["parent-a"],
+            "parent_fingerprints": [{
+                "source_path": "parent-a",
+                "weights_sha256": "b" * 64,
+                "weight_bytes": 7,
+                "weight_files": [{
+                    "path": "model.safetensors",
+                    "size_bytes": 7,
+                    "sha256": "c" * 64,
+                }],
+            }],
             "dtype": "bfloat16",
         }
         self.inspection = inspect_model(self.staging)
@@ -149,6 +159,13 @@ class PublicationFilesystemTest(unittest.TestCase):
         with self.assertRaisesRegex(PublicationError, "manifest contract is invalid"):
             commit_staging(self.staging, self.root, manifest, register_fn=self._register)
 
+    def test_recipe_manifest_rejects_missing_parent_weight_fingerprints(self):
+        manifest = self._manifest()
+        manifest["provenance"].pop("parent_fingerprints")
+
+        with self.assertRaisesRegex(PublicationError, "manifest contract is invalid"):
+            commit_staging(self.staging, self.root, manifest, register_fn=self._register)
+
     def test_vlm_recipe_manifest_requires_complete_vlm_base_provenance(self):
         manifest = self._manifest()
         manifest["artifact_type"] = "vlm"
@@ -156,6 +173,21 @@ class PublicationFilesystemTest(unittest.TestCase):
         manifest["model"]["model_type"] = "qwen2_5_vl"
         manifest["model"]["architectures"] = ["Qwen2_5_VLForConditionalGeneration"]
         manifest["provenance"]["vlm_base"] = {}
+
+        with self.assertRaisesRegex(PublicationError, "manifest contract is invalid"):
+            commit_staging(self.staging, self.root, manifest, register_fn=self._register)
+
+    def test_vlm_recipe_manifest_rejects_missing_base_weight_fingerprint(self):
+        manifest = self._manifest()
+        manifest["artifact_type"] = "vlm"
+        manifest["capabilities"] = ["text_generation", "vision_language"]
+        manifest["model"]["model_type"] = "qwen2_5_vl"
+        manifest["model"]["architectures"] = ["Qwen2_5_VLForConditionalGeneration"]
+        manifest["provenance"]["vlm_base"] = {
+            "source_path": "/models/vlm",
+            "config_sha256": "d" * 64,
+            "visual_weight_count": 3,
+        }
 
         with self.assertRaisesRegex(PublicationError, "manifest contract is invalid"):
             commit_staging(self.staging, self.root, manifest, register_fn=self._register)

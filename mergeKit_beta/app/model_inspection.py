@@ -65,6 +65,12 @@ _VLM_ARCHITECTURE_PREFIXES = (
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
 )
+_WEIGHT_FILE_PATTERNS = (
+    "*.safetensors",
+    "pytorch_model*.bin",
+    "adapter_model*.bin",
+    "*.gguf",
+)
 
 
 @dataclass(frozen=True)
@@ -108,6 +114,69 @@ def _read_weight_keys(model_path: str) -> set[str]:
         with safe_open(shard_path, framework="pt", device="cpu") as handle:
             keys.update(handle.keys())
     return keys
+
+
+def _weight_file_paths(model_path: str) -> list[str]:
+    referenced = set()
+    for index_path in sorted(glob.glob(os.path.join(model_path, "*.safetensors.index.json"))):
+        weight_map = _read_json(index_path).get("weight_map")
+        if not isinstance(weight_map, dict):
+            raise ValueError("weight_map is required: %s" % index_path)
+        referenced.update(str(value) for value in weight_map.values())
+    if not referenced:
+        for pattern in _WEIGHT_FILE_PATTERNS:
+            referenced.update(os.path.basename(path) for path in glob.glob(os.path.join(model_path, pattern)))
+
+    paths = []
+    for relative in sorted(referenced):
+        if os.path.isabs(relative) or relative.replace("\\", "/").split("/").count(".."):
+            raise ValueError("unsafe weight file path: %s" % relative)
+        path = os.path.realpath(os.path.join(model_path, relative))
+        if os.path.commonpath((model_path, path)) != model_path or os.path.islink(os.path.join(model_path, relative)):
+            raise ValueError("unsafe weight file path: %s" % relative)
+        if not os.path.isfile(path):
+            raise ValueError("weight file is missing: %s" % relative)
+        paths.append(path)
+    if not paths:
+        raise ValueError("model contains no supported weight files: %s" % model_path)
+    return paths
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def model_weight_fingerprint(path: str) -> dict:
+    """Hash model weight bytes without slowing ordinary structural inspection."""
+    model_path = os.path.realpath(os.path.abspath(path))
+    if not os.path.isdir(model_path):
+        raise ValueError("model path is not a directory: %s" % path)
+
+    entries = []
+    combined = hashlib.sha256()
+    total_bytes = 0
+    for weight_path in _weight_file_paths(model_path):
+        relative = os.path.relpath(weight_path, model_path).replace(os.sep, "/")
+        size_bytes = os.path.getsize(weight_path)
+        sha256 = _file_sha256(weight_path)
+        entries.append({"path": relative, "size_bytes": size_bytes, "sha256": sha256})
+        total_bytes += size_bytes
+        combined.update(relative.encode("utf-8"))
+        combined.update(b"\0")
+        combined.update(str(size_bytes).encode("ascii"))
+        combined.update(b"\0")
+        combined.update(bytes.fromhex(sha256))
+
+    return {
+        "source_path": model_path,
+        "weights_sha256": combined.hexdigest(),
+        "weight_bytes": total_bytes,
+        "weight_files": entries,
+    }
 
 
 def _read_processor_class(model_path: str) -> str | None:
@@ -213,9 +282,19 @@ def resolve_vlm_base(recipe: dict, override_path: str | None = None) -> ModelIns
     except (OSError, ValueError):
         recorded_inspection = None
     expected_fingerprint = recorded.get("config_sha256")
+    expected_weights = recorded.get("weights_sha256")
+    if (expected_fingerprint or expected_weights) and recorded_inspection is None:
+        raise ValueError("source_fingerprint_mismatch: recorded VLM source is unavailable")
     if expected_fingerprint and recorded_inspection is not None:
         if recorded_inspection.config_sha256 != expected_fingerprint:
             raise ValueError("source_fingerprint_mismatch: recorded VLM config differs from source")
+    if expected_weights and recorded_inspection is not None:
+        try:
+            actual_weights = model_weight_fingerprint(recorded_inspection.path)["weights_sha256"]
+        except (OSError, ValueError) as exc:
+            raise ValueError("source_fingerprint_mismatch: recorded VLM weights are unavailable") from exc
+        if actual_weights != expected_weights:
+            raise ValueError("source_fingerprint_mismatch: recorded VLM weights differ from source")
     if recorded_inspection is not None and recorded_inspection.is_complete_vlm:
         return recorded_inspection
 

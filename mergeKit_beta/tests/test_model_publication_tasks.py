@@ -28,6 +28,12 @@ class _OneShotQueue:
 
 class PublicationTaskTest(unittest.TestCase):
     def setUp(self):
+        self.protected_gpu_env = mock.patch.dict(
+            os.environ,
+            {"MERGEKIT_PROTECTED_GPU_UUIDS": "GPU-7eff453d-60f0-37ed-92c1-0aec341c497d"},
+            clear=False,
+        )
+        self.protected_gpu_env.start()
         self.tmpdir = tempfile.TemporaryDirectory()
         self.root = os.path.join(self.tmpdir.name, "published")
         self.source = os.path.join(self.tmpdir.name, "source")
@@ -65,6 +71,7 @@ class PublicationTaskTest(unittest.TestCase):
         with self.app.app_context():
             self.db.session.remove()
         self.tmpdir.cleanup()
+        self.protected_gpu_env.stop()
 
     def _write_model(self, path, weights=b"weights"):
         os.makedirs(path, exist_ok=True)
@@ -316,12 +323,19 @@ class PublicationTaskTest(unittest.TestCase):
         with self.app.app_context():
             staging = self._staging_task()
 
-            def functional_validate(path, *_args):
+            selected_devices = []
+
+            def functional_validate(path, devices, *_args):
+                selected_devices.extend(devices)
                 with open(os.path.join(path, "model.safetensors"), "ab") as handle:
                     handle.write(b"mutated-after-baseline")
                 return {"status": "passed"}
 
-            with mock.patch("app.model_publication_tasks.publication_gpu_preflight", return_value=[{"index": 0}]):
+            with mock.patch("app.model_publication_tasks.publication_gpu_preflight", return_value=[{
+                "index": 0,
+                "uuid": "GPU-23348268-6430-c539-b7e5-762583f50e91",
+                "pci_bus_id": "00000000:01:00.0",
+            }]):
                 with mock.patch("app.model_publication_tasks.inspect_model", return_value=inspection):
                     with mock.patch("app.model_publication_tasks.inspect_serving_compatibility", return_value={"status": "ready"}):
                         with mock.patch("app.model_publication_tasks.commit_staging") as commit:
@@ -336,6 +350,7 @@ class PublicationTaskTest(unittest.TestCase):
         self.assertEqual(task.status, "validating")
         self.assertEqual(task.config["error_code"], "staging_changed")
         self.assertTrue(os.path.isdir(staging))
+        self.assertEqual(selected_devices, ["GPU-23348268-6430-c539-b7e5-762583f50e91"])
         commit.assert_not_called()
 
     def test_materialization_cancels_after_structural_validation_before_status_write(self):
@@ -438,7 +453,11 @@ class PublicationTaskTest(unittest.TestCase):
                 "publication_id": "publication-a",
                 "files": {"entries": baseline["files"], "total_bytes": baseline["total_bytes"]},
             }
-            with mock.patch("app.model_publication_tasks.publication_gpu_preflight", return_value=[{"index": 0}]):
+            with mock.patch("app.model_publication_tasks.publication_gpu_preflight", return_value=[{
+                "index": 0,
+                "uuid": "GPU-23348268-6430-c539-b7e5-762583f50e91",
+                "pci_bus_id": "00000000:01:00.0",
+            }]):
                 with mock.patch("app.model_publication_tasks.inspect_model", return_value=inspection):
                     with mock.patch("app.model_publication_tasks.inspect_serving_compatibility", return_value={"status": "ready"}):
                         with mock.patch("app.model_publication_tasks.build_manifest", return_value=manifest):
@@ -474,7 +493,11 @@ class PublicationTaskTest(unittest.TestCase):
                 "publication_id": "publication-a",
                 "files": {"entries": baseline["files"], "total_bytes": baseline["total_bytes"]},
             }
-            with mock.patch("app.model_publication_tasks.publication_gpu_preflight", return_value=[{"index": 0}]):
+            with mock.patch("app.model_publication_tasks.publication_gpu_preflight", return_value=[{
+                "index": 0,
+                "uuid": "GPU-23348268-6430-c539-b7e5-762583f50e91",
+                "pci_bus_id": "00000000:01:00.0",
+            }]):
                 with mock.patch("app.model_publication_tasks.inspect_model", return_value=inspection):
                     with mock.patch("app.model_publication_tasks.inspect_serving_compatibility", return_value={"status": "ready"}):
                         with mock.patch("app.model_publication_tasks.build_manifest", return_value=manifest) as build:
@@ -495,7 +518,7 @@ class PublicationTaskTest(unittest.TestCase):
         from app.model_publication import PublicationError
         from app.model_publication_tasks import publication_gpu_preflight
 
-        gpu_line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 100, 24576\n"
+        gpu_line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 00000000:01:00.0, 100, 24576\n"
         topology = [GpuInfo(index=0, mem_free_mib=24476, mem_total_mib=24576)]
 
         def completed(stdout="", returncode=0, stderr=""):
@@ -510,12 +533,12 @@ class PublicationTaskTest(unittest.TestCase):
                 with self.assertRaisesRegex(PublicationError, "insufficient_gpu_memory"):
                     publication_gpu_preflight([0], required_bytes=30 * 1024**3)
 
-            bad_uuid = "0, not-a-uuid, 100, 24576\n"
+            bad_uuid = "0, not-a-uuid, 00000000:01:00.0, 100, 24576\n"
             with mock.patch("app.model_publication_tasks.subprocess.run", side_effect=[completed(bad_uuid), completed()]):
                 with self.assertRaisesRegex(PublicationError, "gpu_preflight_failed"):
                     publication_gpu_preflight([0], required_bytes=1)
 
-            truncated_uuid = "0, GPU-23348268-6430-c539-b7e5, 100, 24576\n"
+            truncated_uuid = "0, GPU-23348268-6430-c539-b7e5, 00000000:01:00.0, 100, 24576\n"
             with mock.patch("app.model_publication_tasks.subprocess.run", side_effect=[completed(truncated_uuid), completed()]):
                 with self.assertRaisesRegex(PublicationError, "gpu_preflight_failed"):
                     publication_gpu_preflight([0], required_bytes=1)
@@ -534,13 +557,13 @@ class PublicationTaskTest(unittest.TestCase):
             for field_index in range(3):
                 for invalid in ("1.0", "1e3", "+1", "-1", ""):
                     with self.subTest(field_index=field_index, invalid=invalid):
-                        line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 100, 24576\n"
+                        line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 00000000:01:00.0, 100, 24576\n"
                         if field_index == 0:
-                            line = "%s, GPU-23348268-6430-c539-b7e5-762583f50e91, 100, 24576\n" % invalid
+                            line = "%s, GPU-23348268-6430-c539-b7e5-762583f50e91, 00000000:01:00.0, 100, 24576\n" % invalid
                         elif field_index == 1:
-                            line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, %s, 24576\n" % invalid
+                            line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 00000000:01:00.0, %s, 24576\n" % invalid
                         else:
-                            line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 100, %s\n" % invalid
+                            line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 00000000:01:00.0, 100, %s\n" % invalid
                         with mock.patch("app.model_publication_tasks.subprocess.run", side_effect=[completed(line), completed()]):
                             with self.assertRaisesRegex(PublicationError, "gpu_preflight_failed"):
                                 publication_gpu_preflight([0], required_bytes=1)
@@ -551,7 +574,7 @@ class PublicationTaskTest(unittest.TestCase):
         from app.model_publication_tasks import publication_gpu_preflight
 
         topology = [GpuInfo(index=0, mem_free_mib=24476, mem_total_mib=24576)]
-        inventory = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 100, 24576\n"
+        inventory = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 00000000:01:00.0, 100, 24576\n"
 
         def completed(stdout="", returncode=0, stderr=""):
             return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
@@ -569,13 +592,34 @@ class PublicationTaskTest(unittest.TestCase):
                         with self.assertRaisesRegex(PublicationError, "gpu_preflight_failed"):
                             publication_gpu_preflight([0], required_bytes=1)
 
+    def test_preflight_rejects_protected_uuid_after_index_remap(self):
+        from core.gpu_topology import GpuInfo
+        from app.model_publication import PublicationError
+        from app.model_publication_tasks import publication_gpu_preflight
+
+        protected_uuid = "GPU-7eff453d-60f0-37ed-92c1-0aec341c497d"
+        topology = [GpuInfo(index=0, mem_free_mib=24476, mem_total_mib=24576)]
+        inventory = "0, %s, 00000000:81:00.0, 100, 24576\n" % protected_uuid
+
+        def completed(stdout="", returncode=0, stderr=""):
+            return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+        with mock.patch.dict(os.environ, {"MERGEKIT_PROTECTED_GPU_UUIDS": protected_uuid}, clear=False):
+            with mock.patch("core.gpu_topology.query_gpus", return_value=topology):
+                with mock.patch(
+                    "app.model_publication_tasks.subprocess.run",
+                    side_effect=[completed(inventory), completed()],
+                ):
+                    with self.assertRaisesRegex(PublicationError, "protected_gpu"):
+                        publication_gpu_preflight([0], required_bytes=1)
+
     def test_preflight_uses_new_inventory_snapshot_not_topology_free_memory(self):
         from core.gpu_topology import GpuInfo
         from app.model_publication import PublicationError
         from app.model_publication_tasks import publication_gpu_preflight
 
         topology = [GpuInfo(index=0, mem_free_mib=24000, mem_total_mib=24576)]
-        gpu_line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 24000, 24576\n"
+        gpu_line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 00000000:01:00.0, 24000, 24576\n"
 
         def completed(stdout="", returncode=0, stderr=""):
             return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
@@ -603,10 +647,20 @@ class PublicationTaskTest(unittest.TestCase):
         process.communicate.return_value = ('{"status":"passed"}', "")
         original = os.environ.get("CUDA_VISIBLE_DEVICES")
         with mock.patch("app.model_publication_tasks.subprocess.Popen", return_value=process) as popen:
-            result = validate_model_functionally(self.source, [1, 3], {"aborted": False})
+            result = validate_model_functionally(
+                self.source,
+                [
+                    "GPU-3f409b14-e414-b97e-346b-5de726e75aaa",
+                    "GPU-ddf96bec-7977-9a3c-8508-602946b44a56",
+                ],
+                {"aborted": False},
+            )
 
         self.assertEqual(result["status"], "passed")
-        self.assertEqual(popen.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "1,3")
+        self.assertEqual(
+            popen.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"],
+            "GPU-3f409b14-e414-b97e-346b-5de726e75aaa,GPU-ddf96bec-7977-9a3c-8508-602946b44a56",
+        )
         self.assertEqual(popen.call_args.kwargs["env"]["MERGEKIT_CLI_SCRIPT"], "1")
         self.assertEqual(os.environ.get("CUDA_VISIBLE_DEVICES"), original)
         self.assertEqual(
@@ -723,8 +777,58 @@ class PublicationTaskTest(unittest.TestCase):
         self.assertEqual(provenance["recipe_snapshot"], recipe_data)
         self.assertEqual(len(provenance["recipe_sha256"]), 64)
         self.assertEqual(provenance["parents"], [self.source, self.current_source])
+        self.assertEqual(
+            [item["source_path"] for item in provenance["parent_fingerprints"]],
+            [os.path.realpath(self.source), os.path.realpath(self.current_source)],
+        )
+        self.assertTrue(all(len(item["weights_sha256"]) == 64 for item in provenance["parent_fingerprints"]))
         self.assertEqual(provenance["vlm_base"]["source_path"], os.path.realpath(self.current_source))
         self.assertEqual(provenance["vlm_base"]["visual_weight_count"], 3)
+        self.assertEqual(len(provenance["vlm_base"]["weights_sha256"]), 64)
+
+    def test_recipe_materialization_rejects_parent_weight_replacement(self):
+        from app.model_publication import PublicationError
+        from app.model_publication_tasks import _materialize_recipe
+
+        recipe = os.path.join(self.tmpdir.name, "recipe.json")
+        recipe_data = {
+            "artifact_type": "text",
+            "model_paths": [self.source, self.current_source],
+            "best_genotype": [0.5, 0.5],
+        }
+        with open(recipe, "w", encoding="utf-8") as handle:
+            json.dump(recipe_data, handle)
+
+        def fingerprint(path, marker):
+            return {
+                "source_path": os.path.realpath(path),
+                "weights_sha256": marker * 64,
+                "weight_bytes": 7,
+                "weight_files": [{
+                    "path": "model.safetensors",
+                    "size_bytes": 7,
+                    "sha256": marker * 64,
+                }],
+            }
+
+        fingerprints = [
+            fingerprint(self.source, "a"),
+            fingerprint(self.current_source, "b"),
+            fingerprint(self.source, "a"),
+            fingerprint(self.current_source, "c"),
+        ]
+        with self.app.app_context():
+            with mock.patch("app.model_publication_tasks._resolve_recipe", return_value=(recipe, recipe_data)):
+                with mock.patch("merge_manager.run_recipe_apply_task", return_value={"status": "success"}):
+                    with mock.patch("app.model_publication_tasks.model_weight_fingerprint", side_effect=fingerprints):
+                        with self.assertRaisesRegex(PublicationError, "source_fingerprint_mismatch"):
+                            _materialize_recipe(
+                                "task-text",
+                                {"recipe_id": "recipe", "recipe_path": recipe},
+                                os.path.join(self.root, ".staging", "text"),
+                                self.progress,
+                                {},
+                            )
 
     def test_recipe_provenance_is_persisted_before_explicit_validation(self):
         from app.models import Task
@@ -740,6 +844,7 @@ class PublicationTaskTest(unittest.TestCase):
             "recipe_sha256": "b" * 64,
             "recipe_snapshot": {"model_paths": [self.source], "vlm_base": {"source_path": self.current_source}},
             "parents": [self.source],
+            "parent_fingerprints": [{"source_path": self.source, "weights_sha256": "c" * 64}],
             "vlm_base": {"source_path": self.current_source},
         }
 

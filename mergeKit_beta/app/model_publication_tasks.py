@@ -17,7 +17,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable
 
-from app.model_inspection import inspect_model
+from app.model_inspection import inspect_model, model_weight_fingerprint
 from app.model_publication import (
     PublicationError,
     _hash_file,
@@ -26,6 +26,11 @@ from app.model_publication import (
     commit_staging,
     inspect_serving_compatibility,
 )
+
+_GPU_UUID_PATTERN = re.compile(
+    r"GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
+)
+_PCI_BUS_ID_PATTERN = re.compile(r"[0-9a-fA-F]{8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]\Z")
 
 
 def _error(code: str, message: str) -> PublicationError:
@@ -143,7 +148,7 @@ def _recipe_model_paths(params: dict) -> list[str]:
     return paths
 
 
-def _serialized_vlm_base(inspection, recorded: object) -> dict:
+def _serialized_vlm_base(inspection, recorded: object, fingerprint: dict) -> dict:
     value = dict(recorded) if isinstance(recorded, dict) else {}
     value.update({
         "source_path": inspection.path,
@@ -155,8 +160,44 @@ def _serialized_vlm_base(inspection, recorded: object) -> dict:
         "language_weight_count": inspection.language_weight_count,
         "language_signature": list(inspection.language_signature),
         "config_sha256": inspection.config_sha256,
+        **fingerprint,
     })
     return value
+
+
+def _fingerprint_sources(paths: list[str]) -> dict[str, dict]:
+    fingerprints = {}
+    try:
+        for path in paths:
+            normalized = os.path.realpath(path)
+            if normalized not in fingerprints:
+                fingerprints[normalized] = model_weight_fingerprint(normalized)
+    except (OSError, ValueError) as exc:
+        raise _error("source_fingerprint_failed", "model source weights cannot be fingerprinted") from exc
+    return fingerprints
+
+
+def _assert_sources_unchanged(expected: dict[str, dict]) -> None:
+    actual = _fingerprint_sources(list(expected))
+    if actual != expected:
+        raise _error("source_fingerprint_mismatch", "model source weights changed during materialization")
+
+
+def _resolve_publication_vlm_base(params: dict, recipe: dict):
+    from app.model_inspection import resolve_vlm_base
+
+    vlm_base_model_id = str(params.get("vlm_base_model_id") or "").strip()
+    try:
+        if not vlm_base_model_id:
+            return resolve_vlm_base(recipe)
+        from app.repositories import model_get_by_id
+
+        model = model_get_by_id(vlm_base_model_id)
+        return resolve_vlm_base(recipe, override_path=model.path) if model is not None else None
+    except ValueError as exc:
+        if "source_fingerprint_mismatch" in str(exc):
+            raise _error("source_fingerprint_mismatch", "recorded VLM source changed") from exc
+        return None
 
 
 def _materialize_recipe(task_id: str, params: dict, staging: str, progress: Callable, task_control: dict) -> dict:
@@ -164,64 +205,60 @@ def _materialize_recipe(task_id: str, params: dict, staging: str, progress: Call
 
     recipe_path, recipe = _resolve_recipe(params)
     recipe_sha256 = _hash_file(recipe_path)
+    parents = [os.path.realpath(str(path)) for path in recipe.get("model_paths") or []]
+    if not parents or any(not os.path.isdir(path) for path in parents):
+        raise _error("invalid_recipe", "managed recipe has unavailable parents")
+    is_vlm = recipe.get("artifact_type") == "vlm" or bool(recipe.get("vlm_path"))
+    vlm_inspection = _resolve_publication_vlm_base(params, recipe) if is_vlm else None
+    if is_vlm and vlm_inspection is None:
+        raise _error("vlm_base_missing", "recipe has no complete VLM base")
+
+    fingerprint_paths = list(parents)
+    if vlm_inspection is not None:
+        fingerprint_paths.append(vlm_inspection.path)
+    source_fingerprints = _fingerprint_sources(fingerprint_paths)
     provenance = {
         "recipe_sha256": recipe_sha256,
         "recipe_snapshot": json.loads(json.dumps(recipe)),
-        "parents": list(recipe.get("model_paths") or []),
+        "parents": parents,
+        "parent_fingerprints": [source_fingerprints[path] for path in parents],
         "vlm_base": {},
     }
-    is_vlm = recipe.get("artifact_type") == "vlm" or bool(recipe.get("vlm_path"))
     output_dir = staging if not is_vlm else "%s.language" % staging
-
-    result = run_recipe_apply_task(
-        task_id,
-        {**params, "recipe_id": params.get("recipe_id")},
-        progress,
-        task_control,
-        skip_register=True,
-        output_dir_override=output_dir,
-        metadata_type_override="model_publication",
-        metadata_extra={
-            "publication_id": _publication_id(task_id, params),
-            "display_name": params.get("display_name"),
-            "source_type": "recipe",
-        },
-    )
-    if result.get("status") != "success":
-        raise _error("materialization_failed", result.get("error", "recipe materialization failed"))
-    if not is_vlm:
-        if _hash_file(recipe_path) != recipe_sha256:
-            raise _error("invalid_recipe", "managed recipe changed during materialization")
-        return provenance
-    vlm_base_model_id = str(params.get("vlm_base_model_id") or "").strip()
-    if vlm_base_model_id:
-        from app.repositories import model_get_by_id
-        from app.model_inspection import resolve_vlm_base
-
-        model = model_get_by_id(vlm_base_model_id)
-        try:
-            vlm_inspection = resolve_vlm_base(recipe, override_path=model.path) if model is not None else None
-        except ValueError:
-            vlm_inspection = None
-    else:
-        from app.model_inspection import resolve_vlm_base
-
-        try:
-            vlm_inspection = resolve_vlm_base(recipe)
-        except ValueError:
-            vlm_inspection = None
-    if not vlm_inspection:
-        shutil.rmtree(output_dir, ignore_errors=True)
-        raise _error("vlm_base_missing", "recipe has no complete VLM base")
     try:
-        from evolution.vendor.vlm_merge.model_composition import materialize_full_vlm
+        result = run_recipe_apply_task(
+            task_id,
+            {**params, "recipe_id": params.get("recipe_id")},
+            progress,
+            task_control,
+            skip_register=True,
+            output_dir_override=output_dir,
+            metadata_type_override="model_publication",
+            metadata_extra={
+                "publication_id": _publication_id(task_id, params),
+                "display_name": params.get("display_name"),
+                "source_type": "recipe",
+            },
+        )
+        if result.get("status") != "success":
+            raise _error("materialization_failed", result.get("error", "recipe materialization failed"))
+        if is_vlm:
+            from evolution.vendor.vlm_merge.model_composition import materialize_full_vlm
 
-        materialize_full_vlm(output_dir, vlm_inspection.path, staging, recipe.get("dtype", "bfloat16"))
+            materialize_full_vlm(output_dir, vlm_inspection.path, staging, recipe.get("dtype", "bfloat16"))
     finally:
-        shutil.rmtree(output_dir, ignore_errors=True)
+        if is_vlm:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
     if _hash_file(recipe_path) != recipe_sha256:
         raise _error("invalid_recipe", "managed recipe changed during materialization")
-    provenance["vlm_base"] = _serialized_vlm_base(vlm_inspection, recipe.get("vlm_base"))
+    _assert_sources_unchanged(source_fingerprints)
+    if vlm_inspection is not None:
+        provenance["vlm_base"] = _serialized_vlm_base(
+            vlm_inspection,
+            recipe.get("vlm_base"),
+            source_fingerprints[os.path.realpath(vlm_inspection.path)],
+        )
     return provenance
 
 
@@ -333,6 +370,16 @@ def _nonnegative_decimal(value: object) -> int:
     return int(value)
 
 
+def _protected_gpu_uuids() -> set[str]:
+    raw = (os.environ.get("MERGEKIT_PROTECTED_GPU_UUIDS") or "").strip()
+    if not raw:
+        raise _error("protected_gpu_config_missing", "protected physical GPU UUIDs are not configured")
+    values = {value.strip() for value in raw.split(",") if value.strip()}
+    if not values or any(_GPU_UUID_PATTERN.fullmatch(value) is None for value in values):
+        raise _error("protected_gpu_config_invalid", "protected physical GPU UUIDs are invalid")
+    return values
+
+
 def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> list[dict]:
     """Fail-closed GPU check with model bytes + 10%/1 GiB inference headroom."""
     gpu_ids = _normalize_gpu_ids(gpu_ids)
@@ -342,7 +389,7 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
         topology_rows = query_gpus()
         result = subprocess.run(
             [
-                "nvidia-smi", "--query-gpu=index,uuid,memory.used,memory.total",
+                "nvidia-smi", "--query-gpu=index,uuid,pci.bus_id,memory.used,memory.total",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True, text=True, timeout=5,
@@ -352,7 +399,7 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
     if result.returncode != 0:
         raise _error("gpu_preflight_failed", "GPU inventory query failed")
 
-    uuid_pattern = re.compile(r"GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+    protected_uuids = _protected_gpu_uuids()
     topology = {}
     for gpu in topology_rows:
         if gpu.index in topology or gpu.mem_total_mib <= 0:
@@ -363,16 +410,18 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
     try:
         for line in result.stdout.splitlines():
             parts = [part.strip() for part in line.split(",")]
-            if len(parts) != 4:
+            if len(parts) != 5:
                 raise ValueError("invalid GPU row")
             index = _nonnegative_decimal(parts[0])
-            used = _nonnegative_decimal(parts[2])
-            total = _nonnegative_decimal(parts[3])
+            used = _nonnegative_decimal(parts[3])
+            total = _nonnegative_decimal(parts[4])
             uuid = parts[1]
+            pci_bus_id = parts[2]
             if (
                 index in snapshots
                 or uuid in uuids
-                or uuid_pattern.fullmatch(uuid) is None
+                or _GPU_UUID_PATTERN.fullmatch(uuid) is None
+                or _PCI_BUS_ID_PATTERN.fullmatch(pci_bus_id) is None
                 or total <= 0
                 or not 0 <= used <= total
             ):
@@ -381,6 +430,7 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
             snapshots[index] = {
                 "index": index,
                 "uuid": uuid,
+                "pci_bus_id": pci_bus_id,
                 "memory_used_mib": used,
                 "memory_total_mib": total,
                 "memory_free_mib": total - used,
@@ -394,6 +444,8 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
         gpu = topology.get(gpu_id)
         if snapshot is None or gpu is None or snapshot["memory_total_mib"] != gpu.mem_total_mib:
             raise _error("gpu_preflight_failed", "selected GPU inventory changed")
+        if snapshot["uuid"] in protected_uuids:
+            raise _error("protected_gpu", "selected physical GPU is protected")
         selected.append((snapshot, gpu))
 
     try:
@@ -426,7 +478,7 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
         try:
             valid = (
                 len(parts) == 2
-                and uuid_pattern.fullmatch(parts[0]) is not None
+                and _GPU_UUID_PATTERN.fullmatch(parts[0]) is not None
                 and _nonnegative_decimal(parts[1]) > 0
             )
         except (TypeError, ValueError):
@@ -438,11 +490,11 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
     return [snapshots[gpu_id] for gpu_id in gpu_ids]
 
 
-def validate_model_functionally(staging: str, gpu_ids: list[int], task_control: dict) -> dict:
+def validate_model_functionally(staging: str, gpu_devices: list[str], task_control: dict) -> dict:
     """Run real validation in a child whose CUDA visibility is explicitly scoped."""
     env = os.environ.copy()
     env["MERGEKIT_CLI_SCRIPT"] = "1"
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(value) for value in gpu_ids)
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_devices)
     process = subprocess.Popen(
         [sys.executable, "-m", "app.model_publication_tasks", "--functional-validation", staging],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -550,7 +602,11 @@ def run_publication_validation(
         if _cancelled(task_control):
             return _cancel_validation(task_id, params)
         progress(86, "Running functional validation")
-        functional = functional_validate_fn(staging, gpu_ids, task_control) or {"status": "passed"}
+        functional = functional_validate_fn(
+            staging,
+            [snapshot["uuid"] for snapshot in gpu_snapshot],
+            task_control,
+        ) or {"status": "passed"}
         if _cancelled(task_control):
             return _cancel_validation(task_id, params)
         inspection = inspect_model(staging)
