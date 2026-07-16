@@ -249,6 +249,107 @@ class PublicationRouteTest(unittest.TestCase):
         self.assertEqual(self.state.tasks["publication-task"]["status"], "running")
         self.assertEqual(self.state.tasks["merge-task"]["status"], "queued")
 
+    def test_generic_stop_rechecks_publication_target_after_waiting_for_scheduler_lock(self):
+        task_id = "race-target"
+        ordinary_process = mock.Mock(pid=222)
+        publication_process = mock.Mock(pid=111)
+        self.state.tasks[task_id] = {
+            "status": "queued",
+            "type": "merge",
+            "original_data": {"type": "merge"},
+            "control": {"aborted": False, "process": ordinary_process},
+        }
+        self.services.kill_process_tree_by_pid = mock.Mock()
+        result = {}
+        lock = self.state.scheduler_lock
+        guard_checked = threading.Event()
+        original_guard = self.services._publication_stop_denied
+
+        def observe_guard(*args, **kwargs):
+            denied = original_guard(*args, **kwargs)
+            guard_checked.set()
+            return denied
+
+        self.services._publication_stop_denied = observe_guard
+
+        lock.acquire()
+        try:
+            thread = threading.Thread(
+                target=lambda: result.update(self.services.stop_task_with_cleanup(task_id)),
+            )
+            thread.start()
+            guard_checked.wait(0.2)
+            self.state.tasks[task_id] = {
+                "status": "running",
+                "type": "model_publication",
+                "original_data": {"type": "model_publication"},
+                "control": {"aborted": False, "process": publication_process},
+            }
+        finally:
+            lock.release()
+        thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["error_code"], "publication_cancel_required")
+        self.assertEqual(self.state.tasks[task_id]["status"], "running")
+        self.assertFalse(self.state.tasks[task_id]["control"]["aborted"])
+        self.services.kill_process_tree_by_pid.assert_not_called()
+
+    def test_generic_stop_all_blocks_on_in_memory_publication_when_db_guard_fails(self):
+        merge_process = mock.Mock(pid=222)
+        publication_process = mock.Mock(pid=111)
+        self.state.tasks["merge-task"] = {
+            "status": "queued",
+            "type": "merge",
+            "original_data": {"type": "merge"},
+            "control": {"aborted": False, "process": merge_process},
+        }
+        self.state.task_queue.put((10, 1.0, "merge-task", {"type": "merge"}))
+        self.state.running_task_info.update({"id": "merge-task", "process": merge_process})
+        self.services.kill_process_tree_by_pid = mock.Mock()
+        result = {}
+        lock = self.state.scheduler_lock
+        guard_checked = threading.Event()
+        original_guard = self.services._publication_stop_denied
+
+        def observe_guard(*args, **kwargs):
+            denied = original_guard(*args, **kwargs)
+            guard_checked.set()
+            return denied
+
+        self.services._publication_stop_denied = observe_guard
+        db_guard = mock.patch(
+            "app.repositories.active_publication_tasks",
+            side_effect=RuntimeError("db unavailable"),
+        )
+        active_publication_tasks = db_guard.start()
+
+        lock.acquire()
+        try:
+            thread = threading.Thread(target=lambda: result.update(self.services.stop_all_active_tasks()))
+            thread.start()
+            guard_checked.wait(0.2)
+            self.state.tasks["publication-task"] = {
+                "status": "running",
+                "type": "model_publication",
+                "original_data": {"type": "model_publication"},
+                "control": {"aborted": False, "process": publication_process},
+            }
+        finally:
+            lock.release()
+        thread.join(5)
+        db_guard.stop()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["error_code"], "publication_cancel_required")
+        self.assertEqual(self.state.task_queue.qsize(), 1)
+        self.assertEqual(self.state.tasks["merge-task"]["status"], "queued")
+        self.assertFalse(self.state.tasks["merge-task"]["control"]["aborted"])
+        self.assertEqual(self.state.tasks["publication-task"]["status"], "running")
+        self.assertFalse(self.state.tasks["publication-task"]["control"]["aborted"])
+        active_publication_tasks.assert_not_called()
+        self.services.kill_process_tree_by_pid.assert_not_called()
+
     def test_validate_is_single_flight_and_marks_the_durable_enqueue(self):
         task_id = "single-flight"
         self._add_publication_task(task_id, "validating", {"publication_id": "single-flight", "display_name": "published"})
@@ -501,7 +602,10 @@ class PublicationRouteTest(unittest.TestCase):
         def build_manifest(*_args):
             manifest_started.set()
             release_manifest.wait(5)
-            return {"publication_id": publication_id}
+            return {
+                "publication_id": publication_id,
+                "files": {"entries": files, "total_bytes": total_bytes},
+            }
 
         def validate():
             with self.app.app_context():

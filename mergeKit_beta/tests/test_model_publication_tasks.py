@@ -303,6 +303,85 @@ class PublicationTaskTest(unittest.TestCase):
         functional.assert_not_called()
         self.assertEqual(task.status, "validating")
 
+    def test_validation_rechecks_manifest_inventory_after_functional_validation(self):
+        from app.models import Task
+        from app.model_publication_tasks import run_publication_validation
+
+        inspection = SimpleNamespace(
+            architectures=("Qwen2ForCausalLM",),
+            is_vlm=False,
+            model_type="qwen2",
+            processor_class=None,
+        )
+        with self.app.app_context():
+            staging = self._staging_task()
+
+            def functional_validate(path, *_args):
+                with open(os.path.join(path, "model.safetensors"), "ab") as handle:
+                    handle.write(b"mutated-after-baseline")
+                return {"status": "passed"}
+
+            with mock.patch("app.model_publication_tasks.publication_gpu_preflight", return_value=[{"index": 0}]):
+                with mock.patch("app.model_publication_tasks.inspect_model", return_value=inspection):
+                    with mock.patch("app.model_publication_tasks.inspect_serving_compatibility", return_value={"status": "ready"}):
+                        with mock.patch("app.model_publication_tasks.commit_staging") as commit:
+                            result = run_publication_validation(
+                                "task-a", [0], self.progress, {"aborted": False, "lock": threading.Lock()},
+                                functional_validate_fn=functional_validate,
+                            )
+            task = self.db.session.get(Task, "task-a")
+
+        self.assertEqual(result["status"], "validating")
+        self.assertEqual(result["error_code"], "staging_changed")
+        self.assertEqual(task.status, "validating")
+        self.assertEqual(task.config["error_code"], "staging_changed")
+        self.assertTrue(os.path.isdir(staging))
+        commit.assert_not_called()
+
+    def test_materialization_cancels_after_structural_validation_before_status_write(self):
+        from app.models import Task
+        from app.model_publication_tasks import run_model_publication_task
+
+        control = {"aborted": False}
+
+        def structural_validate(staging):
+            self.structural_validate(staging)
+            control["aborted"] = True
+            return {"status": "passed"}
+
+        with self.app.app_context():
+            self._add_task()
+            result = run_model_publication_task("task-a", self.request, self.progress, control, structural_validate_fn=structural_validate)
+            task = self.db.session.get(Task, "task-a")
+
+        self.assertEqual(result["status"], "canceled")
+        self.assertEqual(task.status, "canceled")
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".staging", "publication-a")))
+
+    def test_materialization_cancels_after_inventory_before_status_write(self):
+        from app.models import Task
+        from app.model_publication import _inventory as inventory
+        from app.model_publication_tasks import run_model_publication_task
+
+        control = {"aborted": False}
+
+        def inventory_then_cancel(*args, **kwargs):
+            result = inventory(*args, **kwargs)
+            control["aborted"] = True
+            return result
+
+        with self.app.app_context():
+            self._add_task()
+            with mock.patch("app.model_publication_tasks._inventory", side_effect=inventory_then_cancel):
+                result = run_model_publication_task(
+                    "task-a", self.request, self.progress, control, structural_validate_fn=self.structural_validate,
+                )
+            task = self.db.session.get(Task, "task-a")
+
+        self.assertEqual(result["status"], "canceled")
+        self.assertEqual(task.status, "canceled")
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".staging", "publication-a")))
+
     def test_materialization_error_leaves_terminal_failure_to_worker(self):
         from app.models import Task
         from app.model_publication_tasks import run_model_publication_task
@@ -354,10 +433,15 @@ class PublicationTaskTest(unittest.TestCase):
         inspection = SimpleNamespace(architectures=("Qwen2ForCausalLM",))
         with self.app.app_context():
             staging = self._staging_task()
+            baseline = self.db.session.get(Task, "task-a").config["staging_inventory"]
+            manifest = {
+                "publication_id": "publication-a",
+                "files": {"entries": baseline["files"], "total_bytes": baseline["total_bytes"]},
+            }
             with mock.patch("app.model_publication_tasks.publication_gpu_preflight", return_value=[{"index": 0}]):
                 with mock.patch("app.model_publication_tasks.inspect_model", return_value=inspection):
                     with mock.patch("app.model_publication_tasks.inspect_serving_compatibility", return_value={"status": "ready"}):
-                        with mock.patch("app.model_publication_tasks.build_manifest", return_value={"publication_id": "publication-a"}):
+                        with mock.patch("app.model_publication_tasks.build_manifest", return_value=manifest):
                             with mock.patch("app.model_publication_tasks.commit_staging", side_effect=OSError("rename failed")):
                                 result = run_publication_validation(
                                     "task-a", [0], self.progress, {"aborted": False, "lock": threading.Lock()},
@@ -370,6 +454,7 @@ class PublicationTaskTest(unittest.TestCase):
         self.assertTrue(os.path.isdir(staging))
 
     def test_vlm_cmmmu_result_is_recorded_in_manifest_evaluation(self):
+        from app.models import Task
         from app.model_publication_tasks import run_publication_validation
 
         inspection = SimpleNamespace(architectures=("Qwen2_5_VLForConditionalGeneration",))
@@ -380,10 +465,15 @@ class PublicationTaskTest(unittest.TestCase):
         }
         with self.app.app_context():
             self._staging_task()
+            baseline = self.db.session.get(Task, "task-a").config["staging_inventory"]
+            manifest = {
+                "publication_id": "publication-a",
+                "files": {"entries": baseline["files"], "total_bytes": baseline["total_bytes"]},
+            }
             with mock.patch("app.model_publication_tasks.publication_gpu_preflight", return_value=[{"index": 0}]):
                 with mock.patch("app.model_publication_tasks.inspect_model", return_value=inspection):
                     with mock.patch("app.model_publication_tasks.inspect_serving_compatibility", return_value={"status": "ready"}):
-                        with mock.patch("app.model_publication_tasks.build_manifest", return_value={"publication_id": "publication-a"}) as build:
+                        with mock.patch("app.model_publication_tasks.build_manifest", return_value=manifest) as build:
                             with mock.patch("app.model_publication_tasks.commit_staging", return_value={"publication_id": "publication-a"}):
                                 run_publication_validation(
                                     "task-a", [0], self.progress, {"aborted": False, "lock": threading.Lock()},
@@ -421,6 +511,31 @@ class PublicationTaskTest(unittest.TestCase):
             with mock.patch("app.model_publication_tasks.subprocess.run", side_effect=[completed(truncated_uuid), completed()]):
                 with self.assertRaisesRegex(PublicationError, "gpu_preflight_failed"):
                     publication_gpu_preflight([0], required_bytes=1)
+
+    def test_preflight_rejects_non_decimal_gpu_inventory_numbers(self):
+        from core.gpu_topology import GpuInfo
+        from app.model_publication import PublicationError
+        from app.model_publication_tasks import publication_gpu_preflight
+
+        topology = [GpuInfo(index=0, mem_free_mib=24476, mem_total_mib=24576)]
+
+        def completed(stdout="", returncode=0, stderr=""):
+            return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+        with mock.patch("core.gpu_topology.query_gpus", return_value=topology):
+            for field_index in range(3):
+                for invalid in ("1.0", "1e3", "+1", "-1", ""):
+                    with self.subTest(field_index=field_index, invalid=invalid):
+                        line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 100, 24576\n"
+                        if field_index == 0:
+                            line = "%s, GPU-23348268-6430-c539-b7e5-762583f50e91, 100, 24576\n" % invalid
+                        elif field_index == 1:
+                            line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, %s, 24576\n" % invalid
+                        else:
+                            line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 100, %s\n" % invalid
+                        with mock.patch("app.model_publication_tasks.subprocess.run", side_effect=[completed(line), completed()]):
+                            with self.assertRaisesRegex(PublicationError, "gpu_preflight_failed"):
+                                publication_gpu_preflight([0], required_bytes=1)
 
     def test_preflight_uses_new_inventory_snapshot_not_topology_free_memory(self):
         from core.gpu_topology import GpuInfo

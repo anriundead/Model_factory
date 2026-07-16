@@ -209,6 +209,16 @@ def _structural_result(staging: str, structural_validate_fn: Callable) -> tuple[
     return value, {"status": "passed"}
 
 
+def _manifest_matches_inventory(manifest: dict, baseline: object) -> bool:
+    files = manifest.get("files") if isinstance(manifest, dict) else None
+    if not isinstance(files, dict):
+        return False
+    return baseline == {
+        "files": files.get("entries"),
+        "total_bytes": files.get("total_bytes"),
+    }
+
+
 def run_model_publication_task(
     task_id: str,
     params: dict,
@@ -243,7 +253,11 @@ def run_model_publication_task(
             raise _error("canceled", "publication canceled")
         progress(65, "Validating publication structure")
         inspection, structural = _structural_result(staging, structural_validate_fn)
+        if _cancelled(task_control):
+            raise _error("canceled", "publication canceled")
         files, total_bytes = _inventory(staging, include_hash=True)
+        if _cancelled(task_control):
+            raise _error("canceled", "publication canceled")
         _set_status(
             task_id,
             "validating",
@@ -280,6 +294,12 @@ def _normalize_gpu_ids(gpu_ids: list[int]) -> list[int]:
     return normalized
 
 
+def _nonnegative_decimal(value: object) -> int:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value) is None:
+        raise ValueError("not a nonnegative decimal integer")
+    return int(value)
+
+
 def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> list[dict]:
     """Fail-closed GPU check with model bytes + 10%/1 GiB inference headroom."""
     gpu_ids = _normalize_gpu_ids(gpu_ids)
@@ -312,9 +332,9 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
             parts = [part.strip() for part in line.split(",")]
             if len(parts) != 4:
                 raise ValueError("invalid GPU row")
-            index = int(parts[0])
-            used = int(float(parts[2]))
-            total = int(float(parts[3]))
+            index = _nonnegative_decimal(parts[0])
+            used = _nonnegative_decimal(parts[2])
+            total = _nonnegative_decimal(parts[3])
             uuid = parts[1]
             if (
                 index in snapshots
@@ -510,6 +530,8 @@ def run_publication_validation(
             validation,
             compatibility,
         )
+        if not _manifest_matches_inventory(manifest, baseline):
+            raise _error("staging_changed", "publication staging changed during validation")
     except PublicationError as exc:
         if exc.code == "canceled":
             return _cancel_validation(task_id, params)

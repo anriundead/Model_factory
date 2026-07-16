@@ -1071,6 +1071,14 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
             task = self.state.tasks.get(task_id)
             if self._memory_task_type(task) == "model_publication":
                 return {"ok": False, "error_code": "publication_cancel_required", "message": publication_message}
+        else:
+            for task in self.state.tasks.values():
+                if (
+                    isinstance(task, dict)
+                    and task.get("status") in self._ACTIVE_PUBLICATION_STATUSES
+                    and self._memory_task_type(task) == "model_publication"
+                ):
+                    return {"ok": False, "error_code": "publication_cancel_required", "message": publication_message}
         app = getattr(self, "app", None)
         if not app:
             return None
@@ -1172,12 +1180,12 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
         return ids
 
     def stop_task_with_cleanup(self, task_id: str, message: str = "任务已手动停止") -> dict:
-        denied = self._publication_stop_denied(task_id)
-        if denied is not None:
-            return denied
-        if task_id not in self.state.tasks:
-            return {"ok": False, "message": "任务不存在"}
         with self.state.scheduler_lock:
+            denied = self._publication_stop_denied(task_id)
+            if denied is not None:
+                return denied
+            if task_id not in self.state.tasks:
+                return {"ok": False, "message": "任务不存在"}
             task = self.state.tasks[task_id]
             task["status"] = "stopped"
             task["message"] = message
@@ -1204,13 +1212,13 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
         return {"ok": True, "task_id": task_id, **cleanup}
 
     def stop_all_active_tasks(self, message: str = "任务已手动停止") -> dict:
-        denied = self._publication_stop_denied()
-        if denied is not None:
-            return denied
-        stopped_ids = self._collect_active_task_ids()
         killed_pids = set()
 
         with self.state.scheduler_lock:
+            denied = self._publication_stop_denied()
+            if denied is not None:
+                return denied
+            stopped_ids = self._collect_active_task_ids()
             run_proc = self.state.running_task_info.get("process")
             if run_proc and run_proc.pid not in killed_pids:
                 try:
