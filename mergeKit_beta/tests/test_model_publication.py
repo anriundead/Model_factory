@@ -1,7 +1,9 @@
 import json
 import os
+import shutil
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -81,6 +83,18 @@ class PublicationFilesystemTest(unittest.TestCase):
     def _register(self, path, manifest):
         self.registered.append((os.path.realpath(path), manifest["publication_id"]))
 
+    def _new_staging(self, publication_id):
+        staging = os.path.join(self.root, ".staging", publication_id)
+        self._write_model(staging)
+        request = dict(self.request, publication_id=publication_id, task_id="task-%s" % publication_id)
+        return staging, build_manifest(
+            staging,
+            request,
+            inspect_model(staging),
+            validation={"structural": {"status": "passed"}},
+            compatibility={"serving": {"backend": "vllm", "status": "ready", "tested_version": "0.7.0"}},
+        )
+
     def test_commit_is_atomic_and_manifest_excludes_itself_from_hashes(self):
         committed = commit_staging(self.staging, self.root, self._manifest(), register_fn=self._register)
 
@@ -120,8 +134,10 @@ class PublicationFilesystemTest(unittest.TestCase):
             second = reconcile_publications(self.root, register_fn=self._register)
 
         self.assertEqual(first["registered"], 1)
-        self.assertEqual(second["registered"], 0)
-        self.assertEqual(len(self.registered), 1)
+        self.assertEqual(first["published"], 1)
+        self.assertEqual(second["registered"], 1)
+        self.assertEqual(second["published"], 0)
+        self.assertEqual(len(self.registered), 2)
 
     def test_invalid_hash_is_quarantined(self):
         committed = commit_staging(self.staging, self.root, self._manifest(), register_fn=self._register)
@@ -161,7 +177,7 @@ class PublicationFilesystemTest(unittest.TestCase):
         old = time.time() - 2 * 24 * 60 * 60
         os.utime(stale, (old, old))
 
-        result = reconcile_publications(self.root, register_fn=self._register)
+        result = reconcile_publications(self.root, register_fn=self._register, active_check_fn=lambda task_id: False)
 
         diagnostic = os.path.join(self.root, ".diagnostics", "stale-publication.json")
         self.assertEqual(result["staging_cleaned"], 1)
@@ -182,6 +198,260 @@ class PublicationFilesystemTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.root, ".trash", committed["publication_id"])))
         reference_check.assert_called_once_with(committed["publication_id"], os.path.realpath(final))
         delete_model.assert_called_once_with(os.path.realpath(final))
+
+    def test_commit_rejects_arbitrary_or_changed_staging(self):
+        arbitrary = os.path.join(self.tmpdir.name, self.publication_id)
+        self._write_model(arbitrary)
+        arbitrary_manifest = build_manifest(
+            arbitrary, self.request, inspect_model(arbitrary), {"structural": {}}, {"serving": {"status": "ready"}}
+        )
+        with self.assertRaisesRegex(PublicationError, "staging_invalid"):
+            commit_staging(arbitrary, self.root, arbitrary_manifest, self._register)
+
+        manifest = self._manifest()
+        with open(os.path.join(self.staging, "model.safetensors"), "ab") as handle:
+            handle.write(b"changed")
+        with self.assertRaisesRegex(PublicationError, "validation_failed"):
+            commit_staging(self.staging, self.root, manifest, self._register)
+
+    def test_validate_rejects_wrong_directory_and_manifest_contract(self):
+        committed = commit_staging(self.staging, self.root, self._manifest(), self._register)
+        final = os.path.join(self.root, committed["publication_id"])
+        renamed = os.path.join(self.root, "wrong-directory")
+        os.rename(final, renamed)
+        with self.assertRaisesRegex(PublicationError, "validation_failed"):
+            validate_published_asset(renamed)
+
+        os.rename(renamed, final)
+        manifest_path = os.path.join(final, "publication_manifest.json")
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        manifest["files"]["hash_algorithm"] = "md5"
+        manifest["capabilities"] = ["vision_language"]
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+        with self.assertRaisesRegex(PublicationError, "validation_failed"):
+            validate_published_asset(final)
+
+    def test_structural_validation_does_not_hash_files(self):
+        committed = commit_staging(self.staging, self.root, self._manifest(), self._register)
+        final = os.path.join(self.root, committed["publication_id"])
+        with mock.patch("app.model_publication._hash_file", side_effect=AssertionError("unexpected hash")):
+            validate_published_asset(final, full_hash=False)
+
+    def test_manifest_temp_files_do_not_invalidate_asset(self):
+        committed = commit_staging(self.staging, self.root, self._manifest(), self._register)
+        final = os.path.join(self.root, committed["publication_id"])
+        with open(os.path.join(final, ".manifest-interrupted.json"), "w", encoding="utf-8") as handle:
+            handle.write("partial")
+
+        validate_published_asset(final, full_hash=True)
+        with mock.patch("app.model_publication.inspect_serving_compatibility", return_value={"backend": "vllm", "status": "ready", "tested_version": "0.7.0"}):
+            result = reconcile_publications(self.root, self._register)
+        self.assertEqual(result["quarantined"], 0)
+
+    def test_symlinked_root_and_control_directories_are_rejected(self):
+        real_root = os.path.join(self.tmpdir.name, "real-root")
+        os.makedirs(real_root)
+        shutil.rmtree(self.root)
+        os.symlink(real_root, self.root)
+        with self.assertRaisesRegex(PublicationError, "unsafe_path"):
+            reconcile_publications(self.root, self._register)
+
+        os.unlink(self.root)
+        os.makedirs(self.root)
+        os.symlink(self.tmpdir.name, os.path.join(self.root, ".staging"))
+        self._write_model(self.staging)
+        with self.assertRaisesRegex(PublicationError, "unsafe_path"):
+            commit_staging(self.staging, self.root, self._manifest(), self._register)
+
+    def test_reconcile_rejects_unused_symlinked_control_directory(self):
+        os.makedirs(self.root, exist_ok=True)
+        os.symlink(self.tmpdir.name, os.path.join(self.root, ".diagnostics"))
+
+        with self.assertRaisesRegex(PublicationError, "unsafe_path"):
+            reconcile_publications(self.root, self._register)
+
+    def test_active_or_unknown_old_staging_is_preserved(self):
+        stale = os.path.join(self.root, ".staging", "stale-publication")
+        self._write_model(stale)
+        old = time.time() - 2 * 24 * 60 * 60
+        os.utime(stale, (old, old))
+
+        active = reconcile_publications(self.root, self._register, active_check_fn=lambda task_id: True)
+        unknown = reconcile_publications(self.root, self._register, active_check_fn=lambda task_id: None)
+
+        self.assertEqual(active["staging_cleaned"], 0)
+        self.assertEqual(unknown["staging_cleaned"], 0)
+        self.assertTrue(os.path.isdir(stale))
+
+    def test_empty_publication_root_has_no_staging_error(self):
+        empty_root = os.path.join(self.tmpdir.name, "empty-published")
+        result = reconcile_publications(empty_root, self._register, active_check_fn=lambda task_id: False)
+
+        self.assertEqual(result["staging_cleaned"], 0)
+        self.assertEqual(result["errors"], [])
+
+    def test_recovery_isolates_bad_assets_and_restores_published_rows(self):
+        first_staging, first_manifest = self._new_staging("publication-a")
+        second_staging, second_manifest = self._new_staging("publication-b")
+        first = commit_staging(first_staging, self.root, first_manifest, lambda path, manifest: None)
+        second = commit_staging(second_staging, self.root, second_manifest, lambda path, manifest: None)
+        with open(os.path.join(self.root, first["publication_id"], "model.safetensors"), "ab") as handle:
+            handle.write(b"bad")
+        calls = []
+
+        with mock.patch("app.model_publication.inspect_serving_compatibility", return_value={"backend": "vllm", "status": "ready", "tested_version": "0.7.0"}):
+            result = reconcile_publications(self.root, lambda path, manifest: calls.append(manifest["publication_id"]))
+
+        self.assertEqual(result["quarantined"], 1)
+        self.assertEqual(calls, [second["publication_id"]])
+
+    def test_recovery_filesystem_error_does_not_block_later_assets(self):
+        first_staging, first_manifest = self._new_staging("publication-a")
+        second_staging, second_manifest = self._new_staging("publication-b")
+        first = commit_staging(first_staging, self.root, first_manifest, lambda path, manifest: None)
+        second = commit_staging(second_staging, self.root, second_manifest, lambda path, manifest: None)
+        with open(os.path.join(self.root, first["publication_id"], "model.safetensors"), "ab") as handle:
+            handle.write(b"bad")
+        calls = []
+
+        with mock.patch("app.model_publication._quarantine_locked", side_effect=OSError("disk busy")), mock.patch(
+            "app.model_publication.inspect_serving_compatibility",
+            return_value={"backend": "vllm", "status": "ready", "tested_version": "0.7.0"},
+        ):
+            result = reconcile_publications(self.root, lambda path, manifest: calls.append(manifest["publication_id"]))
+
+        self.assertEqual(calls, [second["publication_id"]])
+        self.assertTrue(any(error["asset"] == first["publication_id"] for error in result["errors"]))
+
+    def test_recovery_keeps_transient_failures_and_continues(self):
+        assets = []
+        for publication_id in ("publication-a", "publication-b", "publication-c"):
+            staging, manifest = self._new_staging(publication_id)
+            assets.append(commit_staging(staging, self.root, manifest, lambda path, manifest: None))
+        calls = []
+
+        def register(path, manifest):
+            calls.append(manifest["publication_id"])
+            if manifest["publication_id"] == "publication-b":
+                raise RuntimeError("database transient")
+
+        with mock.patch(
+            "app.model_publication.inspect_serving_compatibility",
+            side_effect=[RuntimeError("vllm transient"), {"backend": "vllm", "status": "ready", "tested_version": "0.7.0"}, {"backend": "vllm", "status": "ready", "tested_version": "0.7.0"}],
+        ):
+            result = reconcile_publications(self.root, register)
+
+        self.assertEqual(calls, ["publication-b", "publication-c"])
+        self.assertEqual({error["asset"] for error in result["errors"]}, {"publication-a", "publication-b"})
+        self.assertTrue(all(os.path.isdir(os.path.join(self.root, asset["publication_id"])) for asset in assets))
+
+    def test_delete_waits_for_reconcile_without_recreating_asset(self):
+        committed = commit_staging(self.staging, self.root, self._manifest(), self._register)
+        entered = threading.Event()
+        release = threading.Event()
+        deleted = []
+
+        def register(path, manifest):
+            entered.set()
+            release.wait(1)
+
+        def reconcile():
+            reconcile_publications(self.root, register)
+
+        def delete():
+            deleted.append(delete_published_asset(committed["publication_id"], self.root, lambda publication_id, path: False, lambda path: True))
+
+        with mock.patch("app.model_publication.inspect_serving_compatibility", return_value={"backend": "vllm", "status": "ready", "tested_version": "0.7.0"}):
+            reconcile_thread = threading.Thread(target=reconcile)
+            reconcile_thread.start()
+            self.assertTrue(entered.wait(1))
+            delete_thread = threading.Thread(target=delete)
+            delete_thread.start()
+            self.assertTrue(delete_thread.is_alive())
+            release.set()
+            reconcile_thread.join(2)
+            delete_thread.join(2)
+
+        self.assertFalse(reconcile_thread.is_alive())
+        self.assertFalse(delete_thread.is_alive())
+        self.assertEqual(deleted, [{"publication_id": committed["publication_id"], "deleted": True}])
+        self.assertFalse(os.path.exists(os.path.join(self.root, committed["publication_id"])))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "publication_manifest.json")))
+
+    def test_commit_and_reconcile_do_not_double_transition(self):
+        entered = threading.Event()
+        release = threading.Event()
+        committed = []
+        reconciled = []
+
+        def register(path, manifest):
+            entered.set()
+            release.wait(1)
+
+        def commit():
+            committed.append(commit_staging(self.staging, self.root, self._manifest(), register))
+
+        def reconcile():
+            reconciled.append(reconcile_publications(self.root, lambda path, manifest: None))
+
+        with mock.patch("app.model_publication.inspect_serving_compatibility", return_value={"backend": "vllm", "status": "ready", "tested_version": "0.7.0"}):
+            commit_thread = threading.Thread(target=commit)
+            commit_thread.start()
+            self.assertTrue(entered.wait(1))
+            reconcile_thread = threading.Thread(target=reconcile)
+            reconcile_thread.start()
+            release.set()
+            commit_thread.join(2)
+            reconcile_thread.join(2)
+
+        self.assertFalse(commit_thread.is_alive())
+        self.assertFalse(reconcile_thread.is_alive())
+        self.assertEqual(committed[0]["publication_state"], "published")
+        self.assertEqual(reconciled[0]["published"], 0)
+        self.assertEqual(validate_published_asset(os.path.join(self.root, self.publication_id))["publication_state"], "published")
+
+    def test_delete_rejects_symlinked_asset_and_trash(self):
+        committed = commit_staging(self.staging, self.root, self._manifest(), self._register)
+        final = os.path.join(self.root, committed["publication_id"])
+        shutil.rmtree(final)
+        os.symlink(self.tmpdir.name, final)
+        with self.assertRaisesRegex(PublicationError, "unsafe_path"):
+            delete_published_asset(committed["publication_id"], self.root, lambda publication_id, path: False, lambda path: True)
+
+        os.unlink(final)
+        staging, manifest = self._new_staging(committed["publication_id"])
+        commit_staging(staging, self.root, manifest, self._register)
+        os.symlink(self.tmpdir.name, os.path.join(self.root, ".trash"))
+        with self.assertRaisesRegex(PublicationError, "unsafe_path"):
+            delete_published_asset(committed["publication_id"], self.root, lambda publication_id, path: False, lambda path: True)
+
+    def test_two_reconcilers_transition_pending_once(self):
+        with self.assertRaisesRegex(RuntimeError, "pending"):
+            commit_staging(self.staging, self.root, self._manifest(), lambda path, manifest: (_ for _ in ()).throw(RuntimeError("pending")))
+        calls = []
+        results = []
+        start = threading.Event()
+
+        def register(path, manifest):
+            start.wait(1)
+            calls.append(manifest["publication_id"])
+
+        def reconcile():
+            results.append(reconcile_publications(self.root, register))
+
+        with mock.patch("app.model_publication.inspect_serving_compatibility", return_value={"backend": "vllm", "status": "ready", "tested_version": "0.7.0"}):
+            threads = [threading.Thread(target=reconcile) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            start.set()
+            for thread in threads:
+                thread.join(2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(sum(result["published"] for result in results), 1)
+        self.assertEqual(validate_published_asset(os.path.join(self.root, self.publication_id))["publication_state"], "published")
 
 
 class ServingCompatibilityTest(unittest.TestCase):
@@ -219,6 +489,25 @@ class ServingCompatibilityTest(unittest.TestCase):
 
 
 class PublishedSyncGuardTest(unittest.TestCase):
+    def test_publication_task_active_check_is_fail_closed(self):
+        from app.repositories import publication_task_is_active
+
+        def check(rows):
+            query = mock.Mock()
+            query.filter.return_value = query
+            query.all.return_value = rows
+            with mock.patch("app.repositories.db.session.query", return_value=query):
+                return publication_task_is_active("publication-001")
+
+        active = SimpleNamespace(id="task-001", task_type="model_publication", status="validating", config={"publication_id": "publication-001"})
+        complete = SimpleNamespace(id="task-001", task_type="model_publication", status="completed", config={"publication_id": "publication-001"})
+        other = SimpleNamespace(id="task-001", task_type="merge", status="running", config={"publication_id": "publication-001"})
+        self.assertTrue(check([active]))
+        self.assertFalse(check([complete]))
+        self.assertFalse(check([other]))
+        with mock.patch("app.repositories.db.session.query", side_effect=RuntimeError("db unavailable")):
+            self.assertIsNone(publication_task_is_active("publication-001"))
+
     def test_published_registration_uses_core_orm_fields_only(self):
         from app.repositories import model_register_published
 

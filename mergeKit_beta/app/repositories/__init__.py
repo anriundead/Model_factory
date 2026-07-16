@@ -203,6 +203,28 @@ def model_register_published(path: str, manifest: dict) -> Model:
     )
 
 
+def publication_task_is_active(task_id: str) -> bool | None:
+    """Return None when task state cannot be read so staging cleanup fails closed."""
+    publication_id = (task_id or "").strip()
+    active_statuses = {"queued", "materializing", "validating", "registration_pending", "running"}
+    try:
+        tasks = (
+            db.session.query(Task)
+            .filter(Task.task_type == "model_publication")
+            .filter(Task.status.in_(active_statuses))
+            .all()
+        )
+    except Exception:
+        return None
+    for task in tasks:
+        config = task.config if isinstance(task.config, dict) else {}
+        if task.task_type == "model_publication" and task.status in active_statuses and (
+            task.id == publication_id or config.get("publication_id") == publication_id
+        ):
+            return True
+    return False
+
+
 def model_get_by_path(path: str) -> Model | None:
     """按路径查询模型。"""
     path = path.rstrip("/")
