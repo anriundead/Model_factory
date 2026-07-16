@@ -132,6 +132,7 @@ def atomic_write_json(path: str, payload: dict) -> None:
     parent = _directory(os.path.dirname(path))
     fd, temporary = tempfile.mkstemp(prefix=".manifest-", suffix=".json", dir=parent)
     try:
+        os.fchmod(fd, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.flush()
@@ -312,6 +313,31 @@ def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
         timestamps = manifest["timestamps"]
         if not isinstance(provenance, dict) or not isinstance(provenance.get("task_id"), str) or not provenance["task_id"].strip():
             raise ValueError("provenance")
+        recipe_path = provenance.get("recipe_path")
+        if recipe_path is not None:
+            recipe_snapshot = provenance.get("recipe_snapshot")
+            parents = provenance.get("parents")
+            if (
+                not isinstance(recipe_path, str)
+                or not recipe_path.strip()
+                or not _sha256(provenance.get("recipe_sha256"))
+                or not isinstance(recipe_snapshot, dict)
+                or not recipe_snapshot
+                or not isinstance(parents, list)
+                or not parents
+            ):
+                raise ValueError("recipe provenance")
+            if artifact_type == "vlm":
+                vlm_base = provenance.get("vlm_base")
+                if (
+                    not isinstance(vlm_base, dict)
+                    or not isinstance(vlm_base.get("source_path"), str)
+                    or not vlm_base["source_path"].strip()
+                    or not _sha256(vlm_base.get("config_sha256"))
+                    or not isinstance(vlm_base.get("visual_weight_count"), int)
+                    or vlm_base["visual_weight_count"] < 1
+                ):
+                    raise ValueError("VLM base provenance")
         if not isinstance(model, dict) or not isinstance(model.get("model_type"), str) or not model["model_type"].strip():
             raise ValueError("model")
         architectures = model.get("architectures")

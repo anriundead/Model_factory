@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -40,7 +41,7 @@ class PublicationFilesystemTest(unittest.TestCase):
             "display_name": "Published test model",
             "task_id": "task-001",
             "recipe_path": "recipes/task-001.json",
-            "recipe_sha256": "recipe-sha",
+            "recipe_sha256": "a" * 64,
             "recipe_snapshot": {"models": ["parent-a"]},
             "parents": ["parent-a"],
             "dtype": "bfloat16",
@@ -101,6 +102,10 @@ class PublicationFilesystemTest(unittest.TestCase):
         final = os.path.join(self.root, committed["publication_id"])
         self.assertFalse(os.path.exists(self.staging))
         self.assertTrue(os.path.isfile(os.path.join(final, "publication_manifest.json")))
+        self.assertEqual(
+            stat.S_IMODE(os.stat(os.path.join(final, "publication_manifest.json")).st_mode),
+            0o644,
+        )
         self.assertEqual(committed["publication_state"], "published")
         paths = [item["path"] for item in committed["files"]["entries"]]
         self.assertNotIn("publication_manifest.json", paths)
@@ -119,6 +124,25 @@ class PublicationFilesystemTest(unittest.TestCase):
         final = os.path.join(self.root, self.publication_id)
         manifest = validate_published_asset(final, full_hash=True)
         self.assertEqual(manifest["publication_state"], "registration_pending")
+
+    def test_recipe_manifest_rejects_missing_snapshot_and_hash(self):
+        manifest = self._manifest()
+        manifest["provenance"]["recipe_snapshot"] = {}
+        manifest["provenance"]["recipe_sha256"] = None
+
+        with self.assertRaisesRegex(PublicationError, "manifest contract is invalid"):
+            commit_staging(self.staging, self.root, manifest, register_fn=self._register)
+
+    def test_vlm_recipe_manifest_requires_complete_vlm_base_provenance(self):
+        manifest = self._manifest()
+        manifest["artifact_type"] = "vlm"
+        manifest["capabilities"] = ["text_generation", "vision_language"]
+        manifest["model"]["model_type"] = "qwen2_5_vl"
+        manifest["model"]["architectures"] = ["Qwen2_5_VLForConditionalGeneration"]
+        manifest["provenance"]["vlm_base"] = {}
+
+        with self.assertRaisesRegex(PublicationError, "manifest contract is invalid"):
+            commit_staging(self.staging, self.root, manifest, register_fn=self._register)
 
     def test_reconcile_registers_pending_once(self):
         with self.assertRaisesRegex(RuntimeError, "database unavailable"):

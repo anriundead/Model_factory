@@ -20,6 +20,7 @@ from typing import Callable
 from app.model_inspection import inspect_model
 from app.model_publication import (
     PublicationError,
+    _hash_file,
     _inventory,
     build_manifest,
     commit_staging,
@@ -142,10 +143,33 @@ def _recipe_model_paths(params: dict) -> list[str]:
     return paths
 
 
-def _materialize_recipe(task_id: str, params: dict, staging: str, progress: Callable, task_control: dict) -> None:
+def _serialized_vlm_base(inspection, recorded: object) -> dict:
+    value = dict(recorded) if isinstance(recorded, dict) else {}
+    value.update({
+        "source_path": inspection.path,
+        "model_type": inspection.model_type,
+        "architectures": list(inspection.architectures),
+        "processor_class": inspection.processor_class,
+        "image_token_ids": dict(inspection.image_token_ids),
+        "visual_weight_count": inspection.visual_weight_count,
+        "language_weight_count": inspection.language_weight_count,
+        "language_signature": list(inspection.language_signature),
+        "config_sha256": inspection.config_sha256,
+    })
+    return value
+
+
+def _materialize_recipe(task_id: str, params: dict, staging: str, progress: Callable, task_control: dict) -> dict:
     from merge_manager import run_recipe_apply_task
 
-    _recipe_path, recipe = _resolve_recipe(params)
+    recipe_path, recipe = _resolve_recipe(params)
+    recipe_sha256 = _hash_file(recipe_path)
+    provenance = {
+        "recipe_sha256": recipe_sha256,
+        "recipe_snapshot": json.loads(json.dumps(recipe)),
+        "parents": list(recipe.get("model_paths") or []),
+        "vlm_base": {},
+    }
     is_vlm = recipe.get("artifact_type") == "vlm" or bool(recipe.get("vlm_path"))
     output_dir = staging if not is_vlm else "%s.language" % staging
 
@@ -166,7 +190,9 @@ def _materialize_recipe(task_id: str, params: dict, staging: str, progress: Call
     if result.get("status") != "success":
         raise _error("materialization_failed", result.get("error", "recipe materialization failed"))
     if not is_vlm:
-        return
+        if _hash_file(recipe_path) != recipe_sha256:
+            raise _error("invalid_recipe", "managed recipe changed during materialization")
+        return provenance
     vlm_base_model_id = str(params.get("vlm_base_model_id") or "").strip()
     if vlm_base_model_id:
         from app.repositories import model_get_by_id
@@ -174,25 +200,29 @@ def _materialize_recipe(task_id: str, params: dict, staging: str, progress: Call
 
         model = model_get_by_id(vlm_base_model_id)
         try:
-            vlm_base = resolve_vlm_base(recipe, override_path=model.path).path if model is not None else None
+            vlm_inspection = resolve_vlm_base(recipe, override_path=model.path) if model is not None else None
         except ValueError:
-            vlm_base = None
+            vlm_inspection = None
     else:
         from app.model_inspection import resolve_vlm_base
 
         try:
-            vlm_base = resolve_vlm_base(recipe).path
+            vlm_inspection = resolve_vlm_base(recipe)
         except ValueError:
-            vlm_base = None
-    if not vlm_base:
+            vlm_inspection = None
+    if not vlm_inspection:
         shutil.rmtree(output_dir, ignore_errors=True)
         raise _error("vlm_base_missing", "recipe has no complete VLM base")
     try:
         from evolution.vendor.vlm_merge.model_composition import materialize_full_vlm
 
-        materialize_full_vlm(output_dir, vlm_base, staging, recipe.get("dtype", "bfloat16"))
+        materialize_full_vlm(output_dir, vlm_inspection.path, staging, recipe.get("dtype", "bfloat16"))
     finally:
         shutil.rmtree(output_dir, ignore_errors=True)
+    if _hash_file(recipe_path) != recipe_sha256:
+        raise _error("invalid_recipe", "managed recipe changed during materialization")
+    provenance["vlm_base"] = _serialized_vlm_base(vlm_inspection, recipe.get("vlm_base"))
+    return provenance
 
 
 def validate_staging_model(staging: str) -> dict:
@@ -244,8 +274,9 @@ def run_model_publication_task(
         progress(5, "Materializing publication")
         if os.path.lexists(staging):
             raise _error("publication_exists", "staging directory already exists")
+        provenance = {}
         if source is None:
-            _materialize_recipe(task_id, params, staging, progress, task_control)
+            provenance = _materialize_recipe(task_id, params, staging, progress, task_control) or {}
         elif copy_fn is shutil.copytree:
             _copy_tree_cooperatively(source, staging, task_control)
         else:
@@ -266,6 +297,7 @@ def run_model_publication_task(
                 "staging_path": staging,
                 "structural_validation": structural,
                 "staging_inventory": {"files": files, "total_bytes": total_bytes},
+                **provenance,
             },
         )
         progress(80, "Awaiting explicit GPU validation")
@@ -572,14 +604,23 @@ def run_publication_validation(
             "completed",
             error="",
             model_path=os.path.join(_root(params), committed["publication_id"]),
-            config_patch={"commit_in_progress": False, "publication_id": committed["publication_id"], "error_code": None},
+            config_patch={
+                "commit_in_progress": False,
+                "publication_id": committed["publication_id"],
+                "error_code": None,
+                "validation_enqueued": False,
+            },
         )
     except Exception as exc:
         _set_status(
             task_id,
             "registration_pending",
             error=str(exc),
-            config_patch={"commit_in_progress": False, "error_code": "registration_pending"},
+            config_patch={
+                "commit_in_progress": False,
+                "error_code": "registration_pending",
+                "validation_enqueued": False,
+            },
         )
         return {"status": "registration_pending", "error_code": "registration_pending", "error": str(exc)}
     progress(100, "Publication complete")

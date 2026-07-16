@@ -467,6 +467,7 @@ class PublicationTaskTest(unittest.TestCase):
             self._staging_task()
             task = self.db.session.get(Task, "task-a")
             task.error = "old validation failure"
+            task.config = {**task.config, "validation_enqueued": True}
             self.db.session.commit()
             baseline = task.config["staging_inventory"]
             manifest = {
@@ -487,6 +488,7 @@ class PublicationTaskTest(unittest.TestCase):
         self.assertEqual(build.call_args.args[3]["evaluation"], functional["evaluation"])
         self.assertEqual(task.status, "completed")
         self.assertEqual(task.error, "")
+        self.assertFalse(task.config["validation_enqueued"])
 
     def test_preflight_fails_closed_for_process_query_memory_and_uuid(self):
         from core.gpu_topology import GpuInfo
@@ -703,10 +705,61 @@ class PublicationTaskTest(unittest.TestCase):
         with self.app.app_context():
             with mock.patch("app.model_publication_tasks._resolve_recipe", return_value=(recipe, recipe_data)):
                 with mock.patch("merge_manager.run_recipe_apply_task", return_value={"status": "success"}):
-                    with mock.patch("app.model_inspection.resolve_vlm_base", return_value=SimpleNamespace(path=self.current_source)):
+                    inspection = SimpleNamespace(
+                        path=self.current_source,
+                        model_type="qwen2_5_vl",
+                        architectures=("Qwen2_5_VLForConditionalGeneration",),
+                        processor_class="Qwen2_5_VLProcessor",
+                        image_token_ids={"image_token_id": 7},
+                        visual_weight_count=3,
+                        language_weight_count=4,
+                        language_signature=(8, 1, 32),
+                        config_sha256="a" * 64,
+                    )
+                    with mock.patch("app.model_inspection.resolve_vlm_base", return_value=inspection):
                         with mock.patch("evolution.vendor.vlm_merge.model_composition.materialize_full_vlm") as materialize:
-                            _materialize_recipe("task-vlm", params, os.path.join(self.root, ".staging", "vlm"), self.progress, {})
+                            provenance = _materialize_recipe("task-vlm", params, os.path.join(self.root, ".staging", "vlm"), self.progress, {})
         self.assertEqual(materialize.call_args.args[1], os.path.realpath(self.current_source))
+        self.assertEqual(provenance["recipe_snapshot"], recipe_data)
+        self.assertEqual(len(provenance["recipe_sha256"]), 64)
+        self.assertEqual(provenance["parents"], [self.source, self.current_source])
+        self.assertEqual(provenance["vlm_base"]["source_path"], os.path.realpath(self.current_source))
+        self.assertEqual(provenance["vlm_base"]["visual_weight_count"], 3)
+
+    def test_recipe_provenance_is_persisted_before_explicit_validation(self):
+        from app.models import Task
+        from app.model_publication_tasks import run_model_publication_task
+
+        request = {
+            **self.request,
+            "source_type": "recipe",
+            "recipe_id": "recipe-a",
+            "recipe_path": os.path.join(self.tmpdir.name, "recipe-a.json"),
+        }
+        provenance = {
+            "recipe_sha256": "b" * 64,
+            "recipe_snapshot": {"model_paths": [self.source], "vlm_base": {"source_path": self.current_source}},
+            "parents": [self.source],
+            "vlm_base": {"source_path": self.current_source},
+        }
+
+        def materialize(_task_id, _params, staging, _progress, _control):
+            self._write_model(staging)
+            return provenance
+
+        with self.app.app_context():
+            self._add_task(config=request)
+            with mock.patch("app.model_publication_tasks._recipe_model_paths", return_value=[self.source]):
+                with mock.patch("app.model_publication_tasks._materialize_recipe", side_effect=materialize):
+                    result = run_model_publication_task(
+                        "task-a", request, self.progress, {"aborted": False},
+                        structural_validate_fn=self.structural_validate,
+                    )
+            task = self.db.session.get(Task, "task-a")
+
+        self.assertEqual(result["status"], "validating")
+        for key, value in provenance.items():
+            self.assertEqual(task.config[key], value)
 
     def test_recipe_apply_metadata_override_marks_publication_fallback(self):
         import merge_manager
