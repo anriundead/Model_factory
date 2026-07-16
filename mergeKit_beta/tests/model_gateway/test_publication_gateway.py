@@ -1,8 +1,10 @@
 """Gateway binding tests for formal published assets."""
+from contextlib import contextmanager
 import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -111,9 +113,33 @@ class TestPublishableModels(PublicationGatewayTestCase):
 
         self.assertEqual(response.status_code, 401)
 
+    def test_publishable_models_uses_quick_inventory_without_full_hash(self):
+        from app.model_gateway.routes import _formal_published_asset
+
+        with mock.patch("app.model_gateway.routes._formal_published_asset", wraps=_formal_published_asset) as validate:
+            response = self.client.get("/api/model-gateway/admin/publishable-models", headers=self.admin_headers())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(validate.call_count)
+        self.assertTrue(all(call.kwargs.get("full_hash") is False for call in validate.call_args_list))
+
+    def test_publishable_models_safely_summarizes_changed_runtime_version_as_stale(self):
+        manifest_path = os.path.join(self.published_text.path, "publication_manifest.json")
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        manifest["compatibility"]["serving"]["tested_version"] = "0.0.0"
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+
+        response = self.client.get("/api/model-gateway/admin/publishable-models", headers=self.admin_headers())
+
+        row = next(item for item in response.get_json()["models"] if item["model_id"] == self.published_text.id)
+        self.assertFalse(row["selectable"])
+        self.assertEqual(row["blocked_reason_code"], "version_changed")
+
 
 class TestPublishedServiceLifecycle(PublicationGatewayTestCase):
-    def _create(self, **overrides):
+    def _payload(self, **overrides):
         payload = {
             "model_id": self.published_text.id,
             "display_name": "Published text",
@@ -121,13 +147,46 @@ class TestPublishedServiceLifecycle(PublicationGatewayTestCase):
             "gpu_ids": [0],
         }
         payload.update(overrides)
-        return self.client.post("/api/model-gateway/admin/model-services", headers=self.admin_headers(), json=payload)
+        return payload
+
+    def _create(self, **overrides):
+        return self.client.post(
+            "/api/model-gateway/admin/model-services",
+            headers=self.admin_headers(),
+            json=self._payload(**overrides),
+        )
 
     def test_create_resolves_path_from_formal_model(self):
         response = self._create()
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.get_json()["service"]["model_path"], self.published_text.path)
+
+    def test_create_uses_full_hash_validation(self):
+        from app.model_gateway.routes import _formal_published_asset
+
+        with mock.patch("app.model_gateway.routes._formal_published_asset", wraps=_formal_published_asset) as validate:
+            response = self._create()
+
+        self.assertEqual(response.status_code, 201)
+        validate.assert_called_once()
+        self.assertIs(validate.call_args.kwargs.get("full_hash"), True)
+
+    def test_create_rejects_asset_validated_with_a_different_runtime_version(self):
+        from app.model_gateway.models import ServingModelService
+
+        manifest_path = os.path.join(self.published_text.path, "publication_manifest.json")
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        manifest["compatibility"]["serving"]["tested_version"] = "0.0.0"
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+
+        response = self._create()
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"]["code"], "version_changed")
+        self.assertEqual(self.db.session.query(ServingModelService).count(), 0)
 
     def test_create_rejects_client_model_path_and_non_selectable_asset(self):
         path = self._create(model_path="/tmp/not-a-formal-asset")
@@ -157,6 +216,7 @@ class TestPublishedServiceLifecycle(PublicationGatewayTestCase):
     def test_formal_blocked_asset_never_reaches_gpu_or_process_launch(self):
         from app.model_gateway.models import ServingModelService
         from app.model_gateway.runtime import start_service
+        from app.model_publication import PublicationError
 
         service = ServingModelService(
             model_id=self.published_vlm.id,
@@ -175,12 +235,247 @@ class TestPublishedServiceLifecycle(PublicationGatewayTestCase):
             LOCAL_MODELS_EXTRA_PATHS = []
 
         with mock.patch("app.model_gateway.runtime.validate_gpu_availability") as reserve, mock.patch("app.model_gateway.runtime.subprocess.Popen") as popen:
-            with self.assertRaises(ValueError):
+            with self.assertRaises(PublicationError) as raised:
                 with mock.patch("app.model_gateway.runtime.validate_model_path"):
                     start_service(service.id, config=Config, timeout_s=0)
 
+        self.assertEqual(raised.exception.code, "unsupported_architecture")
         reserve.assert_not_called()
         popen.assert_not_called()
+
+    def test_formal_service_with_missing_core_row_fails_closed_before_gpu_or_process(self):
+        from app.model_gateway.models import ServingModelService
+        from app.model_gateway.runtime import start_service
+        from app.model_publication import PublicationError
+
+        service = ServingModelService(
+            model_id="missing-formal-model",
+            model_path=self.published_text.path,
+            display_name="Missing formal model",
+            served_model_name="missing-formal-model",
+            gpu_ids=[0],
+        )
+        self.db.session.add(service)
+        self.db.session.commit()
+
+        class Config:
+            PUBLISHED_MODELS_PATH = self.published
+            MODEL_POOL_PATH = self.app.config["MODEL_POOL_PATH"]
+            LOCAL_MODELS_PATH = self.app.config["LOCAL_MODELS_PATH"]
+            MERGE_DIR = self.app.config["MERGE_DIR"]
+            LOCAL_MODELS_EXTRA_PATHS = []
+
+        class FakeProc:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        with mock.patch("app.model_gateway.runtime.validate_gpu_availability") as reserve, \
+            mock.patch("app.model_gateway.runtime.subprocess.Popen", return_value=FakeProc()) as popen, \
+            mock.patch("app.model_gateway.runtime.os.getpgid", return_value=12345), \
+            mock.patch("app.model_gateway.runtime._healthcheck", return_value=True), \
+            self.assertRaises(PublicationError) as raised:
+            start_service(service.id, config=Config, timeout_s=1)
+
+        self.assertEqual(raised.exception.code, "asset_unavailable")
+        reserve.assert_not_called()
+        popen.assert_not_called()
+
+    def test_formal_service_source_or_path_mismatch_fails_closed(self):
+        from app.model_gateway.models import ServingModelService
+        from app.model_gateway.runtime import _validate_formal_service_asset
+
+        cases = (("base", self.published_text.path, "asset_unavailable"),
+                 ("published", self.published_vlm.path, "asset_identity_mismatch"))
+        for index, (source, path, expected_code) in enumerate(cases):
+            with self.subTest(expected_code=expected_code):
+                self.published_text.source = source
+                self.db.session.commit()
+                service = ServingModelService(
+                    model_id=self.published_text.id,
+                    model_path=path,
+                    display_name="Mismatched formal model",
+                    served_model_name="mismatched-formal-%s" % index,
+                    gpu_ids=[0],
+                )
+                self.db.session.add(service)
+                self.db.session.commit()
+
+                raised = None
+                try:
+                    _validate_formal_service_asset(service, type("Config", (), {
+                        "PUBLISHED_MODELS_PATH": self.published,
+                        "MODEL_POOL_PATH": self.app.config["MODEL_POOL_PATH"],
+                        "LOCAL_MODELS_PATH": self.app.config["LOCAL_MODELS_PATH"],
+                        "MERGE_DIR": self.app.config["MERGE_DIR"],
+                        "LOCAL_MODELS_EXTRA_PATHS": [],
+                    }))
+                except Exception as exc:
+                    raised = exc
+
+                self.assertIsNotNone(raised)
+                self.assertEqual(getattr(raised, "code", None), expected_code)
+                self.db.session.delete(service)
+                self.published_text.source = "published"
+                self.db.session.commit()
+
+    def test_path_under_publication_root_without_model_id_is_not_legacy(self):
+        from app.model_gateway.models import ServingModelService
+        from app.model_gateway.runtime import start_service
+        from app.model_publication import PublicationError
+
+        service = ServingModelService(
+            model_path=self.published_text.path,
+            display_name="Unbound formal model",
+            served_model_name="unbound-formal-model",
+            gpu_ids=[0],
+        )
+        self.db.session.add(service)
+        self.db.session.commit()
+
+        class FakeProc:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        with mock.patch("app.model_gateway.runtime.validate_gpu_availability") as reserve, \
+            mock.patch("app.model_gateway.runtime.subprocess.Popen", return_value=FakeProc()) as popen, \
+            mock.patch("app.model_gateway.runtime.os.getpgid", return_value=12345), \
+            mock.patch("app.model_gateway.runtime._healthcheck", return_value=True), \
+            self.assertRaises(PublicationError) as raised:
+            start_service(service.id, config=type("Config", (), {
+                "PUBLISHED_MODELS_PATH": self.published,
+                "MODEL_POOL_PATH": self.app.config["MODEL_POOL_PATH"],
+                "LOCAL_MODELS_PATH": self.app.config["LOCAL_MODELS_PATH"],
+                "MERGE_DIR": self.app.config["MERGE_DIR"],
+                "LOCAL_MODELS_EXTRA_PATHS": [],
+            }), timeout_s=1)
+
+        self.assertEqual(raised.exception.code, "asset_unavailable")
+        reserve.assert_not_called()
+        popen.assert_not_called()
+
+    def test_formal_start_detects_corrupt_hash_stale_status_and_version_change(self):
+        from app.model_gateway.models import ServingModelService
+        from app.model_gateway.runtime import start_service
+        from app.model_publication import PublicationError
+
+        manifest_path = os.path.join(self.published_text.path, "publication_manifest.json")
+        weight_path = os.path.join(self.published_text.path, "model.safetensors")
+        with open(manifest_path, encoding="utf-8") as handle:
+            original_manifest = json.load(handle)
+        with open(weight_path, "rb") as handle:
+            original_weight = handle.read()
+
+        cases = (
+            ("corrupt-hash", "validation_failed"),
+            ("stale-status", "version_changed"),
+            ("changed-version", "version_changed"),
+        )
+        for name, expected_code in cases:
+            with self.subTest(name=name):
+                manifest = json.loads(json.dumps(original_manifest))
+                with open(weight_path, "wb") as handle:
+                    handle.write(original_weight)
+                if name == "corrupt-hash":
+                    with open(weight_path, "wb") as handle:
+                        handle.write(b"other")
+                elif name == "stale-status":
+                    manifest["compatibility"]["serving"].update({
+                        "status": "stale",
+                        "reason_code": "version_changed",
+                    })
+                else:
+                    manifest["compatibility"]["serving"]["tested_version"] = "0.0.0"
+                with open(manifest_path, "w", encoding="utf-8") as handle:
+                    json.dump(manifest, handle)
+                service = ServingModelService(
+                    model_id=self.published_text.id,
+                    model_path=self.published_text.path,
+                    display_name=name,
+                    served_model_name=name,
+                    gpu_ids=[0],
+                )
+                self.db.session.add(service)
+                self.db.session.commit()
+
+                with mock.patch("app.model_gateway.runtime.validate_gpu_availability") as reserve, \
+                    mock.patch("app.model_gateway.runtime.subprocess.Popen") as popen, \
+                    mock.patch.dict("sys.modules", {"vllm": mock.Mock(__version__="0.7.0")}), \
+                    self.assertRaises(PublicationError) as raised:
+                    start_service(service.id, config=type("Config", (), {
+                        "PUBLISHED_MODELS_PATH": self.published,
+                        "MODEL_POOL_PATH": self.app.config["MODEL_POOL_PATH"],
+                        "LOCAL_MODELS_PATH": self.app.config["LOCAL_MODELS_PATH"],
+                        "MERGE_DIR": self.app.config["MERGE_DIR"],
+                        "LOCAL_MODELS_EXTRA_PATHS": [],
+                    }), timeout_s=0)
+
+                self.assertEqual(raised.exception.code, expected_code)
+                reserve.assert_not_called()
+                popen.assert_not_called()
+                self.db.session.delete(service)
+                self.db.session.commit()
+
+        with open(weight_path, "wb") as handle:
+            handle.write(original_weight)
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(original_manifest, handle)
+
+    def test_deleted_service_cannot_start_or_mutate_runtime_state(self):
+        from app.model_gateway.models import ServingModelService
+        from app.model_gateway.runtime import start_service
+
+        service = ServingModelService(
+            model_id=self.published_text.id,
+            model_path=self.published_text.path,
+            display_name="Deleted model",
+            served_model_name="deleted-model-start",
+            status="deleted",
+            gpu_ids=[0],
+        )
+        self.db.session.add(service)
+        self.db.session.commit()
+
+        with mock.patch("app.model_gateway.runtime._validate_formal_service_asset") as asset_check, \
+            mock.patch("app.model_gateway.runtime.validate_gpu_availability") as reserve, \
+            mock.patch("app.model_gateway.runtime.subprocess.Popen") as popen, \
+            self.assertRaisesRegex(ValueError, "deleted"):
+            start_service(service.id, config=object(), timeout_s=0)
+
+        self.db.session.refresh(service)
+        self.assertEqual(service.status, "deleted")
+        asset_check.assert_not_called()
+        reserve.assert_not_called()
+        popen.assert_not_called()
+
+    def test_deleted_service_cannot_be_stopped_or_resurrected(self):
+        from app.model_gateway.models import ServingModelService
+        from app.model_gateway.runtime import stop_service
+
+        service = ServingModelService(
+            model_path=self.published_text.path,
+            display_name="Deleted model",
+            served_model_name="deleted-model-stop",
+            status="deleted",
+            vllm_pid=4321,
+            vllm_pgid=4321,
+        )
+        self.db.session.add(service)
+        self.db.session.commit()
+
+        with mock.patch("app.model_gateway.runtime._find_marked_service_pids") as find_pids, \
+            mock.patch("app.model_gateway.runtime._terminate_service_processes") as terminate, \
+            self.assertRaisesRegex(ValueError, "deleted"):
+            stop_service(service.id)
+
+        self.db.session.refresh(service)
+        self.assertEqual(service.status, "deleted")
+        self.assertEqual(service.vllm_pid, 4321)
+        find_pids.assert_not_called()
+        terminate.assert_not_called()
 
 
 class TestPublishedAssetDeleteGuard(PublicationGatewayTestCase):
@@ -217,6 +512,145 @@ class TestPublishedAssetDeleteGuard(PublicationGatewayTestCase):
         self.assertIsNone(self.db.session.get(self.Model, self.published_text.id))
         self.assertIsNotNone(self.db.session.get(ServingModelService, service.id))
         self.assertIsNotNone(self.db.session.get(ServingUsageRecord, usage.id))
+
+
+class TestServiceCreateDeleteRace(PublicationGatewayTestCase):
+    def _create_in_thread(self, result, model_id, **overrides):
+        payload = {
+            "model_id": model_id,
+            "display_name": "Published text",
+            "served_model_name": "race-published-text",
+            "gpu_ids": [0],
+        }
+        payload.update(overrides)
+        response = self.app.test_client().post(
+            "/api/model-gateway/admin/model-services",
+            headers=self.admin_headers(),
+            json=payload,
+        )
+        result.update(status=response.status_code, body=response.get_json())
+
+    def test_creation_wins_and_deletion_observes_asset_in_use(self):
+        from app.model_gateway.models import ServingModelService
+        from app.model_gateway.routes import _formal_published_asset
+        from app.model_publication import PublicationError, delete_registered_published_asset, publication_lock
+
+        validation_entered = threading.Event()
+        release_creation = threading.Event()
+        deletion_attempted = threading.Event()
+        deletion_done = threading.Event()
+        creation_result = {}
+        deletion_result = {}
+        model_id = self.published_text.id
+        model_path = self.published_text.path
+
+        def blocking_validate(model, full_hash=False):
+            validation_entered.set()
+            self.assertTrue(release_creation.wait(5))
+            return _formal_published_asset(model, full_hash=full_hash)
+
+        @contextmanager
+        def observed_lock(root):
+            if threading.current_thread().name == "delete-asset":
+                deletion_attempted.set()
+            with publication_lock(root) as locked_root:
+                yield locked_root
+
+        def delete_asset():
+            with self.app.app_context():
+                try:
+                    delete_registered_published_asset("published-text", self.published)
+                except PublicationError as exc:
+                    deletion_result["code"] = exc.code
+                finally:
+                    deletion_done.set()
+
+        with mock.patch("app.model_gateway.routes._formal_published_asset", side_effect=blocking_validate), \
+            mock.patch("app.model_publication.publication_lock", side_effect=observed_lock):
+            creator = threading.Thread(
+                name="create-service",
+                target=self._create_in_thread,
+                args=(creation_result, model_id),
+            )
+            creator.start()
+            self.assertTrue(validation_entered.wait(5))
+            deleter = threading.Thread(name="delete-asset", target=delete_asset)
+            deleter.start()
+            self.assertTrue(deletion_attempted.wait(5))
+            self.assertFalse(deletion_done.wait(0.2))
+            release_creation.set()
+            creator.join(5)
+            deleter.join(5)
+
+        self.assertFalse(creator.is_alive())
+        self.assertFalse(deleter.is_alive())
+        self.assertEqual(creation_result.get("status"), 201)
+        self.assertEqual(deletion_result.get("code"), "asset_in_use")
+        self.db.session.expire_all()
+        self.assertEqual(self.db.session.query(ServingModelService).count(), 1)
+        self.assertTrue(os.path.isdir(model_path))
+
+    def test_deletion_wins_and_creation_conflicts_without_orphan_row(self):
+        from app.model_gateway.models import ServingModelService
+        from app.model_publication import delete_registered_published_asset, publication_lock
+        from app.repositories import model_delete_by_canonical_path
+
+        core_delete_entered = threading.Event()
+        release_deletion = threading.Event()
+        creation_attempted = threading.Event()
+        creation_done = threading.Event()
+        creation_result = {}
+        deletion_result = {}
+        model_id = self.published_text.id
+        model_path = self.published_text.path
+
+        def blocking_core_delete(path):
+            core_delete_entered.set()
+            self.assertTrue(release_deletion.wait(5))
+            return model_delete_by_canonical_path(path)
+
+        @contextmanager
+        def observed_lock(root):
+            if threading.current_thread().name == "create-service":
+                creation_attempted.set()
+            with publication_lock(root) as locked_root:
+                yield locked_root
+
+        def delete_asset():
+            with self.app.app_context():
+                deletion_result.update(delete_registered_published_asset("published-text", self.published))
+
+        def create_service():
+            try:
+                self._create_in_thread(creation_result, model_id)
+            finally:
+                creation_done.set()
+
+        with mock.patch("app.repositories.model_delete_by_canonical_path", side_effect=blocking_core_delete), \
+            mock.patch("app.model_publication.publication_lock", side_effect=observed_lock):
+            deleter = threading.Thread(name="delete-asset", target=delete_asset)
+            deleter.start()
+            self.assertTrue(core_delete_entered.wait(5))
+            creator = threading.Thread(
+                name="create-service",
+                target=create_service,
+            )
+            creator.start()
+            self.assertTrue(creation_attempted.wait(5))
+            self.assertFalse(creation_done.wait(0.2))
+            release_deletion.set()
+            deleter.join(5)
+            creator.join(5)
+
+        self.assertFalse(deleter.is_alive())
+        self.assertFalse(creator.is_alive())
+        self.assertTrue(deletion_result.get("deleted"))
+        self.assertEqual(creation_result.get("status"), 409)
+        self.assertEqual(creation_result.get("body", {}).get("error", {}).get("code"), "asset_unavailable")
+        self.db.session.expire_all()
+        self.assertEqual(self.db.session.query(ServingModelService).count(), 0)
+        self.assertIsNone(self.db.session.get(self.Model, model_id))
+        self.assertFalse(os.path.exists(model_path))
 
 
 if __name__ == "__main__":

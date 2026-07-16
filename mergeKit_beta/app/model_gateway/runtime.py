@@ -22,6 +22,12 @@ RECOVERY_REASON = "system_restarted_manual_recovery_required"
 INFLIGHT_REQUEST_STATES = ("running", "streaming", "cancel_requested")
 
 
+class ServiceStateError(ValueError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 def should_recover_services_on_start() -> bool:
     """Limit restart recovery to the process that owns the Flask runtime."""
     return os.environ.get("MERGEKIT_MODEL_GATEWAY_RUNTIME_PROCESS") == "1"
@@ -78,26 +84,25 @@ def allowed_model_roots(config) -> list[str]:
 
 def _validate_formal_service_asset(service: ServingModelService, config) -> None:
     """Revalidate formal assets before they reserve a GPU or spawn vLLM."""
-    if not service.model_id:
-        return
-    from app.model_publication import PublicationError, validate_formal_published_model
+    from app.model_publication import PublicationError, current_serving_compatibility, validate_formal_published_model
     from app.models import Model
 
+    root = getattr(config, "PUBLISHED_MODELS_PATH", "")
+    formal_path = bool(root and _is_under(service.model_path, root))
+    if not service.model_id:
+        if formal_path:
+            raise PublicationError("asset_unavailable", "asset_unavailable: published asset is not bound to a core model")
+        return
     model = db.session.get(Model, service.model_id)
     if not model or model.source != "published":
-        return
-    try:
-        manifest = validate_formal_published_model(model, getattr(config, "PUBLISHED_MODELS_PATH", ""), full_hash=True)
-    except PublicationError as exc:
-        raise ValueError(str(exc)) from exc
+        raise PublicationError("asset_unavailable", "asset_unavailable: formal published model is unavailable")
     if _real(service.model_path) != _real(model.path):
-        raise ValueError("published service path does not match its formal model")
-    serving = manifest["compatibility"]["serving"]
+        raise PublicationError("asset_identity_mismatch", "asset_identity_mismatch: service path does not match its formal model")
+    manifest = validate_formal_published_model(model, root, full_hash=True)
+    serving = current_serving_compatibility(manifest)
     if serving.get("status") != "ready":
-        raise ValueError("published asset is not selectable")
-    from vllm import __version__ as vllm_version
-    if serving.get("tested_version") != vllm_version:
-        raise ValueError("published asset serving compatibility is stale")
+        code = serving.get("reason_code") or serving.get("status") or "asset_unavailable"
+        raise PublicationError(code, "%s: published asset is not selectable" % code)
 
 
 def validate_gpu_availability(
@@ -273,6 +278,8 @@ def start_service(service_id: str, config=None, timeout_s: int = 120) -> Serving
     service = db.session.get(ServingModelService, service_id)
     if not service:
         raise ValueError("serving model service not found")
+    if service.status == "deleted":
+        raise ServiceStateError("service_deleted", "deleted service is terminal")
     if service.status == "running":
         return service
 
@@ -434,6 +441,8 @@ def stop_service(service_id: str, timeout_s: int = 30) -> ServingModelService:
     service = db.session.get(ServingModelService, service_id)
     if not service:
         raise ValueError("serving model service not found")
+    if service.status == "deleted":
+        raise ServiceStateError("service_deleted", "deleted service is terminal")
 
     stored_pid = service.vllm_pid
     pids = _find_marked_service_pids(service.id)

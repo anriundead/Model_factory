@@ -33,7 +33,7 @@ from app.model_gateway.models import (
 from app.model_gateway.documents import save_upload, validate_public_source_url
 from app.model_gateway.queue import enqueue_research_file, enqueue_research_job
 from app.model_gateway.quotas import QuotaExceeded, release_quota, reserve_quota
-from app.model_gateway.runtime import start_service, stop_service
+from app.model_gateway.runtime import ServiceStateError, start_service, stop_service
 
 
 model_gateway_bp = Blueprint("model_gateway", __name__)
@@ -277,7 +277,7 @@ def admin_list_model_services():
 
 @model_gateway_bp.get("/api/model-gateway/admin/publishable-models")
 def admin_list_publishable_models():
-    from app.model_publication import PublicationError
+    from app.model_publication import PublicationError, current_serving_compatibility
 
     models = db.session.query(Model).filter(Model.source == "published").order_by(Model.created_at.desc()).all()
     rows = []
@@ -286,9 +286,9 @@ def admin_list_publishable_models():
         reason_code = None
         artifact_type = model.architecture or "text"
         try:
-            manifest = _formal_published_asset(model, full_hash=True)
+            manifest = _formal_published_asset(model, full_hash=False)
             artifact_type = manifest["artifact_type"]
-            serving = manifest["compatibility"]["serving"]
+            serving = current_serving_compatibility(manifest)
             selectable = serving.get("status") == "ready"
             reason_code = None if selectable else serving.get("reason_code") or serving.get("status")
         except PublicationError as exc:
@@ -305,7 +305,7 @@ def admin_list_publishable_models():
 
 @model_gateway_bp.post("/api/model-gateway/admin/model-services")
 def admin_create_model_service():
-    from app.model_publication import PublicationError
+    from app.model_publication import PublicationError, current_serving_compatibility, publication_lock
 
     data = request.get_json(silent=True) or {}
     model_id = (data.get("model_id") or "").strip()
@@ -327,10 +327,6 @@ def admin_create_model_service():
         return _error(400, "invalid_request", "model_id, display_name and served_model_name are required")
     if not SERVED_NAME_RE.match(served_model_name):
         return _error(400, "invalid_served_model_name", "served_model_name supports letters, numbers, dot, underscore and dash")
-    if db.session.query(ServingModelService).filter(
-        ServingModelService.served_model_name == served_model_name,
-    ).first():
-        return _error(409, "served_model_name_exists", "served_model_name already exists")
     if not isinstance(gpu_ids, list) or not gpu_ids:
         return _error(400, "invalid_gpu_ids", "gpu_ids must be a non-empty list")
     if tp < 1 or tp > len(gpu_ids):
@@ -338,37 +334,48 @@ def admin_create_model_service():
     if gpu_mem < 0.50 or gpu_mem > 0.92:
         return _error(400, "invalid_gpu_memory_utilization", "gpu_memory_utilization must be between 0.50 and 0.92")
 
-    model = db.session.get(Model, model_id)
-    if not model or model.source != "published":
-        return _error(409, "asset_unavailable", "model_id is not a formal published asset")
+    root = current_app.config.get("PUBLISHED_MODELS_PATH", "")
     try:
-        manifest = _formal_published_asset(model, full_hash=True)
-    except PublicationError as exc:
-        return _asset_error(exc)
-    serving = manifest["compatibility"]["serving"]
-    if serving.get("status") != "ready":
-        return _error(409, serving.get("reason_code") or "asset_unavailable", "published asset is not selectable")
+        with publication_lock(root):
+            db.session.expire_all()
+            if db.session.query(ServingModelService).filter(
+                ServingModelService.served_model_name == served_model_name,
+            ).first():
+                return _error(409, "served_model_name_exists", "served_model_name already exists")
+            model = db.session.get(Model, model_id)
+            if not model or model.source != "published":
+                return _error(409, "asset_unavailable", "model_id is not a formal published asset")
+            manifest = _formal_published_asset(model, full_hash=True)
+            serving = current_serving_compatibility(manifest)
+            if serving.get("status") != "ready":
+                return _error(409, serving.get("reason_code") or "asset_unavailable", "published asset is not selectable")
 
-    service = ServingModelService(
-        model_id=model.id,
-        model_path=model.path,
-        display_name=display_name,
-        served_model_name=served_model_name,
-        model_type=manifest["artifact_type"],
-        backend_type="vllm",
-        status="stopped",
-        vllm_host="127.0.0.1",
-        gpu_ids=gpu_ids,
-        tensor_parallel_size=tp,
-        gpu_memory_utilization=gpu_mem,
-        dtype=(data.get("dtype") or "auto").strip() or "auto",
-        max_model_len=max_model_len,
-        max_num_seqs=max_num_seqs,
-        max_num_batched_tokens=max_num_batched_tokens,
-        trust_remote_code=bool(data.get("trust_remote_code", False)),
-    )
-    db.session.add(service)
-    db.session.commit()
+            service = ServingModelService(
+                model_id=model.id,
+                model_path=model.path,
+                display_name=display_name,
+                served_model_name=served_model_name,
+                model_type=manifest["artifact_type"],
+                backend_type="vllm",
+                status="stopped",
+                vllm_host="127.0.0.1",
+                gpu_ids=gpu_ids,
+                tensor_parallel_size=tp,
+                gpu_memory_utilization=gpu_mem,
+                dtype=(data.get("dtype") or "auto").strip() or "auto",
+                max_model_len=max_model_len,
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=max_num_batched_tokens,
+                trust_remote_code=bool(data.get("trust_remote_code", False)),
+            )
+            db.session.add(service)
+            db.session.commit()
+    except PublicationError as exc:
+        db.session.rollback()
+        return _asset_error(exc)
+    except IntegrityError:
+        db.session.rollback()
+        return _error(409, "served_model_name_exists", "served_model_name already exists")
     return jsonify({"status": "success", "service": service.to_dict()}), 201
 
 
@@ -397,10 +404,16 @@ def admin_delete_model_service(service_id):
 
 @model_gateway_bp.post("/api/model-gateway/admin/model-services/<service_id>/start")
 def admin_start_model_service(service_id):
+    from app.model_publication import PublicationError
+
     try:
         service = start_service(service_id)
-    except Exception as exc:
+    except (PublicationError, ServiceStateError) as exc:
+        return _error(409, exc.code, str(exc))
+    except ValueError as exc:
         return _error(400, "start_failed", str(exc))
+    except Exception as exc:
+        return _error(500, "start_failed", str(exc))
     return jsonify({"status": "success", "service": service.to_dict()})
 
 
@@ -408,8 +421,12 @@ def admin_start_model_service(service_id):
 def admin_stop_model_service(service_id):
     try:
         service = stop_service(service_id)
-    except Exception as exc:
+    except ServiceStateError as exc:
+        return _error(409, exc.code, str(exc))
+    except ValueError as exc:
         return _error(400, "stop_failed", str(exc))
+    except Exception as exc:
+        return _error(500, "stop_failed", str(exc))
     return jsonify({"status": "success", "service": service.to_dict()})
 
 

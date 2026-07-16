@@ -230,6 +230,9 @@ def register_routes(app, state, services, dataset_service):
             )
         if model is None or model.source != "published":
             return None
+        denied = _publication_admin()
+        if denied:
+            return denied
         try:
             result = delete_registered_published_asset(
                 os.path.basename(os.path.realpath(os.path.abspath(model.path.rstrip(os.sep)))),
@@ -237,6 +240,8 @@ def register_routes(app, state, services, dataset_service):
             )
         except PublicationError as exc:
             return jsonify({"error": {"code": exc.code, "message": str(exc)}}), 409 if exc.code == "asset_in_use" else 400
+        except Exception:
+            return jsonify({"error": {"code": "asset_delete_failed", "message": "published asset deletion failed"}}), 500
         return jsonify({"status": "success", **result})
 
     @app.route("/api/models/delete", methods=["POST"])
@@ -2287,4 +2292,6 @@ def register_routes(app, state, services, dataset_service):
             result = delete_registered_published_asset(publication_id, root)
         except PublicationError as exc:
             return jsonify({"error": {"code": exc.code, "message": str(exc)}}), 409 if exc.code == "asset_in_use" else 400
+        except Exception:
+            return jsonify({"error": {"code": "asset_delete_failed", "message": "published asset deletion failed"}}), 500
         return jsonify({"status": "success", **result})

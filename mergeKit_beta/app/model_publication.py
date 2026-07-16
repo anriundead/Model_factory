@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+from importlib.metadata import PackageNotFoundError, version as package_version
 import json
 import os
 import shutil
@@ -203,6 +204,19 @@ def inspect_serving_compatibility(architectures: Sequence[str], recorded_version
         return result
     result["status"] = "ready"
     return result
+
+
+def current_serving_compatibility(manifest: dict) -> dict:
+    """Return fail-closed serving metadata for the installed backend version."""
+    serving = dict(manifest["compatibility"]["serving"])
+    try:
+        current_version = package_version("vllm")
+    except PackageNotFoundError:
+        serving.update({"status": "blocked", "reason_code": "serving_runtime_unavailable"})
+        return serving
+    if serving.get("tested_version") != current_version:
+        serving.update({"status": "stale", "reason_code": "version_changed"})
+    return serving
 
 
 def build_manifest(

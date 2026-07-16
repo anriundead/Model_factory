@@ -32,6 +32,7 @@ class PublicationRouteTest(unittest.TestCase):
             priority_map={"common": 10},
             logger=mock.Mock(),
             model_pool_path=self.model_path,
+            project_root=self.tmpdir.name,
             config=SimpleNamespace(PUBLISHED_MODELS_PATH=self.published),
         )
         app = Flask(__name__)
@@ -58,6 +59,7 @@ class PublicationRouteTest(unittest.TestCase):
         register_routes(app, self.state, self.services, SimpleNamespace())
         self.app = app
         self.db = db
+        self.Model = Model
         self.Task = Task
 
         import merge_manager
@@ -91,6 +93,63 @@ class PublicationRouteTest(unittest.TestCase):
             task = self.Task(id=task_id, task_type="model_publication", status=status, config=config)
             self.db.session.add(task)
             self.db.session.commit()
+
+    def _published_model(self, publication_id):
+        from app.model_inspection import inspect_model
+        from app.model_publication import build_manifest, commit_staging
+
+        staging = os.path.join(self.published, ".staging", publication_id)
+        os.makedirs(staging)
+        with open(os.path.join(staging, "config.json"), "w", encoding="utf-8") as handle:
+            json.dump({"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]}, handle)
+        for name in ("model.safetensors", "tokenizer.json"):
+            with open(os.path.join(staging, name), "wb") as handle:
+                handle.write(b"asset")
+        with open(os.path.join(staging, "model.safetensors.index.json"), "w", encoding="utf-8") as handle:
+            json.dump({"weight_map": {"model.weight": "model.safetensors"}}, handle)
+        manifest = build_manifest(
+            staging,
+            {"publication_id": publication_id, "display_name": publication_id, "task_id": "task-%s" % publication_id},
+            inspect_model(staging),
+            {"structural": {"status": "passed"}},
+            {"serving": {"backend": "vllm", "tested_version": "0.7.0", "status": "ready"}},
+        )
+        committed = commit_staging(staging, self.published, manifest, lambda _path, _manifest: None)
+        with self.app.app_context():
+            model = self.Model(
+                path=os.path.join(self.published, committed["publication_id"]),
+                name=committed["display_name"],
+                source="published",
+                architecture=committed["model"]["model_type"],
+                is_vlm=False,
+            )
+            self.db.session.add(model)
+            self.db.session.commit()
+            result = SimpleNamespace(id=model.id, path=model.path, name=model.name)
+        return result
+
+    def _gateway_service(self, model, status="stopped"):
+        from app.model_gateway.models import ServingModelService
+
+        with self.app.app_context():
+            service = ServingModelService(
+                model_id=model.id,
+                model_path=model.path,
+                display_name=model.name,
+                served_model_name="served-%s" % model.id,
+                status=status,
+            )
+            self.db.session.add(service)
+            self.db.session.commit()
+            return SimpleNamespace(id=service.id)
+
+    def _make_legacy_model_dir(self, name):
+        path = os.path.join(self.model_path, name)
+        os.makedirs(path)
+        for filename in ("config.json", "tokenizer.json", "model.safetensors"):
+            with open(os.path.join(path, filename), "wb") as handle:
+                handle.write(b"legacy")
+        return path
 
     def test_admin_and_idempotency_contract(self):
         payload = {"source_type": "recipe", "recipe_path": "valid.json", "display_name": "published"}
@@ -756,6 +815,97 @@ class PublicationRouteTest(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.get_json()["error"]["code"], "asset_in_use")
+
+    def test_legacy_path_delete_requires_gateway_admin_for_published_asset_including_alias(self):
+        model = self._published_model("legacy-path-auth")
+        alias = os.path.join(self.tmpdir.name, "published-auth-alias")
+        os.symlink(model.path, alias)
+
+        missing = self.app.test_client().post("/api/models/delete", json={"path": alias})
+        wrong = self.app.test_client().post(
+            "/api/models/delete",
+            json={"path": alias},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        authorized = self.app.test_client().post(
+            "/api/models/delete",
+            json={"path": alias},
+            headers=self.headers,
+        )
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(wrong.status_code, 401)
+        self.assertEqual(authorized.status_code, 200)
+        self.assertFalse(os.path.exists(model.path))
+
+    def test_legacy_id_delete_requires_gateway_admin_for_published_asset(self):
+        model = self._published_model("legacy-id-auth")
+
+        missing = self.app.test_client().delete("/api/model_repo/%s" % model.id)
+        wrong = self.app.test_client().delete(
+            "/api/model_repo/%s" % model.id,
+            headers={"Authorization": "Bearer wrong"},
+        )
+        authorized = self.app.test_client().delete("/api/model_repo/%s" % model.id, headers=self.headers)
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(wrong.status_code, 401)
+        self.assertEqual(authorized.status_code, 200)
+        self.assertFalse(os.path.exists(model.path))
+
+    def test_legacy_delete_routes_preserve_unauthenticated_non_published_behavior(self):
+        path = self._make_legacy_model_dir("legacy-path")
+
+        by_path = self.app.test_client().post("/api/models/delete", json={"path": path})
+        by_id = self.app.test_client().delete("/api/model_repo/model-1")
+
+        self.assertEqual(by_path.status_code, 200)
+        self.assertEqual(by_id.status_code, 200)
+
+    def test_all_model_delete_routes_return_asset_in_use_for_active_gateway_service(self):
+        model = self._published_model("cross-route-in-use")
+        self._gateway_service(model)
+
+        by_path = self.app.test_client().post(
+            "/api/models/delete",
+            json={"path": model.path},
+            headers=self.headers,
+        )
+        by_id = self.app.test_client().delete("/api/model_repo/%s" % model.id, headers=self.headers)
+        formal = self.app.test_client().delete(
+            "/api/model-publications/cross-route-in-use",
+            headers=self.headers,
+        )
+
+        for response in (by_path, by_id, formal):
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.get_json()["error"]["code"], "asset_in_use")
+        self.assertTrue(os.path.isdir(model.path))
+
+    def test_formal_delete_route_restores_asset_when_core_delete_raises(self):
+        model = self._published_model("rollback-core-delete")
+
+        with mock.patch("app.repositories.model_delete_by_canonical_path", side_effect=RuntimeError("db failed")):
+            response = self.app.test_client().delete(
+                "/api/model-publications/rollback-core-delete",
+                headers=self.headers,
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json()["error"]["code"], "asset_delete_failed")
+        self.assertTrue(os.path.isdir(model.path))
+        self.assertFalse(os.path.exists(os.path.join(self.published, ".trash", "rollback-core-delete")))
+
+    def test_formal_delete_route_authorized_success(self):
+        model = self._published_model("formal-delete-success")
+
+        response = self.app.test_client().delete(
+            "/api/model-publications/formal-delete-success",
+            headers=self.headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(os.path.exists(model.path))
 
     def test_manifest_rejects_symlink_escape_and_traversal(self):
         outside = os.path.join(self.tmpdir.name, "outside")
