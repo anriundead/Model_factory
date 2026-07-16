@@ -32,11 +32,20 @@ class VlmRecipeContractTest(unittest.TestCase):
 
         self.assertEqual(enriched["recipe_schema_version"], 2)
         self.assertEqual(enriched["artifact_type"], "vlm")
+        self.assertEqual(enriched["capabilities"], ["text_generation", "vision_language"])
         self.assertEqual(enriched["vlm_path"], self.inspection.path)
         self.assertEqual(enriched["vlm_base"]["config_sha256"], self.inspection.config_sha256)
         self.assertIn("best_genotype", enriched)
         self.assertEqual(enriched["custom_field"], "kept")
         json.dumps(enriched)
+
+    def test_vlm_recipe_preserves_historical_vlm_path(self):
+        enriched = runner.build_recipe_vlm_fields(
+            {"vlm_path": "/models/legacy-vlm"}, self.inspection
+        )
+
+        self.assertEqual(enriched["vlm_path"], "/models/legacy-vlm")
+        self.assertEqual(enriched["vlm_base"]["source_path"], self.inspection.path)
 
     def test_text_recipe_has_text_contract_without_vlm_base(self):
         enriched = runner.build_recipe_vlm_fields({"best_genotype": [1.0]}, None)
@@ -71,6 +80,28 @@ class VlmRecipeContractTest(unittest.TestCase):
 
             lock_file.assert_not_called()
             popen.assert_not_called()
+
+    def test_cmmmu_text_metadata_normalizes_before_lock_or_subprocess(self):
+        meta = {
+            "model_paths": ["/models/text-a", "/models/text-b"],
+            "eval_mode": "text",
+            "hf_dataset": "m-a-p/CMMMU",
+            "vlm_path": "/models/legacy-vlm",
+        }
+        with mock.patch("app.model_inspection.resolve_vlm_base", return_value=self.inspection), mock.patch(
+            "app.model_inspection.assert_language_compatible"
+        ) as compatible, mock.patch.object(runner, "_lock_file") as lock_file, mock.patch.object(
+            runner.subprocess, "Popen"
+        ) as popen:
+            vlm_mode, eval_mode, resolved_vlm_path, selected = runner.resolve_vlm_preflight(meta)
+
+        self.assertTrue(vlm_mode)
+        self.assertEqual(eval_mode, "vlm")
+        self.assertEqual(resolved_vlm_path, self.inspection.path)
+        self.assertIs(selected, self.inspection)
+        compatible.assert_called_once_with(meta["model_paths"], self.inspection)
+        lock_file.assert_not_called()
+        popen.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -73,10 +73,23 @@ def build_recipe_vlm_fields(meta: dict, inspection) -> dict:
         recipe["capabilities"] = ["text_generation"]
         return recipe
     recipe["artifact_type"] = "vlm"
-    recipe["capabilities"] = ["text_generation", "image_text_generation"]
-    recipe["vlm_path"] = inspection.path
+    recipe["capabilities"] = ["text_generation", "vision_language"]
+    recipe.setdefault("vlm_path", inspection.path)
     recipe["vlm_base"] = _serialize_vlm_base(inspection)
     return recipe
+
+
+def resolve_vlm_preflight(meta: dict):
+    eval_mode = meta.get("eval_mode") or "text"
+    vlm_mode = _is_vlm_mode(eval_mode, meta.get("hf_dataset") or "")
+    if not vlm_mode:
+        return vlm_mode, eval_mode, meta.get("vlm_path") or "", None
+
+    from app.model_inspection import assert_language_compatible, resolve_vlm_base
+
+    inspection = resolve_vlm_base(meta)
+    assert_language_compatible(meta.get("model_paths") or [], inspection)
+    return vlm_mode, "vlm", inspection.path, inspection
 
 
 def _write_json_atomically(path: str, value: dict) -> None:
@@ -732,18 +745,9 @@ def main():
     max_samples = int(meta.get("max_samples", 64))
     dtype = meta.get("dtype") or "bfloat16"
     ray_num_gpus = int(meta.get("ray_num_gpus") or 1)
-    eval_mode = meta.get("eval_mode") or "text"
-    vlm_path = meta.get("vlm_path") or ""
     testset_id = (meta.get("testset_id") or "").strip()
-    vlm_mode = _is_vlm_mode(eval_mode, hf_dataset)
-    if vlm_mode:
-        from app.model_inspection import assert_language_compatible, resolve_vlm_base
-
-        vlm_inspection = resolve_vlm_base(meta)
-        assert_language_compatible(model_paths, vlm_inspection)
-        vlm_path = vlm_inspection.path
-        eval_mode = "vlm"
-        meta["vlm_path"] = vlm_path
+    vlm_mode, eval_mode, resolved_vlm_path, vlm_inspection = resolve_vlm_preflight(meta)
+    if vlm_inspection is not None:
         meta["vlm_base"] = _serialize_vlm_base(vlm_inspection)
         _write_metadata_safe(task_id, merge_dir, meta, logger)
 
@@ -752,7 +756,7 @@ def main():
     logger.info("=" * 80)
     logger.info("任务ID: %s", task_id)
     logger.info("模型路径: %s", model_paths)
-    logger.info("VLM路径: %s", vlm_path or "(无)")
+    logger.info("VLM路径: %s", resolved_vlm_path or "(无)")
     logger.info("数据集: %s, 子集: %s, 分割: %s, 最终分割: %s", hf_dataset, hf_subsets, hf_split, hf_split_final or "(同训练)")
     logger.info("参数: pop_size=%s, n_iter=%s, max_samples=%s", pop_size, n_iter, max_samples)
     logger.info("精度: %s, GPU并行数: %s", dtype, ray_num_gpus)
@@ -908,8 +912,8 @@ def main():
     final_acc_file = os.path.join(merge_dir, "final_test_acc.json")
     if hf_split_final and hf_split_final != hf_split:
         cmd.extend(["--hf-split-final", hf_split_final, "--final-acc-file", final_acc_file])
-    if vlm_path:
-        cmd.extend(["--vlm-path", vlm_path])
+    if resolved_vlm_path:
+        cmd.extend(["--vlm-path", resolved_vlm_path])
 
     logger.info("启动 run_vlm_search.py 子进程...")
     logger.debug("命令: %s", " ".join(cmd))

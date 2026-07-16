@@ -14,12 +14,34 @@ def replace_language_model_weights(vlm, merged_lm) -> None:
     target = language_model_of(vlm)
     source = merged_lm.state_dict()
     expected = target.state_dict()
-    if source.keys() != expected.keys():
-        raise ValueError("architecture_mismatch: language tensor names differ")
-    for name in source:
-        if source[name].shape != expected[name].shape:
+    if source.keys() == expected.keys():
+        normalized = source
+    else:
+        normalized = {
+            name.removeprefix("model."): tensor
+            for name, tensor in source.items()
+            if name.startswith("model.")
+        }
+        if (
+            len(normalized) != len(source) - ("lm_head.weight" in source)
+            or normalized.keys() != expected.keys()
+        ):
+            raise ValueError("architecture_mismatch: language tensor names differ")
+    for name, tensor in normalized.items():
+        if tensor.shape != expected[name].shape:
             raise ValueError("architecture_mismatch: %s shape differs" % name)
-    target.load_state_dict(source, strict=True)
+    target.load_state_dict(normalized, strict=True)
+    if normalized is source:
+        return
+
+    source_head = source.get("lm_head.weight")
+    target_head = getattr(vlm, "lm_head", None)
+    target_head_weight = getattr(target_head, "weight", None)
+    if source_head is None or target_head_weight is None:
+        raise ValueError("architecture_mismatch: VLM lm_head is missing")
+    if source_head.shape != target_head_weight.shape:
+        raise ValueError("architecture_mismatch: lm_head.weight shape differs")
+    target_head_weight.detach().copy_(source_head)
 
 
 def materialize_full_vlm(merged_llm_dir, vlm_base_path, output_dir, dtype) -> None:
@@ -27,20 +49,28 @@ def materialize_full_vlm(merged_llm_dir, vlm_base_path, output_dir, dtype) -> No
     import gc
     import os
     import shutil
+    import tempfile
 
-    import torch
-    from transformers import AutoModelForCausalLM, AutoProcessor
+    output_dir = os.path.abspath(output_dir)
+    if os.path.lexists(output_dir):
+        raise FileExistsError("output_dir already exists: %s" % output_dir)
+    parent_dir = os.path.dirname(output_dir)
+    os.makedirs(parent_dir, exist_ok=True)
+    staging_dir = tempfile.mkdtemp(prefix=".%s." % os.path.basename(output_dir), dir=parent_dir)
 
-    try:
-        from transformers import AutoModelForImageTextToText
-    except ImportError:
-        from transformers import AutoModelForVision2Seq as AutoModelForImageTextToText
-
-    torch_dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
     vlm = None
     merged_lm = None
     processor = None
     try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoProcessor
+
+        try:
+            from transformers import AutoModelForImageTextToText
+        except ImportError:
+            from transformers import AutoModelForVision2Seq as AutoModelForImageTextToText
+
+        torch_dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
         vlm = AutoModelForImageTextToText.from_pretrained(
             vlm_base_path,
             torch_dtype=torch_dtype,
@@ -52,17 +82,13 @@ def materialize_full_vlm(merged_llm_dir, vlm_base_path, output_dir, dtype) -> No
             trust_remote_code=True,
         )
         replace_language_model_weights(vlm, merged_lm)
-        if os.path.lexists(output_dir):
-            if os.path.islink(output_dir) or os.path.isfile(output_dir):
-                os.unlink(output_dir)
-            else:
-                shutil.rmtree(output_dir)
-        os.makedirs(output_dir)
-        vlm.save_pretrained(output_dir)
+        vlm.save_pretrained(staging_dir)
         processor = AutoProcessor.from_pretrained(vlm_base_path, trust_remote_code=True)
-        processor.save_pretrained(output_dir)
+        processor.save_pretrained(staging_dir)
+        os.rename(staging_dir, output_dir)
+        staging_dir = None
     finally:
         del processor, merged_lm, vlm
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if staging_dir:
+            shutil.rmtree(staging_dir, ignore_errors=True)
