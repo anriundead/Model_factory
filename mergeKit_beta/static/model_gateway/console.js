@@ -145,26 +145,61 @@
         if (!gatewayState.adminToken) {
             renderServices();
             renderKeys();
-            return;
+            renderPublishedModels();
+            return { failed: 0 };
         }
         renderPublishedModelsLoading();
-        try {
-            const [services, keys, models] = await Promise.all([
-                requestJson("/api/model-gateway/admin/model-services", { headers: adminHeaders() }),
-                requestJson("/api/model-gateway/admin/api-keys", { headers: adminHeaders() }),
-                requestJson("/api/model-gateway/admin/publishable-models", { headers: adminHeaders() })
-            ]);
-            gatewayState.services = services.services || [];
-            gatewayState.apiKeys = keys.api_keys || [];
-            gatewayState.publishableModels = models.models || [];
+        const results = await Promise.allSettled([
+            requestJson("/api/model-gateway/admin/model-services", { headers: adminHeaders() }),
+            requestJson("/api/model-gateway/admin/api-keys", { headers: adminHeaders() }),
+            requestJson("/api/model-gateway/admin/publishable-models", { headers: adminHeaders() })
+        ]);
+        renderServicesResult(results[0]);
+        renderKeysResult(results[1]);
+        renderPublishedModelsResult(results[2]);
+        const rejected = results.filter((result) => result.status === "rejected");
+        const authError = rejected.find((result) => [401, 403].includes((result.reason || {}).status));
+        if (authError) throw authError.reason;
+        return { failed: rejected.length };
+    }
+
+    function renderServicesResult(result) {
+        if (result.status === "fulfilled") {
+            gatewayState.services = result.value.services || [];
             renderServices();
-            renderKeys();
-            renderPublishedModels();
-        } catch (error) {
-            gatewayState.publishableModels = [];
-            renderPublishedModelsError(error);
-            throw error;
+            return;
         }
+        const list = $("gateway-services-list");
+        if (list) list.innerHTML = '<div class="gateway-empty">服务列表加载失败，请重试。</div>';
+    }
+
+    function renderKeysResult(result) {
+        if (result.status === "fulfilled") {
+            gatewayState.apiKeys = result.value.api_keys || [];
+            renderKeys();
+            return;
+        }
+        const list = $("gateway-api-keys-list");
+        if (list) list.innerHTML = '<div class="gateway-empty">API Key 加载失败，请重试。</div>';
+    }
+
+    function renderPublishedModelsResult(result) {
+        if (result.status === "fulfilled") {
+            gatewayState.publishableModels = result.value.models || [];
+            renderPublishedModels();
+        } else {
+            gatewayState.publishableModels = [];
+            renderPublishedModelsError(result.reason || {});
+        }
+    }
+
+    async function loadPublishedModels() {
+        renderPublishedModelsLoading();
+        const result = await Promise.allSettled([
+            requestJson("/api/model-gateway/admin/publishable-models", { headers: adminHeaders() })
+        ]);
+        renderPublishedModelsResult(result[0]);
+        if (result[0].status === "rejected") throw result[0].reason;
     }
 
     function renderPublishedModelsLoading() {
@@ -258,8 +293,8 @@
             event.preventDefault();
             gatewayState.adminToken = ($("gateway-admin-token").value || "").trim();
             try {
-                await loadAdminData();
-                showToast("管理员连接成功", "success");
+                const result = await loadAdminData();
+                showToast(result.failed ? "管理员已连接，部分数据加载失败" : "管理员连接成功", result.failed ? "error" : "success");
             } catch (err) {
                 showToast(`管理员连接失败：${err.message}`, "error");
             }
@@ -271,7 +306,7 @@
         if (unavailableModels) unavailableModels.addEventListener("click", async (event) => {
             if (!event.target.closest("[data-retry-published-models]")) return;
             try {
-                await loadAdminData();
+                await loadPublishedModels();
                 showToast("正式资产已刷新", "success");
             } catch (err) {
                 showToast(`正式资产加载失败：${err.message}`, "error");

@@ -796,14 +796,14 @@
 
 .gateway-toast {
     position: fixed;
-    left: 50%;
-    bottom: 24px;
-    transform: translateX(-50%) translateY(20px);
+    top: 10px;
+    right: 16px;
+    transform: translateY(-12px);
     opacity: 0;
     pointer-events: none;
     z-index: 4000;
     max-width: min(520px, calc(100vw - 32px));
-    border-radius: 999px;
+    border-radius: var(--gateway-small-radius);
     padding: 12px 16px;
     background: #111827;
     color: #ffffff;
@@ -813,7 +813,7 @@
 
 .gateway-toast.show {
     opacity: 1;
-    transform: translateX(-50%) translateY(0);
+    transform: translateY(0);
 }
 
 .gateway-toast.error {
@@ -852,6 +852,11 @@
 }
 
 @media (max-width: 720px) {
+    .gateway-toast {
+        right: 12px;
+        max-width: calc(100vw - 88px);
+    }
+
     .gateway-header-inner,
     .gateway-page {
         padding-left: 16px;

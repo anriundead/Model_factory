@@ -118,9 +118,9 @@
         </div>
     </div>
     <div id="publication-validate-overlay" class="modal-overlay" style="display:none; opacity:0;" aria-hidden="true">
-        <div class="ios-modal" style="max-width: 460px;" onclick="event.stopPropagation()">
+        <div class="ios-modal publication-validation-dialog" role="dialog" aria-modal="true" aria-labelledby="publication-validate-title" onclick="event.stopPropagation()">
             <div class="modal-header">
-                <h3>显式验证 GPU</h3>
+                <h3 id="publication-validate-title">显式验证 GPU</h3>
                 <p id="publication-validate-copy" class="limit-desc" style="margin-top: 12px;">验证任务需要管理员明确选择 GPU。</p>
             </div>
             <form id="publication-validate-form" class="publication-validation-form">
@@ -155,7 +155,11 @@
         .publication-rail { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:2px; background:var(--border-color, #d2d2d7); padding:2px; }
         .publication-rail span { min-height:5px; background:#e5e5ea; }
         .publication-rail span.is-current { background:var(--accent-color, #007aff); }
-        .publication-rail span.is-failed { background:var(--error, #ff3b30); }
+        .publication-rail span.is-gateway { background:#e5e5ea; }
+        .publication-task.is-terminal-failed, .publication-task.is-terminal-unknown { border-color:var(--error, #ff3b30); }
+        .publication-task.is-terminal-failed .publication-state, .publication-task.is-terminal-unknown .publication-state { color:var(--error, #ff3b30); font-weight:600; }
+        .publication-task.is-terminal-canceled { border-color:#8e8e93; border-style:dashed; }
+        .publication-task.is-terminal-canceled .publication-state { color:#636366; font-weight:600; }
         .publication-task-actions button { border:1px solid var(--border-color, #d2d2d7); border-radius:5px; background:#fff; color:inherit; padding:7px 10px; cursor:pointer; }
         .publication-task-actions button:hover { border-color:var(--accent-color, #007aff); transform:translateY(-1px); }
         .publication-task-actions button:active { transform:translateY(1px); }
@@ -163,10 +167,13 @@
         .publication-validation-form { display:grid; gap:16px; padding:0 20px 20px; }
         .publication-validation-form fieldset { border:1px solid var(--border-color, #d2d2d7); border-radius:6px; padding:12px; }
         .publication-validation-form fieldset label { font-weight:400; }
+        #publication-validate-overlay { box-sizing:border-box; padding:12px; overflow-y:auto; }
+        .publication-validation-dialog { width:min(100%, 460px); max-width:460px; max-height:calc(100dvh - 24px); margin:auto; overflow-y:auto; }
         @media (max-width: 840px) { .publication-form { grid-template-columns:1fr 1fr; } }
         @media (max-width: 560px) { .publication-form { grid-template-columns:1fr; } .publication-rail { grid-template-columns:repeat(5, minmax(24px, 1fr)); } }
         @media (prefers-reduced-motion: reduce) { .publication-task-actions button { transition:none; } .publication-task-actions button:hover { transform:none; } }
     </style>
+    <script src="/static/model_publication_ui.js"></script>
     <script>
         document.getElementById('menu-btn').onclick = function() { document.getElementById('history-sidebar').classList.add('open'); document.getElementById('sidebar-overlay').classList.add('show'); };
         document.getElementById('close-sidebar').onclick = function() { document.getElementById('history-sidebar').classList.remove('open'); document.getElementById('sidebar-overlay').classList.remove('show'); };
@@ -352,17 +359,35 @@
         };
 
         var recipesData = [];
-        var publicationState = { taskIds: [], tasks: {}, timer: null, validationTaskId: null, assets: [] };
+        var publicationState = { taskIds: [], tasks: {}, validationTaskId: null, assets: [], storageWarning: false };
         var publicationStorageKey = 'mergeneticPublicationTaskIdsV1';
         var publicationStages = ['recipe', 'materializing', 'validating', 'published', 'gateway'];
+        var publicationGeneration = PublicationUI.createGenerationGate();
+        var publicationPoller = PublicationUI.createPollScheduler({
+            setTimer: window.setTimeout.bind(window),
+            clearTimer: window.clearTimeout.bind(window),
+            normalDelay: 3000,
+            retryBaseDelay: 1000,
+            retryMaxDelay: 12000
+        });
+        var publicationStorage;
+        try { publicationStorage = PublicationUI.safeStorage(window.localStorage); }
+        catch (error) { publicationStorage = PublicationUI.safeStorage(null); publicationState.storageWarning = true; }
+        var publicationValidationTrigger = null;
+        var publicationBackground = document.getElementById('main-app');
+        var publicationHeader = document.querySelector('.sticky-header');
 
         function publicationToken() { return (document.getElementById('publication-admin-token').value || '').trim(); }
-        function publicationHeaders() { return { 'Authorization': 'Bearer ' + publicationToken(), 'Content-Type': 'application/json' }; }
+        function publicationHeaders(snapshot) { return { 'Authorization': 'Bearer ' + snapshot.token, 'Content-Type': 'application/json' }; }
         function publicationMessage(message) { document.getElementById('publication-live-status').textContent = message || ''; }
+        function publicationStorageWarning(message) { return (message ? message + ' ' : '') + '本地任务记录不可用；本次任务仍会在当前页面轮询。'; }
         function publicationErrorMessage(error) { return error && error.message ? error.message : '请求失败'; }
-        function publicationRequest(url, options) {
+        function publicationRequest(url, options, snapshot) {
             return fetch(url, options || {}).then(function(response) {
                 return response.json().catch(function() { return {}; }).then(function(data) {
+                    if (!publicationGeneration.isCurrent(snapshot)) {
+                        var stale = new Error('stale token response'); stale.stale = true; throw stale;
+                    }
                     if (!response.ok) {
                         var error = new Error((data.error && data.error.message) || ('HTTP ' + response.status));
                         error.status = response.status;
@@ -373,21 +398,27 @@
                 });
             });
         }
-        function publicationSaveTaskIds() { localStorage.setItem(publicationStorageKey, JSON.stringify(publicationState.taskIds.slice(0, 24))); }
+        function publicationSaveTaskIds() {
+            var ids = publicationState.taskIds.slice(0, 24);
+            var ok = ids.length ? publicationStorage.set(publicationStorageKey, JSON.stringify(ids)) : publicationStorage.remove(publicationStorageKey);
+            if (!ok) publicationState.storageWarning = true;
+            return ok;
+        }
         function publicationLoadTaskIds() {
+            var result = publicationStorage.get(publicationStorageKey);
+            if (!result.ok) { publicationState.storageWarning = true; publicationState.taskIds = []; return; }
             try {
-                var stored = JSON.parse(localStorage.getItem(publicationStorageKey) || '[]');
+                var stored = JSON.parse(result.value || '[]');
                 publicationState.taskIds = Array.isArray(stored) ? stored.filter(function(id) { return typeof id === 'string'; }).slice(0, 24) : [];
-            } catch (error) { publicationState.taskIds = []; }
+            } catch (error) {
+                publicationState.taskIds = [];
+                if (!publicationStorage.remove(publicationStorageKey)) publicationState.storageWarning = true;
+            }
         }
-        function publicationStage(status) {
-            if (status === 'queued') return 0;
-            if (status === 'materializing') return 1;
-            if (status === 'validating') return 2;
-            if (status === 'registration_pending' || status === 'published') return 3;
-            return 4;
+        function publicationIsActive(status) { return PublicationUI.lifecycleForStatus(status).kind === 'active'; }
+        function publicationHasNonterminalTask() {
+            return publicationState.taskIds.some(function(id) { return !publicationState.tasks[id] || publicationIsActive(publicationState.tasks[id].status); });
         }
-        function publicationIsActive(status) { return ['queued', 'running', 'materializing', 'validating', 'registration_pending'].indexOf(status) !== -1; }
         function renderPublicationTasks() {
             var list = document.getElementById('publication-status-list');
             if (!publicationState.taskIds.length) { list.innerHTML = '<p class="limit-desc">尚未提交发布任务。</p>'; return; }
@@ -395,13 +426,20 @@
             publicationState.taskIds.forEach(function(taskId) {
                 var task = publicationState.tasks[taskId] || { id: taskId, status: 'loading', display_name: taskId };
                 var item = document.createElement('article');
-                item.className = 'publication-task';
+                var lifecycle = PublicationUI.lifecycleForStatus(task.status);
+                item.className = 'publication-task' + (['failed', 'canceled', 'unknown'].indexOf(lifecycle.kind) !== -1 ? ' is-terminal-' + lifecycle.kind : '');
                 var head = document.createElement('div'); head.className = 'publication-task-head';
                 var name = document.createElement('strong'); name.className = 'publication-task-name'; name.textContent = task.display_name || task.publication_id || task.id;
                 var state = document.createElement('span'); state.className = 'publication-state'; state.textContent = task.status || 'loading';
                 head.appendChild(name); head.appendChild(state); item.appendChild(head);
                 var rail = document.createElement('div'); rail.className = 'publication-rail'; rail.setAttribute('aria-label', '发布生命周期：recipe, materializing, validating, published, gateway');
-                publicationStages.forEach(function(stage, index) { var segment = document.createElement('span'); if (index === publicationStage(task.status)) segment.className = task.status === 'failed' ? 'is-failed' : 'is-current'; segment.title = stage; rail.appendChild(segment); });
+                publicationStages.forEach(function(stage, index) {
+                    var segment = document.createElement('span');
+                    if (index === lifecycle.segment) segment.classList.add('is-current');
+                    if (index === 4) segment.classList.add('is-gateway');
+                    segment.title = stage;
+                    rail.appendChild(segment);
+                });
                 item.appendChild(rail);
                 var detail = document.createElement('p'); detail.className = 'limit-desc';
                 detail.textContent = task.error || task.error_code || (task.status === 'validating' ? '等待管理员选择验证 GPU。' : '');
@@ -434,17 +472,20 @@
                 item.appendChild(detail); list.appendChild(item);
             });
         }
-        async function loadPublicationAssets() {
-            if (!publicationToken()) { renderPublicationAssets(); return; }
+        async function loadPublicationAssets(snapshot) {
+            snapshot = snapshot || publicationGeneration.snapshot();
+            if (!snapshot.token) { renderPublicationAssets(); return; }
             try {
-                var data = await publicationRequest('/api/model-gateway/admin/publishable-models', { headers: publicationHeaders() });
+                var data = await publicationRequest('/api/model-gateway/admin/publishable-models', { headers: publicationHeaders(snapshot) }, snapshot);
                 publicationState.assets = data.models || [];
                 renderPublicationAssets();
             } catch (error) {
+                if (error.stale || !publicationGeneration.isCurrent(snapshot)) return;
                 publicationState.assets = [];
                 var list = document.getElementById('publication-assets-list');
                 list.innerHTML = '<p class="limit-desc">正式资产加载失败。</p><button type="button" class="publication-assets-retry">重试</button>';
-                publicationMessage(error.status === 401 ? '管理员 Token 无效，无法加载正式资产。' : ('正式资产加载失败：' + publicationErrorMessage(error)));
+                if (error.status === 401 || error.status === 403) publicationPoller.stop();
+                publicationMessage(error.status === 401 || error.status === 403 ? '管理员 Token 无效，请更正后重试。' : ('正式资产加载失败：' + publicationErrorMessage(error)));
             }
         }
         function loadPublicationRecipes(recipes) {
@@ -454,37 +495,98 @@
             recipes.forEach(function(recipe) { var option = document.createElement('option'); option.value = String(recipe.recipe_id || '') + '.json'; option.textContent = recipe.custom_name || recipe.recipe_id || '未命名配方'; select.appendChild(option); });
             select.disabled = !recipes.length;
         }
-        async function refreshPublicationTask(taskId) {
-            var data = await publicationRequest('/api/model-publications/' + encodeURIComponent(taskId), { headers: publicationHeaders() });
-            publicationState.tasks[taskId] = data.task;
+        async function refreshPublicationTask(taskId, snapshot) {
+            var data = await publicationRequest('/api/model-publications/' + encodeURIComponent(taskId), { headers: publicationHeaders(snapshot) }, snapshot);
             return data.task;
         }
-        async function loadPublicationTasks() {
+        async function loadPublicationTasks(snapshot) {
+            snapshot = snapshot || publicationGeneration.snapshot();
             if (!publicationState.taskIds.length) { renderPublicationTasks(); return; }
-            if (!publicationToken()) { renderPublicationTasks(); publicationMessage('输入管理员 Token 后查看发布任务状态。'); return; }
-            try {
-                var tasks = await Promise.all(publicationState.taskIds.map(function(id) { return refreshPublicationTask(id).catch(function(error) { if (error.status === 404) return null; throw error; }); }));
-                publicationState.taskIds = publicationState.taskIds.filter(function(id, index) { return tasks[index] !== null; });
-                publicationSaveTaskIds(); renderPublicationTasks();
-                if (tasks.some(function(task) { return task && publicationIsActive(task.status); })) schedulePublicationPoll();
-                else if (publicationState.timer) { clearTimeout(publicationState.timer); publicationState.timer = null; }
-            } catch (error) { publicationMessage(error.status === 401 ? '管理员 Token 无效，无法读取发布任务。' : ('任务状态加载失败：' + publicationErrorMessage(error))); renderPublicationTasks(); }
+            if (!snapshot.token) { renderPublicationTasks(); publicationMessage('输入管理员 Token 后查看发布任务状态。'); return; }
+            var ids = publicationState.taskIds.slice();
+            var results = await Promise.allSettled(ids.map(function(id) { return refreshPublicationTask(id, snapshot); }));
+            if (!publicationGeneration.isCurrent(snapshot)) return;
+            var successful = false;
+            var transientError = null;
+            var authError = null;
+            results.forEach(function(result, index) {
+                var id = ids[index];
+                if (result.status === 'fulfilled') { publicationState.tasks[id] = result.value; successful = true; return; }
+                var error = result.reason || {};
+                var action = PublicationUI.pollFailureAction(error.status, publicationHasNonterminalTask());
+                if (action === 'missing') { delete publicationState.tasks[id]; publicationState.taskIds = publicationState.taskIds.filter(function(taskId) { return taskId !== id; }); }
+                else if (action === 'auth') authError = error;
+                else if (action === 'retry') transientError = error;
+            });
+            if (successful) publicationPoller.succeeded();
+            publicationSaveTaskIds();
+            renderPublicationTasks();
+            if (authError) {
+                publicationPoller.stop();
+                publicationMessage('管理员 Token 无效，请更正后重试。');
+            } else if (transientError && publicationHasNonterminalTask()) {
+                publicationMessage('任务状态暂时不可用，正在重试。');
+                schedulePublicationPoll(true, snapshot);
+            } else if (publicationHasNonterminalTask()) {
+                schedulePublicationPoll(false, snapshot);
+            } else {
+                publicationPoller.stop();
+            }
         }
-        function schedulePublicationPoll() {
-            if (publicationState.timer) clearTimeout(publicationState.timer);
-            publicationState.timer = setTimeout(function() { loadPublicationTasks(); }, 3000);
+        function schedulePublicationPoll(transient, snapshot) {
+            snapshot = snapshot || publicationGeneration.snapshot();
+            publicationPoller.schedule(function() {
+                if (publicationGeneration.isCurrent(snapshot)) loadPublicationTasks(snapshot);
+            }, !!transient);
         }
-        function openPublicationValidation(taskId) {
+        function publicationDialogFocusables() {
+            return Array.from(document.querySelectorAll('#publication-validate-overlay input:not([disabled]), #publication-validate-overlay button:not([disabled])'));
+        }
+        function publicationTrapFocus(event) {
+            if (event.key === 'Escape') { event.preventDefault(); closePublicationValidation(); return; }
+            if (event.key !== 'Tab') return;
+            var focusable = publicationDialogFocusables();
+            if (!focusable.length) { event.preventDefault(); return; }
+            var first = focusable[0]; var last = focusable[focusable.length - 1];
+            if (event.shiftKey && (document.activeElement === first || !event.currentTarget.contains(document.activeElement))) { event.preventDefault(); last.focus(); }
+            else if (!event.shiftKey && (document.activeElement === last || !event.currentTarget.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
+        }
+        function openPublicationValidation(taskId, trigger) {
             publicationState.validationTaskId = taskId;
+            publicationValidationTrigger = trigger || document.activeElement;
             document.querySelectorAll('input[name="publication-gpu"]').forEach(function(input) { input.checked = false; });
             document.getElementById('publication-validate-error').textContent = '';
             document.getElementById('publication-validate-copy').textContent = '任务 ' + taskId + ' 正在等待验证。GPU 2 不在可选范围内。';
             var overlay = document.getElementById('publication-validate-overlay'); overlay.style.display = 'flex'; overlay.style.opacity = '1'; overlay.classList.add('show'); overlay.setAttribute('aria-hidden', 'false');
+            publicationBackground.inert = true;
+            publicationHeader.inert = true;
+            window.setTimeout(function() { var focusable = publicationDialogFocusables(); if (focusable.length) focusable[0].focus(); }, 0);
         }
-        function closePublicationValidation() { var overlay = document.getElementById('publication-validate-overlay'); overlay.style.display = 'none'; overlay.classList.remove('show'); overlay.setAttribute('aria-hidden', 'true'); publicationState.validationTaskId = null; }
+        function closePublicationValidation() {
+            var overlay = document.getElementById('publication-validate-overlay'); overlay.style.display = 'none'; overlay.classList.remove('show'); overlay.setAttribute('aria-hidden', 'true');
+            publicationBackground.inert = false;
+            publicationHeader.inert = false;
+            publicationState.validationTaskId = null;
+            if (publicationValidationTrigger && publicationValidationTrigger.isConnected) publicationValidationTrigger.focus();
+            publicationValidationTrigger = null;
+        }
+        function publicationTokenChanged() {
+            if (!publicationGeneration.changeToken(publicationToken())) return;
+            publicationPoller.stop();
+            publicationState.tasks = {};
+            publicationState.assets = [];
+            if (publicationState.validationTaskId) closePublicationValidation();
+            renderPublicationTasks();
+            renderPublicationAssets();
+            publicationMessage('');
+            var snapshot = publicationGeneration.snapshot();
+            if (snapshot.token) { loadPublicationTasks(snapshot); loadPublicationAssets(snapshot); }
+        }
         function bindPublicationControls() {
             publicationLoadTaskIds();
-            document.getElementById('publication-admin-token').addEventListener('change', function() { publicationMessage(''); loadPublicationTasks(); loadPublicationAssets(); });
+            var tokenInput = document.getElementById('publication-admin-token');
+            tokenInput.addEventListener('input', publicationTokenChanged);
+            tokenInput.addEventListener('change', publicationTokenChanged);
             document.getElementById('publication-assets-list').addEventListener('click', function(event) { if (event.target.closest('.publication-assets-retry')) loadPublicationAssets(); });
             document.getElementById('publication-create-form').addEventListener('submit', async function(event) {
                 event.preventDefault();
@@ -492,31 +594,38 @@
                 var displayName = document.getElementById('publication-display-name').value.trim();
                 if (!publicationToken() || !recipe || !displayName) { publicationMessage('请填写管理员 Token、配方和发布名称。'); return; }
                 var idempotencyKey = window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : ('publication-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+                var snapshot = publicationGeneration.snapshot();
                 try {
-                    var data = await publicationRequest('/api/model-publications', { method: 'POST', headers: Object.assign(publicationHeaders(), { 'Idempotency-Key': idempotencyKey }), body: JSON.stringify({ source_type: 'recipe', recipe_path: recipe, display_name: displayName }) });
-                    var task = data.task; publicationState.tasks[task.id] = task;
-                    if (publicationState.taskIds.indexOf(task.id) === -1) publicationState.taskIds.unshift(task.id);
-                    publicationSaveTaskIds(); renderPublicationTasks(); publicationMessage('发布任务已提交。'); schedulePublicationPoll();
-                } catch (error) { publicationMessage(error.status === 409 ? '幂等键冲突，请重新提交。' : ('提交失败：' + publicationErrorMessage(error))); }
+                    var data = await publicationRequest('/api/model-publications', { method: 'POST', headers: Object.assign(publicationHeaders(snapshot), { 'Idempotency-Key': idempotencyKey }), body: JSON.stringify({ source_type: 'recipe', recipe_path: recipe, display_name: displayName }) }, snapshot);
+                    var task = data.task;
+                    var stored = PublicationUI.acceptSubmission(publicationState, task, publicationSaveTaskIds, function() { schedulePublicationPoll(false, snapshot); });
+                    renderPublicationTasks();
+                    publicationMessage(stored ? '发布任务已提交。' : publicationStorageWarning('发布任务已提交。'));
+                } catch (error) { if (!error.stale && publicationGeneration.isCurrent(snapshot)) publicationMessage(error.status === 409 ? '幂等键冲突，请重新提交。' : ('提交失败：' + publicationErrorMessage(error))); }
             });
             document.getElementById('publication-status-list').addEventListener('click', async function(event) {
                 var cancel = event.target.closest('[data-publication-cancel]'); var validate = event.target.closest('[data-publication-validate]');
-                if (validate) { openPublicationValidation(validate.dataset.publicationValidate); return; }
+                if (validate) { openPublicationValidation(validate.dataset.publicationValidate, validate); return; }
                 if (!cancel) return;
-                try { await publicationRequest('/api/model-publications/' + encodeURIComponent(cancel.dataset.publicationCancel) + '/cancel', { method: 'POST', headers: publicationHeaders() }); publicationMessage('取消请求已提交。'); await loadPublicationTasks(); }
-                catch (error) { publicationMessage(error.status === 409 ? '该任务当前不能取消。' : ('取消失败：' + publicationErrorMessage(error))); }
+                var snapshot = publicationGeneration.snapshot();
+                try { await publicationRequest('/api/model-publications/' + encodeURIComponent(cancel.dataset.publicationCancel) + '/cancel', { method: 'POST', headers: publicationHeaders(snapshot) }, snapshot); publicationMessage('取消请求已提交。'); await loadPublicationTasks(snapshot); }
+                catch (error) { if (!error.stale && publicationGeneration.isCurrent(snapshot)) publicationMessage(error.status === 409 ? '该任务当前不能取消。' : ('取消失败：' + publicationErrorMessage(error))); }
             });
             document.getElementById('publication-validate-cancel').addEventListener('click', closePublicationValidation);
             document.getElementById('publication-validate-overlay').addEventListener('click', function(event) { if (event.target === this) closePublicationValidation(); });
+            document.getElementById('publication-validate-overlay').addEventListener('keydown', publicationTrapFocus);
             document.getElementById('publication-validate-form').addEventListener('submit', async function(event) {
                 event.preventDefault();
                 var gpuIds = Array.from(document.querySelectorAll('input[name="publication-gpu"]:checked')).map(function(input) { return Number(input.value); });
                 var errorEl = document.getElementById('publication-validate-error');
                 if (!gpuIds.length) { errorEl.textContent = '必须明确选择至少一个验证 GPU。'; return; }
-                try { await publicationRequest('/api/model-publications/' + encodeURIComponent(publicationState.validationTaskId) + '/validate', { method: 'POST', headers: publicationHeaders(), body: JSON.stringify({ gpu_ids: gpuIds }) }); closePublicationValidation(); publicationMessage('验证已进入队列。'); await loadPublicationTasks(); }
-                catch (error) { errorEl.textContent = error.status === 409 ? '验证已经在队列中或任务状态已变化。' : ('验证失败：' + publicationErrorMessage(error)); }
+                var taskId = publicationState.validationTaskId; var snapshot = publicationGeneration.snapshot();
+                try { await publicationRequest('/api/model-publications/' + encodeURIComponent(taskId) + '/validate', { method: 'POST', headers: publicationHeaders(snapshot), body: JSON.stringify({ gpu_ids: gpuIds }) }, snapshot); closePublicationValidation(); publicationMessage('验证已进入队列。'); await loadPublicationTasks(snapshot); }
+                catch (error) { if (!error.stale && publicationGeneration.isCurrent(snapshot)) errorEl.textContent = error.status === 409 ? '验证已经在队列中或任务状态已变化。' : ('验证失败：' + publicationErrorMessage(error)); }
             });
+            publicationGeneration.changeToken(publicationToken());
             renderPublicationTasks(); renderPublicationAssets();
+            if (publicationState.storageWarning) publicationMessage(publicationStorageWarning(''));
         }
 
         function showRecipeDetail(recipeId) {
