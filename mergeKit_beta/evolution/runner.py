@@ -543,7 +543,7 @@ def _do_success_path(
 ) -> None:
     """
     完全融合成功路径：复制 final_vlm 到命名目录、写 fusion_info/README/配方、创建 output 链接、
-    清理中间目录，并更新 metadata.json 为 success。任一步骤失败会抛异常，由调用方决定是否仍写 metadata。
+    清理中间目录，并更新 metadata.json 为 success。任一步骤失败都会抛异常。
     """
     output_dir = os.path.join(merge_dir, "output")
     if not os.path.isdir(final_vlm_output) or not os.listdir(final_vlm_output):
@@ -556,8 +556,7 @@ def _do_success_path(
                 logger.info("已清理空的中间模型目录: %s", final_vlm_output)
             except Exception as e:
                 logger.warning("清理空目录失败（可忽略）: %s", e)
-        _ensure_metadata_success(meta_path, logger)
-        return
+        raise RuntimeError("final_vlm_output is missing or empty")
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
@@ -1322,7 +1321,8 @@ def main():
             except Exception as e:
                 logger.warning("最终评测异常（不阻断主流程）: %s", e)
 
-        # 完全融合成功：复制到命名目录、写 fusion_info、更新 metadata；任一步骤失败仍尽量将任务标为成功
+        # 完全融合成功：复制到命名目录、写 fusion_info、更新 metadata。
+        # 收尾失败时保留现场并让外层写 error，禁止无模型任务被标记成功。
         try:
             _do_success_path(
                 merge_dir=merge_dir,
@@ -1336,7 +1336,7 @@ def main():
             )
         except Exception as e:
             logger.exception("收尾步骤异常: %s", e)
-            _ensure_metadata_success(meta_path, logger, message="任务完成（收尾步骤部分失败，模型在 final_vlm）")
+            raise
 
         # progress.json 终态与 metadata success 对齐，避免前端仍显示 running
         try:
