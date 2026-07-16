@@ -215,6 +215,30 @@ def register_routes(app, state, services, dataset_service):
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
 
+    def _delete_formal_published_model(path=None, model_id=None):
+        from .extensions import db
+        from .model_publication import PublicationError, delete_registered_published_asset
+        from .models import Model
+
+        model = db.session.get(Model, model_id) if model_id else None
+        if model is None and path:
+            real_path = os.path.realpath(os.path.abspath(path.rstrip(os.sep)))
+            model = next(
+                (row for row in db.session.query(Model).filter(Model.source == "published").all()
+                 if os.path.realpath(os.path.abspath(row.path.rstrip(os.sep))) == real_path),
+                None,
+            )
+        if model is None or model.source != "published":
+            return None
+        try:
+            result = delete_registered_published_asset(
+                os.path.basename(os.path.realpath(os.path.abspath(model.path.rstrip(os.sep)))),
+                app.config.get("PUBLISHED_MODELS_PATH") or getattr(state.config, "PUBLISHED_MODELS_PATH", ""),
+            )
+        except PublicationError as exc:
+            return jsonify({"error": {"code": exc.code, "message": str(exc)}}), 409 if exc.code == "asset_in_use" else 400
+        return jsonify({"status": "success", **result})
+
     @app.route("/api/models/delete", methods=["POST"])
     def delete_model():
         try:
@@ -227,6 +251,10 @@ def register_routes(app, state, services, dataset_service):
             resolved_path = services.resolve_model_path(path)
             if not resolved_path:
                  return jsonify({"status": "error", "message": "模型不存在或路径无效"}), 404
+
+            published_response = _delete_formal_published_model(path=resolved_path)
+            if published_response is not None:
+                return published_response
             
             extra_paths = getattr(state.config, "LOCAL_MODELS_EXTRA_PATHS", None) or []
             allowed_bases = [
@@ -888,6 +916,9 @@ def register_routes(app, state, services, dataset_service):
         model_id = (model_id or "").strip()
         if not model_id:
             return jsonify({"status": "error", "message": "模型 ID 无效"}), 400
+        published_response = _delete_formal_published_model(model_id=model_id)
+        if published_response is not None:
+            return published_response
         models = services.model_repo_load_raw()
         if not isinstance(models, dict):
             return jsonify({"status": "error", "message": "仓库数据异常"}), 500
@@ -2248,34 +2279,12 @@ def register_routes(app, state, services, dataset_service):
         denied = _publication_admin()
         if denied:
             return denied
-        from .extensions import db
-        from .models import Model
-        from .model_gateway.models import ServingModelService
-        from .model_publication import PublicationError, delete_published_asset
-        from .repositories import model_delete_by_canonical_path, publication_task_is_active
+        from .model_publication import PublicationError, delete_registered_published_asset
 
         root = app.config.get("PUBLISHED_MODELS_PATH") or getattr(state.config, "PUBLISHED_MODELS_PATH", "")
 
-        def reference_check(candidate_id, path):
-            real_path = os.path.realpath(os.path.abspath(path.rstrip(os.sep)))
-            model = next(
-                (
-                    row
-                    for row in db.session.query(Model).all()
-                    if os.path.realpath(os.path.abspath(row.path.rstrip(os.sep))) == real_path
-                ),
-                None,
-            )
-            if publication_task_is_active(candidate_id) is not False:
-                return True
-            for service in db.session.query(ServingModelService).filter(ServingModelService.status != "deleted").all():
-                service_path = os.path.realpath(os.path.abspath(service.model_path.rstrip(os.sep)))
-                if service_path == real_path or (model is not None and service.model_id == model.id):
-                    return True
-            return False
-
         try:
-            result = delete_published_asset(publication_id, root, reference_check, model_delete_by_canonical_path)
+            result = delete_registered_published_asset(publication_id, root)
         except PublicationError as exc:
-            return jsonify({"error": {"code": exc.code, "message": str(exc)}}), 409 if exc.code == "publication_referenced" else 400
+            return jsonify({"error": {"code": exc.code, "message": str(exc)}}), 409 if exc.code == "asset_in_use" else 400
         return jsonify({"status": "success", **result})

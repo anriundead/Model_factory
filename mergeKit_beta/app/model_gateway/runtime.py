@@ -71,8 +71,33 @@ def allowed_model_roots(config) -> list[str]:
         getattr(config, "MODEL_POOL_PATH", ""),
         getattr(config, "LOCAL_MODELS_PATH", ""),
         getattr(config, "MERGE_DIR", ""),
+        getattr(config, "PUBLISHED_MODELS_PATH", ""),
         *(getattr(config, "LOCAL_MODELS_EXTRA_PATHS", None) or []),
     ]
+
+
+def _validate_formal_service_asset(service: ServingModelService, config) -> None:
+    """Revalidate formal assets before they reserve a GPU or spawn vLLM."""
+    if not service.model_id:
+        return
+    from app.model_publication import PublicationError, validate_formal_published_model
+    from app.models import Model
+
+    model = db.session.get(Model, service.model_id)
+    if not model or model.source != "published":
+        return
+    try:
+        manifest = validate_formal_published_model(model, getattr(config, "PUBLISHED_MODELS_PATH", ""), full_hash=True)
+    except PublicationError as exc:
+        raise ValueError(str(exc)) from exc
+    if _real(service.model_path) != _real(model.path):
+        raise ValueError("published service path does not match its formal model")
+    serving = manifest["compatibility"]["serving"]
+    if serving.get("status") != "ready":
+        raise ValueError("published asset is not selectable")
+    from vllm import __version__ as vllm_version
+    if serving.get("tested_version") != vllm_version:
+        raise ValueError("published asset serving compatibility is stale")
 
 
 def validate_gpu_availability(
@@ -251,6 +276,7 @@ def start_service(service_id: str, config=None, timeout_s: int = 120) -> Serving
     if service.status == "running":
         return service
 
+    _validate_formal_service_asset(service, config)
     validate_model_path(service.model_path, allowed_model_roots(config))
     validate_gpu_availability(
         service,

@@ -77,6 +77,18 @@ class TestRuntimeValidation(RuntimeTestCase):
         with self.assertRaises(ValueError):
             validate_model_path(model_path, [os.path.join(self.tmp, "other")])
 
+    def test_allowed_model_roots_includes_published_models(self):
+        from app.model_gateway.runtime import allowed_model_roots
+
+        class Config:
+            MODEL_POOL_PATH = "/models"
+            LOCAL_MODELS_PATH = "/local"
+            MERGE_DIR = "/merges"
+            PUBLISHED_MODELS_PATH = "/published"
+            LOCAL_MODELS_EXTRA_PATHS = []
+
+        self.assertIn("/published", allowed_model_roots(Config))
+
     def test_find_free_port_skips_reserved_and_listening_ports(self):
         from app.model_gateway.runtime import find_free_port
 

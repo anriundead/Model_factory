@@ -345,6 +345,20 @@ def validate_published_asset(path: str, full_hash: bool = False) -> dict:
     return _validate_manifest(_directory(os.path.abspath(path), "validation_failed"), _load_manifest(os.path.abspath(path)), full_hash)
 
 
+def validate_formal_published_model(model, root: str, full_hash: bool = False) -> dict:
+    """Validate a core registry row as a formal, published asset."""
+    if getattr(model, "source", None) != "published":
+        raise _error("model_not_published", "model is not a formal published asset")
+    root = _publication_root(root)
+    path = _directory(getattr(model, "path", ""), "validation_failed")
+    if os.path.dirname(path) != root:
+        raise _error("validation_failed", "published model path is outside the publication root")
+    manifest = validate_published_asset(path, full_hash=full_hash)
+    if manifest.get("publication_id") != os.path.basename(path) or manifest.get("publication_state") != "published":
+        raise _error("validation_failed", "published model registry does not match its manifest")
+    return manifest
+
+
 def commit_staging(staging: str, root: str, manifest: dict, register_fn: Callable[[str, dict], object]) -> dict:
     root = _publication_root(root, create=True)
     publication_id = _publication_id(manifest.get("publication_id"))
@@ -517,3 +531,33 @@ def delete_published_asset(
         _fsync_directory(root)
         _fsync_directory(trash_root)
     return {"publication_id": publication_id, "deleted": True}
+
+
+def delete_registered_published_asset(publication_id: str, root: str) -> dict:
+    """Delete a formal asset only when no active task or Gateway row references it."""
+    from app.extensions import db
+    from app.model_gateway.models import ServingModelService
+    from app.models import Model
+    from app.repositories import model_delete_by_canonical_path, publication_task_is_active
+
+    def reference_check(candidate_id: str, path: str) -> bool:
+        real_path = os.path.realpath(os.path.abspath(path.rstrip(os.sep)))
+        models = db.session.query(Model).filter(Model.source == "published").all()
+        model = next(
+            (row for row in models if os.path.realpath(os.path.abspath(row.path.rstrip(os.sep))) == real_path),
+            None,
+        )
+        if publication_task_is_active(candidate_id) is not False:
+            return True
+        for service in db.session.query(ServingModelService).filter(ServingModelService.status != "deleted").all():
+            service_path = os.path.realpath(os.path.abspath(service.model_path.rstrip(os.sep)))
+            if service_path == real_path or (model is not None and service.model_id == model.id):
+                return True
+        return False
+
+    try:
+        return delete_published_asset(publication_id, root, reference_check, model_delete_by_canonical_path)
+    except PublicationError as exc:
+        if exc.code == "publication_referenced":
+            raise _error("asset_in_use", "publication is still referenced") from exc
+        raise

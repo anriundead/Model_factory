@@ -755,7 +755,7 @@ class PublicationRouteTest(unittest.TestCase):
                 headers=self.headers,
             )
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.get_json()["error"]["code"], "publication_referenced")
+        self.assertEqual(response.get_json()["error"]["code"], "asset_in_use")
 
     def test_manifest_rejects_symlink_escape_and_traversal(self):
         outside = os.path.join(self.tmpdir.name, "outside")

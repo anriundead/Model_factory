@@ -166,7 +166,7 @@ class TestAdminRoutes(ServingRoutesTestCase):
         self.assertEqual(resp.status_code, 401)
         self.assertEqual(resp.get_json()["error"]["code"], "unauthorized")
 
-    def test_admin_can_create_service_and_api_key(self):
+    def test_admin_rejects_path_based_service_creation_and_can_create_api_key(self):
         from app.model_gateway.models import ServingApiKey, ServingModelService
 
         model_path = self.make_model_dir()
@@ -189,10 +189,10 @@ class TestAdminRoutes(ServingRoutesTestCase):
             json={"owner_label": "demo-user", "model_allowlist": ["qwen-demo"]},
         )
 
-        self.assertEqual(service_resp.status_code, 201)
+        self.assertEqual(service_resp.status_code, 400)
         self.assertEqual(key_resp.status_code, 201)
         self.assertTrue(key_resp.get_json()["api_key"].startswith("mk_live_"))
-        self.assertEqual(self.db.session.query(ServingModelService).count(), 1)
+        self.assertEqual(self.db.session.query(ServingModelService).count(), 0)
         stored_key = self.db.session.query(ServingApiKey).one()
         self.assertNotEqual(stored_key.key_hash, key_resp.get_json()["api_key"])
 
