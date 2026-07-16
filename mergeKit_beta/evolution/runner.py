@@ -96,6 +96,7 @@ def _write_json_atomically(path: str, value: dict) -> None:
     directory = os.path.dirname(path) or "."
     fd, temporary_path = tempfile.mkstemp(prefix=".%s." % os.path.basename(path), dir=directory)
     try:
+        os.fchmod(fd, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(value, handle, ensure_ascii=False, indent=2)
             handle.flush()

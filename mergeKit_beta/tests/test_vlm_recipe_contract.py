@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -38,6 +39,15 @@ class VlmRecipeContractTest(unittest.TestCase):
         self.assertIn("best_genotype", enriched)
         self.assertEqual(enriched["custom_field"], "kept")
         json.dumps(enriched)
+
+    def test_atomic_recipe_is_readable_outside_the_container_owner(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "recipe.json")
+            runner._write_json_atomically(path, {"task_id": "recipe"})
+
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+
+        self.assertEqual(mode, 0o644)
 
     def test_vlm_recipe_preserves_historical_vlm_path(self):
         enriched = runner.build_recipe_vlm_fields(
