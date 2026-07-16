@@ -17,6 +17,7 @@ class ModelPublicationPortalTestCase(unittest.TestCase):
         self.assertIn('id="publication-status-list"', page)
         self.assertIn("/api/model-publications", page)
         self.assertIn(".sticky-header { margin: 0 0 40px; }", page)
+        self.assertIn("#publication-title, #published-assets-title { scroll-margin-top: 116px; }", page)
 
     def test_gateway_uses_formal_published_model_selector(self):
         page = self._read("templates", "model_gateway", "console.html")
