@@ -24,6 +24,7 @@ class TestResolveEvalDatasetCap(unittest.TestCase):
         self.assertEqual(_resolve_eval_dataset_cap(1000, "0.5"), 500)
         self.assertEqual(_resolve_eval_dataset_cap(1000, "1.0"), 1000)
         self.assertEqual(_resolve_eval_dataset_cap(1000, 1.0), 1000)
+        self.assertEqual(_resolve_eval_dataset_cap(1000, 1), 1000)
         self.assertEqual(_resolve_eval_dataset_cap(1000, "6"), 6)
         self.assertEqual(_resolve_eval_dataset_cap(1000, 6), 6)
         self.assertEqual(_resolve_eval_dataset_cap(1000, "100"), 100)

@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -93,9 +95,17 @@ class PublicationTaskTest(unittest.TestCase):
         return task
 
     def _staging_task(self, task_id="task-a"):
+        from app.model_publication import _inventory
+
         staging = os.path.join(self.root, ".staging", self.request["publication_id"])
         self._write_model(staging)
-        config = {**self.request, "staging_path": staging, "structural_validation": {"status": "passed"}}
+        files, total_bytes = _inventory(staging)
+        config = {
+            **self.request,
+            "staging_path": staging,
+            "structural_validation": {"status": "passed"},
+            "staging_inventory": {"files": files, "total_bytes": total_bytes},
+        }
         self._add_task(task_id, "validating", config)
         return staging
 
@@ -166,6 +176,36 @@ class PublicationTaskTest(unittest.TestCase):
         self.assertIs(run.call_args.args[3], control)
         self.assertTrue(run.call_args.args[3]["aborted"])
 
+    def test_worker_gives_non_publication_tasks_a_fresh_control_after_resume(self):
+        from app.services import Services
+
+        task_id = "ordinary-resume"
+        data = {"task_id": task_id, "type": "merge", "model_paths": []}
+        state = SimpleNamespace(
+            task_queue=_OneShotQueue((10, 1.0, task_id, data)),
+            scheduler_lock=threading.Lock(),
+            tasks={task_id: {
+                "status": "queued", "original_data": data,
+                "control": {"aborted": True, "process": "stale"},
+            }},
+            running_task_info={"id": None, "priority": None, "process": None},
+            merge_dir=self.tmpdir.name,
+        )
+        service = Services.__new__(Services)
+        service.state = state
+        service.app = self.app
+        service.logger = mock.Mock()
+        service._post_task_gpu_cleanup = mock.Mock()
+
+        with mock.patch("importlib.reload", side_effect=lambda module: module):
+            with mock.patch("merge_manager.run_merge_task", return_value={"status": "success"}) as run:
+                with self.assertRaises(KeyboardInterrupt):
+                    service.worker()
+
+        control = run.call_args.args[3]
+        self.assertFalse(control["aborted"])
+        self.assertIsNone(control["process"])
+
     def test_materialization_re_resolves_existing_model_from_core_orm(self):
         from app.model_publication_tasks import run_model_publication_task
 
@@ -221,6 +261,92 @@ class PublicationTaskTest(unittest.TestCase):
         self.assertEqual(task.config["error_code"], "gpu_busy")
         self.assertTrue(os.path.isdir(staging))
 
+    def test_validation_failure_clears_enqueued_marker_for_retry(self):
+        from app.models import Task
+        from app.model_publication import PublicationError
+        from app.model_publication_tasks import run_publication_validation
+
+        with self.app.app_context():
+            self._staging_task()
+            task = self.db.session.get(Task, "task-a")
+            task.config = {**task.config, "validation_enqueued": True}
+            self.db.session.commit()
+            with mock.patch("app.model_publication_tasks.publication_gpu_preflight", side_effect=PublicationError("gpu_busy", "busy")):
+                result = run_publication_validation("task-a", [0], self.progress, {"aborted": False})
+            task = self.db.session.get(Task, "task-a")
+
+        self.assertEqual(result["status"], "validating")
+        self.assertFalse(task.config["validation_enqueued"])
+
+    def test_validation_rejects_staging_tampered_after_structural_baseline(self):
+        from app.models import Task
+        from app.model_publication_tasks import run_model_publication_task, run_publication_validation
+
+        with self.app.app_context():
+            self._add_task()
+            materialized = run_model_publication_task(
+                "task-a", self.request, self.progress, {"aborted": False},
+                structural_validate_fn=self.structural_validate,
+            )
+            task = self.db.session.get(Task, "task-a")
+            baseline = task.config.get("staging_inventory")
+            staging = task.config["staging_path"]
+            with open(os.path.join(staging, "model.safetensors"), "ab") as handle:
+                handle.write(b"tampered")
+            functional = mock.Mock(return_value={"status": "passed"})
+            result = run_publication_validation("task-a", [0], self.progress, {"aborted": False}, functional_validate_fn=functional)
+            task = self.db.session.get(Task, "task-a")
+
+        self.assertEqual(materialized["status"], "validating")
+        self.assertTrue(baseline["files"][0]["sha256"])
+        self.assertEqual(result["error_code"], "staging_changed")
+        functional.assert_not_called()
+        self.assertEqual(task.status, "validating")
+
+    def test_materialization_error_leaves_terminal_failure_to_worker(self):
+        from app.models import Task
+        from app.model_publication_tasks import run_model_publication_task
+
+        with self.app.app_context():
+            self._add_task()
+            result = run_model_publication_task(
+                "task-a", self.request, self.progress, {"aborted": False},
+                copy_fn=mock.Mock(side_effect=OSError("copy failed")),
+            )
+            task = self.db.session.get(Task, "task-a")
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(task.status, "materializing")
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".staging", "publication-a")))
+
+    def test_worker_exception_persists_publication_failure_unless_durable_state(self):
+        from app.models import Task
+        from app.services import Services
+
+        task_id = "worker-persist-failure"
+        with self.app.app_context():
+            self._add_task(task_id, "materializing")
+        data = {**self.request, "task_id": task_id, "type": "model_publication"}
+        state = SimpleNamespace(
+            task_queue=_OneShotQueue((10, 1.0, task_id, data)),
+            scheduler_lock=threading.Lock(),
+            tasks={task_id: {"status": "queued", "original_data": data}},
+            running_task_info={"id": None, "priority": None, "process": None},
+            merge_dir=self.tmpdir.name,
+        )
+        service = Services.__new__(Services)
+        service.state = state
+        service.app = self.app
+        service.logger = mock.Mock()
+        service._post_task_gpu_cleanup = mock.Mock()
+
+        with mock.patch("app.model_publication_tasks.run_model_publication_task", side_effect=OSError("status write failed")):
+            with self.assertRaises(KeyboardInterrupt):
+                service.worker()
+
+        with self.app.app_context():
+            self.assertEqual(self.db.session.get(Task, task_id).status, "failed")
+
     def test_registration_failure_remains_registration_pending_for_reconciliation(self):
         from app.models import Task
         from app.model_publication_tasks import run_publication_validation
@@ -271,7 +397,7 @@ class PublicationTaskTest(unittest.TestCase):
         from app.model_publication import PublicationError
         from app.model_publication_tasks import publication_gpu_preflight
 
-        gpu_line = "0, GPU-good, 100, 24576\n"
+        gpu_line = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 100, 24576\n"
         topology = [GpuInfo(index=0, mem_free_mib=24476, mem_total_mib=24576)]
 
         def completed(stdout="", returncode=0, stderr=""):
@@ -291,6 +417,20 @@ class PublicationTaskTest(unittest.TestCase):
                 with self.assertRaisesRegex(PublicationError, "gpu_preflight_failed"):
                     publication_gpu_preflight([0], required_bytes=1)
 
+            truncated_uuid = "0, GPU-23348268-6430-c539-b7e5, 100, 24576\n"
+            with mock.patch("app.model_publication_tasks.subprocess.run", side_effect=[completed(truncated_uuid), completed()]):
+                with self.assertRaisesRegex(PublicationError, "gpu_preflight_failed"):
+                    publication_gpu_preflight([0], required_bytes=1)
+
+    def test_gpu_ids_are_exact_non_boolean_integers(self):
+        from app.model_publication import PublicationError
+        from app.model_publication_tasks import _normalize_gpu_ids
+
+        for invalid in (True, 1.9, "1"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(PublicationError, "gpu_selection_required"):
+                    _normalize_gpu_ids([invalid])
+
     def test_functional_validation_scopes_cuda_only_to_cancellable_child(self):
         from app.model_publication_tasks import validate_model_functionally
 
@@ -305,6 +445,58 @@ class PublicationTaskTest(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(popen.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "1,3")
         self.assertEqual(os.environ.get("CUDA_VISIBLE_DEVICES"), original)
+        self.assertEqual(
+            popen.call_args.args[0][:2],
+            [sys.executable, "-m"],
+        )
+        self.assertEqual(popen.call_args.args[0][2], "app.model_publication_tasks")
+
+    def test_functional_validation_module_import_smoke_reaches_cuda_requirement(self):
+        package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = os.environ.copy()
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "app.model_publication_tasks", "--functional-validation", self.source],
+            cwd=package_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("functional validation requires visible CUDA devices", result.stderr)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
+
+    def test_vlm_cmmmu_requests_explicit_one_row_boundary(self):
+        from app.model_publication_tasks import _functional_validation_worker
+
+        inspection = SimpleNamespace(is_vlm=True)
+        fake_torch = SimpleNamespace(
+            cuda=SimpleNamespace(is_available=lambda: True, empty_cache=lambda: None),
+            bfloat16=object(),
+            Tensor=(),
+            is_floating_point=lambda _value: False,
+            no_grad=lambda: mock.MagicMock(__enter__=lambda *_args: None, __exit__=lambda *_args: None),
+            device=lambda _value: _value,
+        )
+        model = mock.Mock(device="cuda")
+        model.generate.return_value = ["tokens"]
+        processor = mock.Mock()
+        processor.apply_chat_template.return_value = "prompt"
+        processor.return_value = {}
+        processor.batch_decode.return_value = ["ok"]
+        fake_transformers = SimpleNamespace(AutoProcessor=SimpleNamespace(from_pretrained=lambda *_args, **_kwargs: processor), AutoModelForImageTextToText=SimpleNamespace(from_pretrained=lambda *_args, **_kwargs: model))
+
+        with mock.patch("app.model_publication_tasks.inspect_model", return_value=inspection):
+            with mock.patch.dict(sys.modules, {"torch": fake_torch, "transformers": fake_transformers}):
+                with mock.patch("PIL.Image.new", return_value=object()):
+                    with mock.patch("merge_manager.run_lmms_eval_stream", return_value={"samples": 1}) as evaluate:
+                        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=False):
+                            _functional_validation_worker(self.source)
+
+        self.assertEqual(evaluate.call_args.kwargs["absolute_limit"], 1)
 
     def test_vlm_recipe_materializes_with_fresh_managed_base(self):
         from app.model_publication_tasks import _materialize_recipe

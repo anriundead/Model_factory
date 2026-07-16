@@ -665,10 +665,15 @@ def register_routes(app, state, services, dataset_service):
 
     @app.route("/api/history/<task_id>", methods=["GET"])
     def get_history_detail(task_id):
-        path = os.path.join(state.merge_dir, task_id, "metadata.json")
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return jsonify({"status": "success", "data": json.load(f)})
+        publication = _publication_task_lookup(task_id)
+        if publication is not None and publication.task_type == "model_publication":
+            return jsonify({"status": "success", "data": _public_publication_view(publication)})
+        metadata = _history_metadata(task_id)
+        redacted = _public_publication_disk_view(task_id, metadata=metadata)
+        if redacted is not None:
+            return jsonify({"status": "success", "data": redacted})
+        if metadata is not None:
+            return jsonify({"status": "success", "data": metadata})
         return jsonify({"status": "error", "message": "Not found"}), 404
 
     @app.route("/api/status/<task_id>")
@@ -799,7 +804,13 @@ def register_routes(app, state, services, dataset_service):
                 except Exception:
                     pass
             return jsonify(resp)
+        publication = _publication_task_lookup(task_id)
+        if publication is not None and publication.task_type == "model_publication":
+            return jsonify(_public_publication_view(publication))
         disk = services.status_from_disk(task_id)
+        redacted = _public_publication_disk_view(task_id, disk=disk)
+        if redacted is not None:
+            return jsonify(redacted)
         if disk is not None:
             disk.setdefault("is_active", False)
             return jsonify(disk)
@@ -828,6 +839,9 @@ def register_routes(app, state, services, dataset_service):
             priority = state.priority_map.get(task.get("priority", "cutin"), 20)
             task["status"] = "queued"
             task["message"] = "已手动恢复..."
+            control = task.setdefault("control", {})
+            control["aborted"] = False
+            control["process"] = None
             state.task_queue.put((priority, task["created_at"], task_id, task["original_data"]))
         return jsonify({"status": "success"})
 
@@ -1944,6 +1958,49 @@ def register_routes(app, state, services, dataset_service):
             "error": task.error,
         }
 
+    def _public_publication_view(task):
+        config = task.config if isinstance(task.config, dict) else {}
+        return {
+            "status": task.status,
+            "is_active": False,
+            "publication_id": config.get("publication_id"),
+            "display_name": config.get("display_name"),
+            "error_code": config.get("error_code"),
+        }
+
+    def _history_metadata(task_id):
+        path = os.path.join(state.merge_dir, task_id, "metadata.json")
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _publication_task_lookup(task_id):
+        try:
+            from .extensions import db
+            from .models import Task
+
+            return db.session.get(Task, task_id)
+        except Exception:
+            return None
+
+    def _public_publication_disk_view(task_id, *, disk=None, metadata=None):
+        metadata = metadata if metadata is not None else _history_metadata(task_id)
+        if not isinstance(metadata, dict) or metadata.get("type") != "model_publication":
+            return None
+        result = disk.get("result") if isinstance(disk, dict) and isinstance(disk.get("result"), dict) else {}
+        return {
+            "status": (disk or {}).get("status") or metadata.get("status") or "error",
+            "is_active": False,
+            "publication_id": result.get("publication_id") or metadata.get("publication_id"),
+            "display_name": metadata.get("display_name"),
+            "error_code": result.get("error_code") or metadata.get("error_code"),
+        }
+
     def _queue_publication_locked(task_id, data):
         created_at = time.time()
         previous = state.tasks.get(task_id) or {}
@@ -1954,6 +2011,7 @@ def register_routes(app, state, services, dataset_service):
             "created_at": created_at,
             "original_data": data,
             "priority": "common",
+            "validation_enqueued": bool(data.get("validation_enqueued")),
         }
         if isinstance(previous.get("control"), dict):
             queued["control"] = previous["control"]
@@ -2114,19 +2172,27 @@ def register_routes(app, state, services, dataset_service):
         from .models import Task
         from .model_publication import PublicationError
         from .model_publication_tasks import _normalize_gpu_ids
+        from .repositories import task_set_status
 
         try:
             gpu_ids = _normalize_gpu_ids((request.get_json(silent=True) or {}).get("gpu_ids"))
         except PublicationError as exc:
             return jsonify({"error": {"code": exc.code, "message": str(exc)}}), 400
-        task = db.session.get(Task, task_id)
-        if task is None or task.task_type != "model_publication":
-            return jsonify({"error": {"code": "not_found", "message": "publication task not found"}}), 404
-        if task.status != "validating":
-            return jsonify({"error": {"code": "invalid_publication_state", "message": "publication is not awaiting validation"}}), 409
-        data = dict(task.config or {})
-        data.update({"type": "model_publication", "task_id": task_id, "validation_gpu_ids": gpu_ids})
-        _queue_publication(task_id, data)
+        with state.scheduler_lock:
+            db.session.expire_all()
+            task = db.session.get(Task, task_id)
+            if task is None or task.task_type != "model_publication":
+                return jsonify({"error": {"code": "not_found", "message": "publication task not found"}}), 404
+            config = dict(task.config or {})
+            memory_task = state.tasks.get(task_id) or {}
+            if config.get("validation_enqueued") or memory_task.get("validation_enqueued"):
+                return jsonify({"error": {"code": "validation_in_progress", "message": "publication validation is already queued"}}), 409
+            if task.status != "validating":
+                return jsonify({"error": {"code": "invalid_publication_state", "message": "publication is not awaiting validation"}}), 409
+            task = task_set_status(task_id, "validating", config_patch={"validation_enqueued": True})
+            data = dict(task.config or {})
+            data.update({"type": "model_publication", "task_id": task_id, "validation_gpu_ids": gpu_ids})
+            _queue_publication_locked(task_id, data)
         return jsonify({"status": "accepted", "task": _publication_task_view(task)}), 202
 
     @app.route("/api/model-publications/<publication_id>/manifest")

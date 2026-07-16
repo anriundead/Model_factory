@@ -12,12 +12,14 @@ import shutil
 import subprocess
 import sys
 import time
+import re
 from contextlib import nullcontext
 from typing import Callable
 
 from app.model_inspection import inspect_model
 from app.model_publication import (
     PublicationError,
+    _inventory,
     build_manifest,
     commit_staging,
     inspect_serving_compatibility,
@@ -235,10 +237,15 @@ def run_model_publication_task(
             raise _error("canceled", "publication canceled")
         progress(65, "Validating publication structure")
         inspection, structural = _structural_result(staging, structural_validate_fn)
+        files, total_bytes = _inventory(staging, include_hash=True)
         _set_status(
             task_id,
             "validating",
-            config_patch={"staging_path": staging, "structural_validation": structural},
+            config_patch={
+                "staging_path": staging,
+                "structural_validation": structural,
+                "staging_inventory": {"files": files, "total_bytes": total_bytes},
+            },
         )
         progress(80, "Awaiting explicit GPU validation")
         return {"status": "validating"}
@@ -248,21 +255,18 @@ def run_model_publication_task(
             _set_status(task_id, "canceled", error=str(exc), config_patch={"error_code": exc.code})
             return {"status": "canceled", "error_code": exc.code, "error": str(exc)}
         shutil.rmtree(staging, ignore_errors=True)
-        _set_status(task_id, "failed", error=str(exc), config_patch={"error_code": exc.code})
         return {"status": "error", "error_code": exc.code, "error": str(exc)}
     except Exception as exc:
         shutil.rmtree(staging, ignore_errors=True)
-        _set_status(task_id, "failed", error=str(exc), config_patch={"error_code": "materialization_failed"})
         return {"status": "error", "error_code": "materialization_failed", "error": str(exc)}
 
 
 def _normalize_gpu_ids(gpu_ids: list[int]) -> list[int]:
     if not isinstance(gpu_ids, list) or not gpu_ids:
         raise _error("gpu_selection_required", "explicit physical GPU ids are required")
-    try:
-        normalized = [int(value) for value in gpu_ids]
-    except (TypeError, ValueError) as exc:
-        raise _error("gpu_selection_required", "GPU ids must be physical integers") from exc
+    if any(type(value) is not int for value in gpu_ids):
+        raise _error("gpu_selection_required", "GPU ids must be physical integers")
+    normalized = list(gpu_ids)
     if len(normalized) != len(set(normalized)):
         raise _error("gpu_selection_required", "GPU ids must not repeat")
     if 2 in normalized:
@@ -289,6 +293,7 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
     if result.returncode != 0:
         raise _error("gpu_preflight_failed", "GPU inventory query failed")
 
+    uuid_pattern = re.compile(r"GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
     topology = {}
     for gpu in topology_rows:
         if gpu.index in topology or gpu.mem_total_mib <= 0 or not 0 <= gpu.mem_free_mib <= gpu.mem_total_mib:
@@ -308,8 +313,7 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
             if (
                 index in snapshots
                 or uuid in uuids
-                or not uuid.startswith("GPU-")
-                or len(uuid) < 8
+                or uuid_pattern.fullmatch(uuid) is None
                 or total <= 0
                 or not 0 <= used <= total
             ):
@@ -360,7 +364,7 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
     for line in process_result.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
         try:
-            valid = len(parts) == 2 and parts[0].startswith("GPU-") and int(parts[1]) > 0
+            valid = len(parts) == 2 and uuid_pattern.fullmatch(parts[0]) is not None and int(parts[1]) > 0
         except (TypeError, ValueError):
             valid = False
         if not valid:
@@ -375,7 +379,8 @@ def validate_model_functionally(staging: str, gpu_ids: list[int], task_control: 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(value) for value in gpu_ids)
     process = subprocess.Popen(
-        [sys.executable, __file__, "--functional-validation", staging],
+        [sys.executable, "-m", "app.model_publication_tasks", "--functional-validation", staging],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     task_control["process"] = process
@@ -445,7 +450,7 @@ def _cancel_validation(task_id: str, params: dict) -> dict:
 def _validation_failure(task_id: str, exc: Exception) -> dict:
     code = exc.code if isinstance(exc, PublicationError) else "validation_failed"
     message = str(exc)
-    _set_status(task_id, "validating", error=message, config_patch={"error_code": code})
+    _set_status(task_id, "validating", error=message, config_patch={"error_code": code, "validation_enqueued": False})
     return {"status": "validating", "error_code": code, "error": message}
 
 
@@ -471,6 +476,10 @@ def run_publication_validation(
     if _cancelled(task_control):
         return _cancel_validation(task_id, params)
     try:
+        baseline = params.get("staging_inventory")
+        files, total_bytes = _inventory(staging, include_hash=True)
+        if baseline != {"files": files, "total_bytes": total_bytes}:
+            raise _error("staging_changed", "publication staging changed after structural validation")
         progress(82, "Checking selected GPUs")
         gpu_snapshot = publication_gpu_preflight(gpu_ids, required_bytes=_estimate_bytes(staging))
         if _cancelled(task_control):
@@ -607,6 +616,7 @@ def _functional_validation_worker(path: str) -> dict:
                 hf_subset="health_and_medicine",
                 hf_split="val",
                 num_gpus=visible_count,
+                absolute_limit=1,
             )
         if not isinstance(evaluation, dict) or int(evaluation.get("samples") or 0) < 1:
             raise RuntimeError("CMMMU validation evaluated no samples")

@@ -176,6 +176,119 @@ class PublicationRouteTest(unittest.TestCase):
         self.assertEqual(response.get_json()["task"]["status"], "canceled")
         self.assertFalse(os.path.exists(staging))
 
+    def test_validate_is_single_flight_and_marks_the_durable_enqueue(self):
+        task_id = "single-flight"
+        self._add_publication_task(task_id, "validating", {"publication_id": "single-flight", "display_name": "published"})
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(
+                lambda _index: self._post(
+                    "/api/model-publications/%s/validate" % task_id,
+                    {"gpu_ids": [0]},
+                    **self.headers,
+                ),
+                range(2),
+            ))
+
+        self.assertEqual(sorted(response.status_code for response in responses), [202, 409])
+        self.assertEqual(self.state.task_queue.qsize(), 1)
+        self.assertEqual(
+            next(response for response in responses if response.status_code == 409).get_json()["error"]["code"],
+            "validation_in_progress",
+        )
+        self.assertTrue(self.state.tasks[task_id]["validation_enqueued"])
+        with self.app.app_context():
+            self.assertTrue(self.db.session.get(self.Task, task_id).config["validation_enqueued"])
+
+    def test_publication_disk_fallbacks_redact_history_and_status_paths(self):
+        task_id = "restart-publication"
+        secret = os.path.join(self.tmpdir.name, "publication-recipe.json")
+        self._add_publication_task(task_id, "validating", {
+            "publication_id": "restart-publication",
+            "display_name": "Published",
+            "error_code": "validation_failed",
+        })
+        metadata_dir = os.path.join(self.state.merge_dir, task_id)
+        os.makedirs(metadata_dir)
+        with open(os.path.join(metadata_dir, "metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump({"type": "model_publication", "recipe_path": secret, "error": "failed at %s" % secret}, handle)
+        self.services.status_from_disk = lambda _task_id: {
+            "status": "error",
+            "message": "failed at %s" % secret,
+            "result": {"staging_path": secret},
+        }
+
+        history = self.app.test_client().get("/api/history/%s" % task_id)
+        status = self.app.test_client().get("/api/status/%s" % task_id)
+
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual(status.status_code, 200)
+        self.assertNotIn(secret, json.dumps(history.get_json(), sort_keys=True))
+        self.assertNotIn(secret, json.dumps(status.get_json(), sort_keys=True))
+        self.assertEqual(status.get_json()["status"], "validating")
+
+    def test_publication_disk_redaction_survives_db_lookup_failure(self):
+        task_id = "restart-publication-db-failure"
+        secret = os.path.join(self.tmpdir.name, "publication-recipe.json")
+        metadata_dir = os.path.join(self.state.merge_dir, task_id)
+        os.makedirs(metadata_dir)
+        with open(os.path.join(metadata_dir, "metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump({
+                "type": "model_publication",
+                "publication_id": "restart-publication",
+                "display_name": "Published",
+                "error_code": "validation_failed",
+                "recipe_path": secret,
+            }, handle)
+        self.services.status_from_disk = lambda _task_id: {
+            "status": "error",
+            "message": "failed at %s" % secret,
+            "result": {"staging_path": secret},
+        }
+
+        with mock.patch.object(self.db.session, "get", side_effect=RuntimeError("db unavailable")):
+            history = self.app.test_client().get("/api/history/%s" % task_id)
+            status = self.app.test_client().get("/api/status/%s" % task_id)
+
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual(status.status_code, 200)
+        self.assertNotIn(secret, json.dumps(history.get_json(), sort_keys=True))
+        self.assertNotIn(secret, json.dumps(status.get_json(), sort_keys=True))
+        self.assertEqual(status.get_json()["status"], "error")
+
+    def test_non_publication_disk_history_and_status_remain_unchanged(self):
+        task_id = "ordinary-restart"
+        secret = os.path.join(self.tmpdir.name, "ordinary-output")
+        metadata_dir = os.path.join(self.state.merge_dir, task_id)
+        os.makedirs(metadata_dir)
+        with open(os.path.join(metadata_dir, "metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump({"type": "merge", "output_path": secret}, handle)
+        self.services.status_from_disk = lambda _task_id: {"status": "completed", "result": {"output_path": secret}}
+
+        history = self.app.test_client().get("/api/history/%s" % task_id)
+        status = self.app.test_client().get("/api/status/%s" % task_id)
+
+        self.assertEqual(history.get_json()["data"]["output_path"], secret)
+        self.assertEqual(status.get_json()["result"]["output_path"], secret)
+
+    def test_resume_clears_stale_abort_control(self):
+        task_id = "ordinary-interrupted"
+        data = {"type": "merge"}
+        control = {"aborted": True, "process": "stale"}
+        self.state.tasks[task_id] = {
+            "status": "interrupted",
+            "priority": "common",
+            "created_at": time.time(),
+            "original_data": data,
+            "control": control,
+        }
+
+        response = self._post("/api/resume/%s" % task_id, {})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(control["aborted"])
+        self.assertIsNone(control["process"])
+
     def test_running_validation_cancel_sets_abort_and_terminates_child(self):
         task_id = "running-task"
         staging = os.path.join(self.published, ".staging", "running-publication")
@@ -195,15 +308,18 @@ class PublicationRouteTest(unittest.TestCase):
 
     def test_cancel_accepted_before_commit_transition_prevents_commit(self):
         from app.model_publication_tasks import run_publication_validation
+        from app.model_publication import _inventory
 
         task_id = "commit-task"
         publication_id = "commit-publication"
         staging = os.path.join(self.published, ".staging", publication_id)
         os.makedirs(staging)
+        files, total_bytes = _inventory(staging)
         config = {
             "publication_id": publication_id,
             "publication_root": self.published,
             "staging_path": staging,
+            "staging_inventory": {"files": files, "total_bytes": total_bytes},
             "display_name": "published",
         }
         self._add_publication_task(task_id, "validating", config)

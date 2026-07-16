@@ -2866,6 +2866,7 @@ def run_lmms_eval_stream(
     hf_subset=None,
     hf_split=None,  # kept for future expansion; lmms-eval tasks usually encode split internally
     num_gpus=0,
+    absolute_limit=None,
 ):
     """
     VLM 评测：调用 lmms-eval CLI，并将其结果归一化为 { acc, f1, samples, time, context, per_task_acc }。
@@ -2905,7 +2906,12 @@ def run_lmms_eval_stream(
             callback(start_prog, f"加载 CMMMU({subset}) 数据集…")
             ds = load_dataset(hf_dataset, subset, split=split, trust_remote_code=True)
             n = len(ds)
-            k = _resolve_eval_dataset_cap(n, limit)
+            if absolute_limit is None:
+                k = _resolve_eval_dataset_cap(n, limit)
+            elif type(absolute_limit) is int and absolute_limit > 0:
+                k = min(n, absolute_limit)
+            else:
+                raise ValueError("absolute_limit must be a positive integer")
             ds = ds.select(range(k))
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
