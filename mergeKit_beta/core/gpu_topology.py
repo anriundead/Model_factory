@@ -16,6 +16,7 @@ GPU 拓扑与占用检测（最小依赖版）
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from typing import Iterable
@@ -56,9 +57,11 @@ def query_gpus() -> list[GpuInfo]:
         if len(parts) < 3:
             continue
         try:
+            if any(re.fullmatch(r"[0-9]+", value) is None for value in parts[:3]):
+                raise ValueError("not an ASCII decimal integer")
             idx = int(parts[0])
-            free = int(float(parts[1]))
-            total = int(float(parts[2]))
+            free = int(parts[1])
+            total = int(parts[2])
         except ValueError:
             continue
         gpus.append(GpuInfo(index=idx, mem_free_mib=free, mem_total_mib=total))

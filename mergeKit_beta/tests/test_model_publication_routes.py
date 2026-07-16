@@ -350,6 +350,52 @@ class PublicationRouteTest(unittest.TestCase):
         active_publication_tasks.assert_not_called()
         self.services.kill_process_tree_by_pid.assert_not_called()
 
+    def test_generic_stop_all_fails_closed_when_publication_guard_lookup_raises(self):
+        merge_process = mock.Mock(pid=222)
+        self.state.tasks["merge-task"] = {
+            "status": "running",
+            "type": "merge",
+            "original_data": {"type": "merge"},
+            "control": {"aborted": False, "process": merge_process},
+        }
+        self.state.task_queue.put((10, 1.0, "merge-task", {"type": "merge"}))
+        self.state.running_task_info.update({"id": "merge-task", "process": merge_process})
+        self.services.kill_process_tree_by_pid = mock.Mock()
+
+        with mock.patch(
+            "app.repositories.active_publication_tasks",
+            side_effect=RuntimeError("db unavailable"),
+        ) as active_publication_tasks:
+            response = self.app.test_client().post("/api/stop_all")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"]["code"], "publication_cancel_required")
+        self.assertEqual(self.state.task_queue.qsize(), 1)
+        self.assertEqual(self.state.tasks["merge-task"]["status"], "running")
+        self.assertFalse(self.state.tasks["merge-task"]["control"]["aborted"])
+        self.services.kill_process_tree_by_pid.assert_not_called()
+        active_publication_tasks.assert_called_once_with()
+
+    def test_generic_stop_fails_closed_when_publication_guard_lookup_raises(self):
+        task_id = "merge-db-lookup-error"
+        process = mock.Mock(pid=222)
+        self.state.tasks[task_id] = {
+            "status": "running",
+            "type": "merge",
+            "original_data": {"type": "merge"},
+            "control": {"aborted": False, "process": process},
+        }
+        self.services.kill_process_tree_by_pid = mock.Mock()
+
+        with mock.patch.object(self.db.session, "get", side_effect=RuntimeError("db unavailable")):
+            response = self.app.test_client().post("/api/stop/%s" % task_id)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"]["code"], "publication_cancel_required")
+        self.assertEqual(self.state.tasks[task_id]["status"], "running")
+        self.assertFalse(self.state.tasks[task_id]["control"]["aborted"])
+        self.services.kill_process_tree_by_pid.assert_not_called()
+
     def test_validate_is_single_flight_and_marks_the_durable_enqueue(self):
         task_id = "single-flight"
         self._add_publication_task(task_id, "validating", {"publication_id": "single-flight", "display_name": "published"})

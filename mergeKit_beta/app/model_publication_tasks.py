@@ -391,7 +391,11 @@ def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> lis
     for line in process_result.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
         try:
-            valid = len(parts) == 2 and uuid_pattern.fullmatch(parts[0]) is not None and int(parts[1]) > 0
+            valid = (
+                len(parts) == 2
+                and uuid_pattern.fullmatch(parts[0]) is not None
+                and _nonnegative_decimal(parts[1]) > 0
+            )
         except (TypeError, ValueError):
             valid = False
         if not valid:

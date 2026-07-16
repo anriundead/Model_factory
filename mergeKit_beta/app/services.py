@@ -1096,6 +1096,7 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                     return {"ok": False, "error_code": "publication_cancel_required", "message": publication_message}
         except Exception as exc:
             self.logger.warning("[stop] publication guard lookup failed: %s", exc)
+            return {"ok": False, "error_code": "publication_cancel_required", "message": publication_message}
         return None
 
     def _mark_task_stopped_on_disk(self, task_id: str, message: str = "任务已手动停止"):

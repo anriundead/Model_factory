@@ -537,6 +537,30 @@ class PublicationTaskTest(unittest.TestCase):
                             with self.assertRaisesRegex(PublicationError, "gpu_preflight_failed"):
                                 publication_gpu_preflight([0], required_bytes=1)
 
+    def test_preflight_rejects_non_decimal_compute_pids(self):
+        from core.gpu_topology import GpuInfo
+        from app.model_publication import PublicationError
+        from app.model_publication_tasks import publication_gpu_preflight
+
+        topology = [GpuInfo(index=0, mem_free_mib=24476, mem_total_mib=24576)]
+        inventory = "0, GPU-23348268-6430-c539-b7e5-762583f50e91, 100, 24576\n"
+
+        def completed(stdout="", returncode=0, stderr=""):
+            return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+        with mock.patch("core.gpu_topology.query_gpus", return_value=topology):
+            for invalid_pid in ("+123", "1.5", "1e3", "-1"):
+                with self.subTest(invalid_pid=invalid_pid):
+                    process_output = (
+                        "GPU-23348268-6430-c539-b7e5-762583f50e91, %s\n" % invalid_pid
+                    )
+                    with mock.patch(
+                        "app.model_publication_tasks.subprocess.run",
+                        side_effect=[completed(inventory), completed(process_output)],
+                    ):
+                        with self.assertRaisesRegex(PublicationError, "gpu_preflight_failed"):
+                            publication_gpu_preflight([0], required_bytes=1)
+
     def test_preflight_uses_new_inventory_snapshot_not_topology_free_memory(self):
         from core.gpu_topology import GpuInfo
         from app.model_publication import PublicationError
