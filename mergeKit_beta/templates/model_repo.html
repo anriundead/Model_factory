@@ -504,34 +504,7 @@
             if (!publicationState.taskIds.length) { renderPublicationTasks(); return; }
             if (!snapshot.token) { renderPublicationTasks(); publicationMessage('输入管理员 Token 后查看发布任务状态。'); return; }
             var ids = publicationState.taskIds.slice();
-            var results = await Promise.allSettled(ids.map(function(id) { return refreshPublicationTask(id, snapshot); }));
-            if (!publicationGeneration.isCurrent(snapshot)) return;
-            var successful = false;
-            var transientError = null;
-            var authError = null;
-            results.forEach(function(result, index) {
-                var id = ids[index];
-                if (result.status === 'fulfilled') { publicationState.tasks[id] = result.value; successful = true; return; }
-                var error = result.reason || {};
-                var action = PublicationUI.pollFailureAction(error.status, publicationHasNonterminalTask());
-                if (action === 'missing') { delete publicationState.tasks[id]; publicationState.taskIds = publicationState.taskIds.filter(function(taskId) { return taskId !== id; }); }
-                else if (action === 'auth') authError = error;
-                else if (action === 'retry') transientError = error;
-            });
-            if (successful) publicationPoller.succeeded();
-            publicationSaveTaskIds();
-            renderPublicationTasks();
-            if (authError) {
-                publicationPoller.stop();
-                publicationMessage('管理员 Token 无效，请更正后重试。');
-            } else if (transientError && publicationHasNonterminalTask()) {
-                publicationMessage('任务状态暂时不可用，正在重试。');
-                schedulePublicationPoll(true, snapshot);
-            } else if (publicationHasNonterminalTask()) {
-                schedulePublicationPoll(false, snapshot);
-            } else {
-                publicationPoller.stop();
-            }
+            await publicationPollController.poll(ids, function(id) { return refreshPublicationTask(id, snapshot); }, snapshot);
         }
         function schedulePublicationPoll(transient, snapshot) {
             snapshot = snapshot || publicationGeneration.snapshot();
@@ -539,6 +512,21 @@
                 if (publicationGeneration.isCurrent(snapshot)) loadPublicationTasks(snapshot);
             }, !!transient);
         }
+        var publicationPollController = PublicationUI.createPollController({
+            poller: publicationPoller,
+            isCurrent: function(snapshot) { return publicationGeneration.isCurrent(snapshot); },
+            hasNonterminalTask: publicationHasNonterminalTask,
+            acceptTask: function(id, task) { publicationState.tasks[id] = task; },
+            removeTask: function(id) {
+                delete publicationState.tasks[id];
+                publicationState.taskIds = publicationState.taskIds.filter(function(taskId) { return taskId !== id; });
+            },
+            saveTaskIds: publicationSaveTaskIds,
+            render: renderPublicationTasks,
+            onAuth: function() { publicationMessage('管理员 Token 无效，请更正后重试。'); },
+            onTransient: function() { publicationMessage('任务状态暂时不可用，正在重试。'); },
+            schedule: schedulePublicationPoll
+        });
         function publicationDialogFocusables() {
             return Array.from(document.querySelectorAll('#publication-validate-overlay input:not([disabled]), #publication-validate-overlay button:not([disabled])'));
         }

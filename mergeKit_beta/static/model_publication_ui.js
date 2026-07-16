@@ -79,6 +79,54 @@
         };
     }
 
+    function createPollController(options) {
+        const poller = options.poller;
+
+        async function poll(ids, refreshTask, snapshot) {
+            const results = await Promise.allSettled(ids.map((id) => refreshTask(id)));
+            if (options.isCurrent && !options.isCurrent(snapshot)) return { stale: true };
+
+            let successful = false;
+            let transientError = null;
+            let authError = null;
+            results.forEach((result, index) => {
+                const id = ids[index];
+                if (result.status === "fulfilled") {
+                    options.acceptTask(id, result.value);
+                    successful = true;
+                    return;
+                }
+                const error = result.reason || {};
+                const action = pollFailureAction(error.status, options.hasNonterminalTask());
+                if (action === "missing") options.removeTask(id);
+                else if (action === "auth") authError = error;
+                else if (action === "retry") transientError = error;
+            });
+
+            if (successful && !transientError && !authError) poller.succeeded();
+            options.saveTaskIds();
+            options.render();
+            if (authError) {
+                poller.stop();
+                options.onAuth(authError);
+                return { action: "auth" };
+            }
+            if (transientError && options.hasNonterminalTask()) {
+                options.onTransient(transientError);
+                options.schedule(true, snapshot);
+                return { action: "retry" };
+            }
+            if (options.hasNonterminalTask()) {
+                options.schedule(false, snapshot);
+                return { action: "poll" };
+            }
+            poller.stop();
+            return { action: "stop" };
+        }
+
+        return { poll };
+    }
+
     function pollFailureAction(status, nonterminal) {
         if (status === 401 || status === 403) return "auth";
         if (status === 404) return "missing";
@@ -134,6 +182,7 @@
         lifecycleForStatus,
         createGenerationGate,
         createPollScheduler,
+        createPollController,
         pollFailureAction,
         safeStorage,
         acceptSubmission

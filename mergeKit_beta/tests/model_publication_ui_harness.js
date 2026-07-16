@@ -66,6 +66,84 @@ scheduler.succeeded();
 scheduler.schedule(() => {}, true);
 equal(timers[timers.length - 1].delay, 1000, "success resets retry backoff");
 
+(async function runControllerIntegrationRegression() {
+const controllerTimers = [];
+const controllerCleared = [];
+const controllerScheduler = PublicationUI.createPollScheduler({
+    setTimer(callback, delay) {
+        const timer = { callback, delay, id: controllerTimers.length + 1 };
+        controllerTimers.push(timer);
+        return timer;
+    },
+    clearTimer(timer) {
+        controllerCleared.push(timer.id);
+    },
+    normalDelay: 3000,
+    retryBaseDelay: 1000,
+    retryMaxDelay: 4000
+});
+const controllerState = {
+    tasks: {
+        completed: { id: "completed", status: "running" },
+        active: { id: "active", status: "running" }
+    },
+    ids: ["completed", "active"]
+};
+const controllerRefreshes = [];
+const controllerCycles = [
+    { completed: { id: "completed", status: "completed" }, active: { status: 503 } },
+    { completed: { id: "completed", status: "completed" }, active: { network: true } },
+    { completed: { id: "completed", status: "completed" }, active: { status: 503 } },
+    { completed: { id: "completed", status: "completed" }, active: { id: "active", status: "running" } },
+    { completed: { id: "completed", status: "completed" }, active: { status: 503 } }
+];
+let controllerCycleIndex = 0;
+const controller = PublicationUI.createPollController({
+    poller: controllerScheduler,
+    isCurrent() { return true; },
+    hasNonterminalTask() {
+        return controllerState.ids.some((id) => PublicationUI.lifecycleForStatus(controllerState.tasks[id].status).kind === "active");
+    },
+    acceptTask(id, task) {
+        controllerState.tasks[id] = task;
+    },
+    removeTask(id) {
+        controllerState.ids = controllerState.ids.filter((taskId) => taskId !== id);
+    },
+    saveTaskIds() {},
+    render() {},
+    onAuth() {},
+    onTransient() {},
+    schedule(transient) {
+        controllerScheduler.schedule(() => {}, transient);
+    }
+});
+
+async function refreshControllerTask(id) {
+    controllerRefreshes.push(id);
+    const result = controllerCycles[controllerCycleIndex][id];
+    if (result.network) throw new Error("network down");
+    if (result.status && result.status >= 400) {
+        const error = new Error(`HTTP ${result.status}`);
+        error.status = result.status;
+        throw error;
+    }
+    return result;
+}
+
+for (controllerCycleIndex = 0; controllerCycleIndex < controllerCycles.length; controllerCycleIndex += 1) {
+    await controller.poll(controllerState.ids, refreshControllerTask);
+    equal(controllerScheduler.hasTimer(), true, "mixed result cycle keeps one polling timer");
+}
+equal(controllerTimers.map((timer) => timer.delay), [1000, 2000, 4000, 3000, 1000], "controller preserves backoff across mixed cycles and resets after all-success cycle");
+equal(controllerRefreshes, ["completed", "active", "completed", "active", "completed", "active", "completed", "active", "completed", "active"], "controller continues polling every active task");
+equal(controllerCleared.length, 4, "controller replaces the shared timer once per cycle");
+
+controllerCycleIndex = 0;
+controllerCycles[0] = { completed: { id: "completed", status: "completed" }, active: { status: 401 } };
+await controller.poll(controllerState.ids, refreshControllerTask);
+equal(controllerScheduler.hasTimer(), false, "controller stops the shared timer on auth failure");
+
 equal(PublicationUI.pollFailureAction(undefined, true), "retry", "network failure retries while active");
 equal(PublicationUI.pollFailureAction(503, true), "retry", "5xx retries while active");
 equal(PublicationUI.pollFailureAction(401, true), "auth", "401 requests token correction");
@@ -94,4 +172,9 @@ equal(stored, false, "submission reports only the storage warning");
 equal(submissionState.taskIds, ["task-storage-warning"], "successful submission remains in memory");
 equal(scheduledPolls, 1, "successful submission polls despite storage failure");
 
-console.log(`publication-ui harness: ${assertions} assertions passed`);
+})().then(() => {
+    console.log(`publication-ui harness: ${assertions} assertions passed`);
+}).catch((error) => {
+    console.error(error.stack || error);
+    process.exitCode = 1;
+});
