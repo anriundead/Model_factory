@@ -11,7 +11,8 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+import time
+from contextlib import nullcontext
 from typing import Callable
 
 from app.model_inspection import inspect_model
@@ -47,17 +48,14 @@ def _staging_path(task_id: str, params: dict) -> str:
 
 
 def _set_status(task_id: str, status: str, **kwargs) -> None:
-    try:
-        from flask import has_app_context
+    from flask import has_app_context
 
-        if not has_app_context():
-            return
-        from app.repositories import task_set_status
+    if not has_app_context():
+        raise RuntimeError("model publication status writes require Flask app context")
+    from app.repositories import task_set_status
 
-        task_set_status(task_id, status, **kwargs)
-    except Exception:
-        # File materialization must not be made unsafe by a transient status write.
-        return
+    if task_set_status(task_id, status, **kwargs) is None:
+        raise _error("publication_missing", "publication task does not exist")
 
 
 def _cancelled(task_control: dict) -> bool:
@@ -102,19 +100,39 @@ def _check_space(root: str, estimated_bytes: int) -> None:
 
 
 def _resolve_source(params: dict) -> str:
-    source = (params.get("source_path") or "").strip()
-    if not source or not os.path.isdir(source):
-        raise _error("invalid_recipe", "resolved publication source is unavailable")
-    return os.path.realpath(source)
+    from app.repositories import model_get_by_id
+
+    model = model_get_by_id(str(params.get("model_id") or "").strip())
+    if model is None or not os.path.isdir(model.path):
+        raise _error("invalid_model", "managed source model is unavailable")
+    return os.path.realpath(model.path)
 
 
-def _recipe_model_paths(params: dict) -> list[str]:
-    recipe_path = (params.get("recipe_path") or "").strip()
+def _resolve_recipe(params: dict) -> tuple[str, dict]:
+    import merge_manager
+
+    recipe_id = str(params.get("recipe_id") or "").strip()
+    if not recipe_id or recipe_id.startswith(".") or os.path.basename(recipe_id) != recipe_id:
+        raise _error("invalid_recipe", "managed recipe id is invalid")
+    root = os.path.realpath(os.path.abspath(merge_manager.RECIPES_DIR))
+    recipe_path = os.path.realpath(os.path.join(root, "%s.json" % recipe_id))
+    if os.path.commonpath((root, recipe_path)) != root or not os.path.isfile(recipe_path):
+        raise _error("invalid_recipe", "managed recipe is unavailable")
+    recorded_path = str(params.get("recipe_path") or "").strip()
+    if recorded_path and os.path.realpath(recorded_path) != recipe_path:
+        raise _error("invalid_recipe", "managed recipe identity changed")
     try:
         with open(recipe_path, encoding="utf-8") as handle:
             recipe = json.load(handle)
     except (OSError, ValueError) as exc:
         raise _error("invalid_recipe", "managed recipe cannot be read") from exc
+    if not isinstance(recipe, dict):
+        raise _error("invalid_recipe", "managed recipe must be an object")
+    return recipe_path, recipe
+
+
+def _recipe_model_paths(params: dict) -> list[str]:
+    _recipe_path, recipe = _resolve_recipe(params)
     paths = [os.path.realpath(path) for path in recipe.get("model_paths") or []]
     if not paths or any(not os.path.isdir(path) for path in paths):
         raise _error("invalid_recipe", "managed recipe has unavailable parents")
@@ -124,11 +142,7 @@ def _recipe_model_paths(params: dict) -> list[str]:
 def _materialize_recipe(task_id: str, params: dict, staging: str, progress: Callable, task_control: dict) -> None:
     from merge_manager import run_recipe_apply_task
 
-    try:
-        with open(params["recipe_path"], encoding="utf-8") as handle:
-            recipe = json.load(handle)
-    except (KeyError, OSError, ValueError) as exc:
-        raise _error("invalid_recipe", "managed recipe cannot be read") from exc
+    _recipe_path, recipe = _resolve_recipe(params)
     is_vlm = recipe.get("artifact_type") == "vlm" or bool(recipe.get("vlm_path"))
     output_dir = staging if not is_vlm else "%s.language" % staging
 
@@ -144,8 +158,24 @@ def _materialize_recipe(task_id: str, params: dict, staging: str, progress: Call
         raise _error("materialization_failed", result.get("error", "recipe materialization failed"))
     if not is_vlm:
         return
-    vlm_base = params.get("vlm_base_path") or recipe.get("vlm_path") or (recipe.get("vlm_base") or {}).get("source_path")
-    if not vlm_base or not os.path.isdir(vlm_base):
+    vlm_base_model_id = str(params.get("vlm_base_model_id") or "").strip()
+    if vlm_base_model_id:
+        from app.repositories import model_get_by_id
+        from app.model_inspection import resolve_vlm_base
+
+        model = model_get_by_id(vlm_base_model_id)
+        try:
+            vlm_base = resolve_vlm_base(recipe, override_path=model.path).path if model is not None else None
+        except ValueError:
+            vlm_base = None
+    else:
+        from app.model_inspection import resolve_vlm_base
+
+        try:
+            vlm_base = resolve_vlm_base(recipe).path
+        except ValueError:
+            vlm_base = None
+    if not vlm_base:
         shutil.rmtree(output_dir, ignore_errors=True)
         raise _error("vlm_base_missing", "recipe has no complete VLM base")
     try:
@@ -211,7 +241,7 @@ def run_model_publication_task(
             config_patch={"staging_path": staging, "structural_validation": structural},
         )
         progress(80, "Awaiting explicit GPU validation")
-        return {"status": "validating", "staging_path": staging, "inspection": inspection}
+        return {"status": "validating"}
     except PublicationError as exc:
         if exc.code == "canceled":
             shutil.rmtree(staging, ignore_errors=True)
@@ -240,51 +270,146 @@ def _normalize_gpu_ids(gpu_ids: list[int]) -> list[int]:
     return normalized
 
 
-def publication_gpu_preflight(gpu_ids: list[int]) -> list[dict]:
-    """Read-only nvidia-smi check immediately before child-process validation."""
+def publication_gpu_preflight(gpu_ids: list[int], *, required_bytes: int) -> list[dict]:
+    """Fail-closed GPU check with model bytes + 10%/1 GiB inference headroom."""
     gpu_ids = _normalize_gpu_ids(gpu_ids)
     from core.gpu_topology import query_gpus
 
-    topology = {gpu.index: gpu for gpu in query_gpus()}
-    command = [
-        "nvidia-smi", "--query-gpu=index,uuid,memory.used,memory.total",
-        "--format=csv,noheader,nounits",
-    ]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=5, check=True)
+    try:
+        topology_rows = query_gpus()
+        result = subprocess.run(
+            [
+                "nvidia-smi", "--query-gpu=index,uuid,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception as exc:
+        raise _error("gpu_preflight_failed", "GPU inventory query failed") from exc
+    if result.returncode != 0:
+        raise _error("gpu_preflight_failed", "GPU inventory query failed")
+
+    topology = {}
+    for gpu in topology_rows:
+        if gpu.index in topology or gpu.mem_total_mib <= 0 or not 0 <= gpu.mem_free_mib <= gpu.mem_total_mib:
+            raise _error("gpu_preflight_failed", "GPU topology is invalid")
+        topology[gpu.index] = gpu
     snapshots = {}
-    for line in result.stdout.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) == 4:
-            snapshots[int(parts[0])] = {
-                "index": int(parts[0]), "uuid": parts[1],
-                "memory_used_mib": int(float(parts[2])), "memory_total_mib": int(float(parts[3])),
+    uuids = set()
+    try:
+        for line in result.stdout.splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) != 4:
+                raise ValueError("invalid GPU row")
+            index = int(parts[0])
+            used = int(float(parts[2]))
+            total = int(float(parts[3]))
+            uuid = parts[1]
+            if (
+                index in snapshots
+                or uuid in uuids
+                or not uuid.startswith("GPU-")
+                or len(uuid) < 8
+                or total <= 0
+                or not 0 <= used <= total
+            ):
+                raise ValueError("invalid GPU row")
+            uuids.add(uuid)
+            snapshots[index] = {
+                "index": index,
+                "uuid": uuid,
+                "memory_used_mib": used,
+                "memory_total_mib": total,
             }
-    missing = [gpu_id for gpu_id in gpu_ids if gpu_id not in snapshots or gpu_id not in topology]
-    if missing:
-        raise _error("gpu_selection_required", "selected physical GPU is unavailable")
-    process_result = subprocess.run(
-        ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"],
-        capture_output=True, text=True, timeout=5,
-    )
+    except (TypeError, ValueError) as exc:
+        raise _error("gpu_preflight_failed", "GPU inventory output is invalid") from exc
+
+    selected = []
+    for gpu_id in gpu_ids:
+        snapshot = snapshots.get(gpu_id)
+        gpu = topology.get(gpu_id)
+        if snapshot is None or gpu is None or snapshot["memory_total_mib"] != gpu.mem_total_mib:
+            raise _error("gpu_preflight_failed", "selected GPU inventory changed")
+        selected.append((snapshot, gpu))
+
+    try:
+        requirement = int(required_bytes)
+        if requirement <= 0:
+            raise ValueError("nonpositive model size")
+        model_mib = (requirement + 1024**2 - 1) // 1024**2
+    except (TypeError, ValueError) as exc:
+        raise _error("gpu_preflight_failed", "model memory requirement is invalid") from exc
+    # Weight bytes plus 10% (at least 1 GiB) covers loading overhead; every
+    # selected device also retains a 1 GiB CUDA/runtime reserve.
+    required_mib = model_mib + max(1024, (model_mib + 9) // 10)
+    if any(gpu.mem_free_mib < 1024 for _snapshot, gpu in selected):
+        raise _error("insufficient_gpu_memory", "selected GPU lacks runtime reserve")
+    if sum(gpu.mem_free_mib - 1024 for _snapshot, gpu in selected) < required_mib:
+        raise _error("insufficient_gpu_memory", "selected GPUs lack validated model headroom")
+
+    try:
+        process_result = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception as exc:
+        raise _error("gpu_preflight_failed", "compute-process query failed") from exc
+    if process_result.returncode != 0:
+        raise _error("gpu_preflight_failed", "compute-process query failed")
     selected_uuids = {snapshots[gpu_id]["uuid"] for gpu_id in gpu_ids}
     for line in process_result.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) >= 2 and parts[0] in selected_uuids:
+        try:
+            valid = len(parts) == 2 and parts[0].startswith("GPU-") and int(parts[1]) > 0
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise _error("gpu_preflight_failed", "compute-process output is invalid")
+        if parts[0] in selected_uuids:
             raise _error("gpu_busy", "selected GPU has an external compute process")
     return [snapshots[gpu_id] for gpu_id in gpu_ids]
 
 
-def validate_model_functionally(staging: str, gpu_ids: list[int], _task_control: dict) -> dict:
+def validate_model_functionally(staging: str, gpu_ids: list[int], task_control: dict) -> dict:
     """Run real validation in a child whose CUDA visibility is explicitly scoped."""
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(value) for value in gpu_ids)
-    completed = subprocess.run(
+    process = subprocess.Popen(
         [sys.executable, __file__, "--functional-validation", staging],
-        env=env, capture_output=True, text=True, timeout=20 * 60,
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    if completed.returncode:
-        raise _error("validation_failed", (completed.stderr or completed.stdout or "functional validation failed")[-1000:])
-    return json.loads(completed.stdout)
+    task_control["process"] = process
+    deadline = time.monotonic() + 20 * 60
+    try:
+        while process.poll() is None:
+            if _cancelled(task_control):
+                process.terminate()
+                try:
+                    process.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                raise _error("canceled", "publication canceled")
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.communicate()
+                raise _error("validation_failed", "functional validation timed out")
+            time.sleep(0.1)
+        stdout, stderr = process.communicate()
+        if _cancelled(task_control):
+            raise _error("canceled", "publication canceled")
+        if process.returncode:
+            raise _error("validation_failed", (stderr or stdout or "functional validation failed")[-1000:])
+        try:
+            result = json.loads(stdout)
+        except (TypeError, ValueError) as exc:
+            raise _error("validation_failed", "functional validation returned invalid JSON") from exc
+        if not isinstance(result, dict) or result.get("status") != "passed":
+            raise _error("validation_failed", "functional validation did not pass")
+        return result
+    finally:
+        if task_control.get("process") is process:
+            task_control["process"] = None
 
 
 def _load_task(task_id: str):
@@ -292,6 +417,36 @@ def _load_task(task_id: str):
     from app.models import Task
 
     return db.session.get(Task, task_id)
+
+
+def remove_publication_staging(params: dict) -> None:
+    """Remove only the Task 3-authorized staging directory for this publication."""
+    from app.model_publication import _control_dir, _publication_root, _staging_dir
+
+    root = _publication_root(_root(params), create=True)
+    staging_parent = os.path.join(root, ".staging")
+    if not os.path.lexists(staging_parent):
+        return
+    _control_dir(root, ".staging")
+    staging = params.get("staging_path") or _staging_path(str(params.get("task_id") or ""), params)
+    if not os.path.lexists(staging):
+        return
+    safe_staging = _staging_dir(root, staging, _publication_id(str(params.get("task_id") or ""), params))
+    shutil.rmtree(safe_staging)
+
+
+def _cancel_validation(task_id: str, params: dict) -> dict:
+    remove_publication_staging({**params, "task_id": task_id})
+    message = "canceled: publication canceled"
+    _set_status(task_id, "canceled", error=message, config_patch={"error_code": "canceled"})
+    return {"status": "canceled", "error_code": "canceled", "error": message}
+
+
+def _validation_failure(task_id: str, exc: Exception) -> dict:
+    code = exc.code if isinstance(exc, PublicationError) else "validation_failed"
+    message = str(exc)
+    _set_status(task_id, "validating", error=message, config_patch={"error_code": code})
+    return {"status": "validating", "error_code": code, "error": message}
 
 
 def run_publication_validation(
@@ -304,8 +459,6 @@ def run_publication_validation(
 ) -> dict:
     """Resume a persisted validating task and atomically commit it after functional validation."""
     gpu_ids = _normalize_gpu_ids(gpu_ids)
-    if _cancelled(task_control):
-        return {"status": "canceled", "error_code": "canceled"}
     task = _load_task(task_id)
     if task is None or task.task_type != "model_publication":
         raise _error("publication_missing", "publication task does not exist")
@@ -315,43 +468,92 @@ def run_publication_validation(
     staging = params.get("staging_path") or _staging_path(task_id, params)
     if not os.path.isdir(staging):
         raise _error("publication_missing", "publication staging is unavailable")
-    progress(82, "Checking selected GPUs")
-    gpu_snapshot = publication_gpu_preflight(gpu_ids)
     if _cancelled(task_control):
-        return {"status": "canceled", "error_code": "canceled"}
-    progress(86, "Running functional validation")
-    functional = functional_validate_fn(staging, gpu_ids, task_control) or {"status": "passed"}
-    if _cancelled(task_control):
-        return {"status": "canceled", "error_code": "canceled"}
-    inspection = inspect_model(staging)
-    compatibility = {"serving": inspect_serving_compatibility(inspection.architectures)}
-    manifest = build_manifest(
-        staging,
-        {**params, "task_id": task_id, "publication_id": _publication_id(task_id, params)},
-        inspection,
-        {"structural": params.get("structural_validation") or {"status": "passed"}, "functional": functional},
-        compatibility,
-    )
-    # Cancellation is rejected from this point because commit_staging is atomic.
-    _set_status(task_id, "registration_pending", config_patch={"commit_in_progress": True, "gpu_snapshot": gpu_snapshot})
+        return _cancel_validation(task_id, params)
+    try:
+        progress(82, "Checking selected GPUs")
+        gpu_snapshot = publication_gpu_preflight(gpu_ids, required_bytes=_estimate_bytes(staging))
+        if _cancelled(task_control):
+            return _cancel_validation(task_id, params)
+        progress(86, "Running functional validation")
+        functional = functional_validate_fn(staging, gpu_ids, task_control) or {"status": "passed"}
+        if _cancelled(task_control):
+            return _cancel_validation(task_id, params)
+        inspection = inspect_model(staging)
+        compatibility = {"serving": inspect_serving_compatibility(inspection.architectures)}
+        validation = {
+            "structural": params.get("structural_validation") or {"status": "passed"},
+            "functional": functional,
+        }
+        if isinstance(functional.get("evaluation"), dict) and functional["evaluation"]:
+            validation["evaluation"] = functional["evaluation"]
+        manifest = build_manifest(
+            staging,
+            {**params, "task_id": task_id, "publication_id": _publication_id(task_id, params)},
+            inspection,
+            validation,
+            compatibility,
+        )
+    except PublicationError as exc:
+        if exc.code == "canceled":
+            return _cancel_validation(task_id, params)
+        return _validation_failure(task_id, exc)
+    except Exception as exc:
+        return _validation_failure(task_id, exc)
+
+    lock = task_control.get("lock")
+    with (lock if lock is not None else nullcontext()):
+        from app.extensions import db
+
+        db.session.expire_all()
+        current = _load_task(task_id)
+        if _cancelled(task_control) or (current is not None and current.status == "canceled"):
+            return _cancel_validation(task_id, params)
+        if current is None or current.status != "validating":
+            raise _error("invalid_publication_state", "publication is not awaiting validation")
+        _set_status(
+            task_id,
+            "registration_pending",
+            config_patch={"commit_in_progress": True, "gpu_snapshot": gpu_snapshot, "error_code": None},
+        )
+
     progress(96, "Committing publication")
     from app.repositories import model_register_published
 
-    committed = commit_staging(staging, _root(params), manifest, model_register_published)
-    _set_status(
-        task_id,
-        "completed",
-        model_path=os.path.join(_root(params), committed["publication_id"]),
-        config_patch={"commit_in_progress": False, "publication_id": committed["publication_id"]},
-    )
+    try:
+        committed = commit_staging(staging, _root(params), manifest, model_register_published)
+        _set_status(
+            task_id,
+            "completed",
+            model_path=os.path.join(_root(params), committed["publication_id"]),
+            config_patch={"commit_in_progress": False, "publication_id": committed["publication_id"], "error_code": None},
+        )
+    except Exception as exc:
+        _set_status(
+            task_id,
+            "registration_pending",
+            error=str(exc),
+            config_patch={"commit_in_progress": False, "error_code": "registration_pending"},
+        )
+        return {"status": "registration_pending", "error_code": "registration_pending", "error": str(exc)}
     progress(100, "Publication complete")
     return {"status": "success", "publication_id": committed["publication_id"]}
 
 
 def _functional_validation_worker(path: str) -> dict:
-    """Task 7 can extend this child contract with real image/CMMMU fixtures."""
+    """Load on visible CUDA devices and run smoke generation plus one CMMMU row."""
     inspection = inspect_model(path)
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("functional validation requires visible CUDA devices")
+    visible_count = len([value for value in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if value.strip()])
+    if visible_count < 1:
+        raise RuntimeError("functional validation requires explicit visible CUDA devices")
+    device_map = "auto" if visible_count > 1 else "cuda"
+    torch_dtype = torch.bfloat16
     if inspection.is_vlm:
+        import tempfile
         from PIL import Image
         from transformers import AutoProcessor
         try:
@@ -360,20 +562,73 @@ def _functional_validation_worker(path: str) -> dict:
             from transformers import AutoModelForVision2Seq as AutoModelForImageTextToText
 
         processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
-        model = AutoModelForImageTextToText.from_pretrained(path, trust_remote_code=True)
-        image = Image.new("RGB", (8, 8), "white")
-        inputs = processor(text="Describe this image.", images=image, return_tensors="pt").to(model.device)
-        output = model.generate(**inputs, max_new_tokens=4)
+        model = AutoModelForImageTextToText.from_pretrained(
+            path,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+            trust_remote_code=True,
+        )
+        model.eval()
+        image = Image.new("RGB", (224, 224), "white")
+        messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Describe this image."}]}]
+        if hasattr(processor, "apply_chat_template"):
+            prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        else:
+            prompt = "<|image_pad|>\nDescribe this image."
+        inputs = processor(text=prompt, images=image, return_tensors="pt")
+        input_device = getattr(model, "device", torch.device("cuda"))
+        moved = {}
+        for key, value in inputs.items():
+            if not hasattr(value, "to"):
+                moved[key] = value
+            elif isinstance(value, torch.Tensor) and torch.is_floating_point(value):
+                moved[key] = value.to(input_device, dtype=torch_dtype)
+            else:
+                moved[key] = value.to(input_device)
+        with torch.no_grad():
+            output = model.generate(**moved, max_new_tokens=4)
         if not processor.batch_decode(output, skip_special_tokens=True)[0].strip():
             raise RuntimeError("VLM image validation returned no output")
-        # The result shape reserves the evaluation channel for Task 7's CMMMU sample.
-        return {"status": "passed", "text_generation": {"status": "passed"}, "image": {"status": "passed"}, "evaluation": {}}
+        del model, processor
+        torch.cuda.empty_cache()
+
+        from merge_manager import run_lmms_eval_stream
+
+        with tempfile.TemporaryDirectory(prefix="publication-cmmmu-") as output_dir:
+            evaluation = run_lmms_eval_stream(
+                path,
+                output_dir,
+                lambda *_args: None,
+                0,
+                100,
+                task_control={},
+                limit=1,
+                hf_dataset="m-a-p/CMMMU",
+                hf_subset="health_and_medicine",
+                hf_split="val",
+                num_gpus=visible_count,
+            )
+        if not isinstance(evaluation, dict) or int(evaluation.get("samples") or 0) < 1:
+            raise RuntimeError("CMMMU validation evaluated no samples")
+        return {
+            "status": "passed",
+            "text_generation": {"status": "passed"},
+            "image": {"status": "passed"},
+            "evaluation": {"cmmmu": evaluation},
+        }
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        path,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
+        trust_remote_code=True,
+    )
+    model.eval()
     inputs = tokenizer("Reply with one word: ready", return_tensors="pt").to(model.device)
-    output = model.generate(**inputs, max_new_tokens=4)
+    with torch.no_grad():
+        output = model.generate(**inputs, max_new_tokens=4)
     if not tokenizer.decode(output[0], skip_special_tokens=True).strip():
         raise RuntimeError("text validation returned no output")
     return {"status": "passed", "text_generation": {"status": "passed"}}

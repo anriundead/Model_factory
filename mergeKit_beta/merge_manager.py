@@ -2909,6 +2909,7 @@ def run_lmms_eval_stream(
             ds = ds.select(range(k))
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
+            device_map = "auto" if device == "cuda" and int(num_gpus or 0) > 1 else device
             torch_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
             callback(start_prog + 5, "加载 VLM 权重…")
             vlm = None
@@ -2917,10 +2918,11 @@ def run_lmms_eval_stream(
                 vlm = AutoModelForImageTextToText.from_pretrained(
                     model_path,
                     torch_dtype=torch_dtype,
-                    device_map=device,
+                    device_map=device_map,
                     trust_remote_code=True,
                 )
                 vlm.eval()
+                input_device = getattr(vlm, "device", torch.device(device))
                 try:
                     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
                 except Exception as e_proc:
@@ -2970,9 +2972,9 @@ def run_lmms_eval_stream(
                             _moved[k] = v
                             continue
                         if getattr(v, "dtype", None) is not None and str(v.dtype).startswith("torch.int"):
-                            _moved[k] = v.to(device)
+                            _moved[k] = v.to(input_device)
                         else:
-                            _moved[k] = v.to(device, dtype=torch_dtype)
+                            _moved[k] = v.to(input_device, dtype=torch_dtype)
                     inputs = _moved
                     with torch.no_grad():
                         out_ids = vlm.generate(**inputs, max_new_tokens=32)

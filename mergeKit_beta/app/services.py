@@ -1474,9 +1474,16 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                 continue
             try:
                 with self.state.scheduler_lock:
+                    if self.state.tasks[task_id].get("status") == "stopped":
+                        continue
                     self.state.tasks[task_id]["status"] = "running"
                     self.state.tasks[task_id]["message"] = "正在初始化..."
-                    task_control = {"aborted": False, "process": None}
+                    task_control = self.state.tasks[task_id].get("control")
+                    if not isinstance(task_control, dict):
+                        task_control = {"aborted": False, "process": None}
+                    task_control.setdefault("aborted", False)
+                    task_control.setdefault("process", None)
+                    task_control["lock"] = self.state.scheduler_lock
                     self.state.tasks[task_id]["control"] = task_control
                     self.state.running_task_info["id"] = task_id
                     self.state.running_task_info["priority"] = priority_score
@@ -1668,12 +1675,13 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                 elif task_type == "model_publication":
                     from app.model_publication_tasks import run_model_publication_task, run_publication_validation
 
-                    if data.get("validation_gpu_ids"):
-                        result = run_publication_validation(
-                            task_id, data["validation_gpu_ids"], update_progress, task_control
-                        )
-                    else:
-                        result = run_model_publication_task(task_id, data, update_progress, task_control)
+                    with self.app.app_context():
+                        if data.get("validation_gpu_ids"):
+                            result = run_publication_validation(
+                                task_id, data["validation_gpu_ids"], update_progress, task_control
+                            )
+                        else:
+                            result = run_model_publication_task(task_id, data, update_progress, task_control)
                 else:
                     import importlib as _importlib
                     _data = dict(data)
@@ -1726,16 +1734,13 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                     self.state.tasks[task_id]["result"] = result
                     if task_type == "model_publication" and result.get("status") == "validating":
                         self.state.tasks[task_id]["status"] = "validating"
-                        self.state.tasks[task_id]["message"] = "Awaiting explicit GPU validation"
+                        self.state.tasks[task_id]["message"] = result.get("error") or "Awaiting explicit GPU validation"
+                    elif task_type == "model_publication" and result.get("status") == "registration_pending":
+                        self.state.tasks[task_id]["status"] = "registration_pending"
+                        self.state.tasks[task_id]["message"] = result.get("error") or "Awaiting publication reconciliation"
                     elif task_type == "model_publication" and result.get("status") == "canceled":
                         self.state.tasks[task_id]["status"] = "error"
                         self.state.tasks[task_id]["message"] = "Canceled"
-                        try:
-                            with self.app.app_context():
-                                from app.repositories import task_set_status
-                                task_set_status(task_id, "canceled", error=result.get("error", "canceled"))
-                        except Exception as exc:
-                            self.logger.warning("[worker] publication cancellation persist failed: %s", exc)
                     elif result.get("status") == "success":
                         self.state.tasks[task_id]["status"] = "completed"
                         self.state.tasks[task_id]["progress"] = 100
@@ -1762,7 +1767,8 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                 if self.state.tasks.get(task_id, {}).get("status") not in ["interrupted", "queued", "stopped"]:
                     self.state.tasks[task_id]["status"] = "error"
                     self.state.tasks[task_id]["message"] = "系统内部错误: %s" % str(e)
-                    self._db_update_completion(task_id, "error", data.get("type", "merge"), None)
+                    if data.get("type") != "model_publication":
+                        self._db_update_completion(task_id, "error", data.get("type", "merge"), None)
             finally:
                 self._post_task_gpu_cleanup(task_id)
                 self.state.task_queue.task_done()

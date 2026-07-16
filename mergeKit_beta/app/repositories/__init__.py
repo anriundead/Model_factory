@@ -4,6 +4,7 @@
 所有函数均需在 Flask 应用上下文中调用（如 request 或 worker 线程内已 push 的 app context）。
 """
 from datetime import datetime
+import os
 
 from app.extensions import db
 from app.models import Task, Model, TestSet, EvaluationResult, Tag, EvolutionStep
@@ -281,6 +282,18 @@ def model_get_by_path(path: str) -> Model | None:
     return db.session.query(Model).filter_by(path=path).first()
 
 
+def model_get_by_canonical_path(path: str) -> Model | None:
+    """Match historical slash and symlink-equivalent model registrations."""
+    raw = (path or "").strip().rstrip(os.sep)
+    if not raw:
+        return None
+    candidate = os.path.realpath(os.path.abspath(raw))
+    for model in db.session.query(Model).all():
+        if os.path.realpath(os.path.abspath(model.path.rstrip(os.sep))) == candidate:
+            return model
+    return None
+
+
 def model_get_by_id(model_id: str) -> Model | None:
     """按 id 查询模型。"""
     if not (model_id or "").strip():
@@ -294,6 +307,15 @@ def model_delete_by_path(path: str) -> bool:
     if not path:
         return False
     model = db.session.query(Model).filter_by(path=path).first()
+    if model is None:
+        return False
+    db.session.delete(model)
+    db.session.commit()
+    return True
+
+
+def model_delete_by_canonical_path(path: str) -> bool:
+    model = model_get_by_canonical_path(path)
     if model is None:
         return False
     db.session.delete(model)
