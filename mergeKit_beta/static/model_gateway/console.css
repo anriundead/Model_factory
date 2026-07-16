@@ -418,8 +418,15 @@
 .gateway-admin-layout,
 .gateway-playground-layout {
     display: grid;
-    grid-template-columns: minmax(300px, 0.72fr) minmax(360px, 1fr);
     gap: 18px;
+}
+
+.gateway-admin-layout {
+    grid-template-columns: minmax(360px, 1fr) minmax(320px, 1fr);
+}
+
+.gateway-playground-layout {
+    grid-template-columns: minmax(300px, 0.72fr) minmax(360px, 1fr);
 }
 
 .gateway-admin-layout > *,
@@ -522,7 +529,13 @@
 }
 
 .gateway-inline-field {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
     gap: 10px;
+}
+
+.gateway-inline-field > * {
+    min-width: 0;
 }
 
 .gateway-two-fields,
