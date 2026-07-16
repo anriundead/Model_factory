@@ -14,6 +14,7 @@ import sys
 import time
 import re
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Callable
 
 from app.model_inspection import inspect_model
@@ -585,6 +586,77 @@ def run_publication_validation(
     return {"status": "success", "publication_id": committed["publication_id"]}
 
 
+def _validate_one_cmmmu_sample(model, processor, input_device, torch_dtype) -> dict:
+    """Reuse the proven evolution helpers for one labeled, image-backed CMMMU row."""
+    import torch
+    from datasets import load_dataset
+    from evolution.vendor.vlm_merge.vlm_fitness import (
+        _cmmmu_first_image,
+        _coerce_hf_image_to_pil,
+        _normalize_cmmmu_gold,
+        build_cmmmu_prompt,
+        load_prompt_cfg,
+        parse_choice,
+    )
+
+    vlm_root = Path(__file__).resolve().parents[1] / "evolution" / "vendor" / "vlm_merge"
+    prompt_config = load_prompt_cfg("eval/prompt.yaml", vlm_root)
+    dataset = load_dataset(
+        "m-a-p/CMMMU",
+        "health_and_medicine",
+        split="val",
+        trust_remote_code=True,
+        cache_dir=os.environ.get("HF_DATASETS_CACHE") or None,
+    )
+    selected = None
+    for index in range(len(dataset)):
+        row = dict(dataset[index])
+        image = _coerce_hf_image_to_pil(_cmmmu_first_image(row))
+        gold = _normalize_cmmmu_gold(row.get("answer"))
+        if image is not None and gold:
+            selected = (index, row, image, gold)
+            break
+    if selected is None:
+        raise RuntimeError("CMMMU validation found no labeled image sample")
+
+    index, row, image, gold = selected
+    prompt = build_cmmmu_prompt(row, prompt_config)
+    image_token = "<|image_pad|>"
+    image_token_id = getattr(getattr(model, "config", None), "image_token_id", None)
+    tokenizer = getattr(processor, "tokenizer", None)
+    if image_token_id is not None and tokenizer is not None and hasattr(tokenizer, "decode"):
+        image_token = tokenizer.decode([int(image_token_id)]).strip() or image_token
+    if image_token not in prompt:
+        prompt = "%s\n%s" % (image_token, prompt)
+
+    inputs = processor(text=prompt, images=image, return_tensors="pt")
+    moved = {}
+    for key, value in inputs.items():
+        if not hasattr(value, "to"):
+            moved[key] = value
+        elif isinstance(value, torch.Tensor) and torch.is_floating_point(value):
+            moved[key] = value.to(input_device, dtype=torch_dtype)
+        else:
+            moved[key] = value.to(input_device)
+    started_at = time.monotonic()
+    with torch.no_grad():
+        output = model.generate(**moved, max_new_tokens=64)
+    prediction = parse_choice(processor.batch_decode(output, skip_special_tokens=True)[0])
+    correct = bool(prediction and prediction == gold)
+    accuracy = 100.0 if correct else 0.0
+    return {
+        "acc": accuracy,
+        "f1": 1.0 if correct else 0.0,
+        "samples": 1,
+        "time": round(time.monotonic() - started_at, 2),
+        "context": 0,
+        "per_task_acc": {"health_and_medicine": accuracy},
+        "subset": "health_and_medicine",
+        "split": "val",
+        "source_index": index,
+    }
+
+
 def _functional_validation_worker(path: str) -> dict:
     """Load on visible CUDA devices and run smoke generation plus one CMMMU row."""
     inspection = inspect_model(path)
@@ -598,7 +670,6 @@ def _functional_validation_worker(path: str) -> dict:
     device_map = "auto" if visible_count > 1 else "cuda"
     torch_dtype = torch.bfloat16
     if inspection.is_vlm:
-        import tempfile
         from PIL import Image
         from transformers import AutoProcessor
         try:
@@ -634,26 +705,9 @@ def _functional_validation_worker(path: str) -> dict:
             output = model.generate(**moved, max_new_tokens=4)
         if not processor.batch_decode(output, skip_special_tokens=True)[0].strip():
             raise RuntimeError("VLM image validation returned no output")
+        evaluation = _validate_one_cmmmu_sample(model, processor, input_device, torch_dtype)
         del model, processor
         torch.cuda.empty_cache()
-
-        from merge_manager import run_lmms_eval_stream
-
-        with tempfile.TemporaryDirectory(prefix="publication-cmmmu-") as output_dir:
-            evaluation = run_lmms_eval_stream(
-                path,
-                output_dir,
-                lambda *_args: None,
-                0,
-                100,
-                task_control={},
-                limit=1,
-                hf_dataset="m-a-p/CMMMU",
-                hf_subset="health_and_medicine",
-                hf_split="val",
-                num_gpus=visible_count,
-                absolute_limit=1,
-            )
         if not isinstance(evaluation, dict) or int(evaluation.get("samples") or 0) < 1:
             raise RuntimeError("CMMMU validation evaluated no samples")
         return {

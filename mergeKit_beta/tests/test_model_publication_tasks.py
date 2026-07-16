@@ -633,7 +633,7 @@ class PublicationTaskTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertNotIn("ModuleNotFoundError", result.stderr)
 
-    def test_vlm_cmmmu_requests_explicit_one_row_boundary(self):
+    def test_vlm_cmmmu_reuses_local_evolution_helpers_without_lmms_eval(self):
         from app.model_publication_tasks import _functional_validation_worker
 
         inspection = SimpleNamespace(is_vlm=True)
@@ -645,22 +645,46 @@ class PublicationTaskTest(unittest.TestCase):
             no_grad=lambda: mock.MagicMock(__enter__=lambda *_args: None, __exit__=lambda *_args: None),
             device=lambda _value: _value,
         )
-        model = mock.Mock(device="cuda")
+        model = mock.Mock(device="cuda", config=SimpleNamespace(image_token_id=None))
         model.generate.return_value = ["tokens"]
         processor = mock.Mock()
         processor.apply_chat_template.return_value = "prompt"
         processor.return_value = {}
-        processor.batch_decode.return_value = ["ok"]
+        processor.batch_decode.side_effect = [["ok"], ["A"]]
         fake_transformers = SimpleNamespace(AutoProcessor=SimpleNamespace(from_pretrained=lambda *_args, **_kwargs: processor), AutoModelForImageTextToText=SimpleNamespace(from_pretrained=lambda *_args, **_kwargs: model))
+        fake_dataset = [{"question": "q", "option1": "a", "option2": "b", "answer": "A", "image_1": object()}]
+        fake_datasets = SimpleNamespace(load_dataset=mock.Mock(return_value=fake_dataset))
+        fake_fitness = SimpleNamespace(
+            _cmmmu_first_image=lambda row: row["image_1"],
+            _coerce_hf_image_to_pil=lambda image: image,
+            _normalize_cmmmu_gold=lambda answer: answer,
+            build_cmmmu_prompt=lambda _row, _config: "question",
+            load_prompt_cfg=lambda *_args: {},
+            parse_choice=lambda output: output,
+        )
 
         with mock.patch("app.model_publication_tasks.inspect_model", return_value=inspection):
-            with mock.patch.dict(sys.modules, {"torch": fake_torch, "transformers": fake_transformers}):
+            with mock.patch.dict(sys.modules, {
+                "torch": fake_torch,
+                "transformers": fake_transformers,
+                "datasets": fake_datasets,
+                "evolution.vendor.vlm_merge.vlm_fitness": fake_fitness,
+            }):
                 with mock.patch("PIL.Image.new", return_value=object()):
-                    with mock.patch("merge_manager.run_lmms_eval_stream", return_value={"samples": 1}) as evaluate:
+                    with mock.patch("merge_manager.run_lmms_eval_stream", side_effect=AssertionError("lmms_eval must not be required")) as legacy_evaluate:
                         with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=False):
-                            _functional_validation_worker(self.source)
+                            result = _functional_validation_worker(self.source)
 
-        self.assertEqual(evaluate.call_args.kwargs["absolute_limit"], 1)
+        legacy_evaluate.assert_not_called()
+        fake_datasets.load_dataset.assert_called_once_with(
+            "m-a-p/CMMMU",
+            "health_and_medicine",
+            split="val",
+            trust_remote_code=True,
+            cache_dir=mock.ANY,
+        )
+        self.assertEqual(result["evaluation"]["cmmmu"]["samples"], 1)
+        self.assertEqual(result["evaluation"]["cmmmu"]["acc"], 100.0)
 
     def test_vlm_recipe_materializes_with_fresh_managed_base(self):
         from app.model_publication_tasks import _materialize_recipe
