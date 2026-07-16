@@ -297,8 +297,11 @@ class ModelPathMixin(BaseService):
             from app.models import Model
             from app.repositories import model_list_by_sources, model_register
 
-            rows = model_list_by_sources(["base", "merged"])
+            rows = model_list_by_sources(["base", "merged", "published"])
             for row in rows:
+                # Published assets are reconciled from their manifests, not base/merge scans.
+                if row.source == "published":
+                    continue
                 keep = False
                 canonical_path = None
 

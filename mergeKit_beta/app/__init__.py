@@ -101,6 +101,20 @@ def create_app():
         except Exception as e:
             import logging
             logging.getLogger("mergeKit_beta").warning("启动时 models 表同步跳过: %s", e)
+        try:
+            from .model_publication import reconcile_publications
+            from .repositories import model_register_published
+
+            recovery = reconcile_publications(Config.PUBLISHED_MODELS_PATH, model_register_published)
+            logging.getLogger("mergeKit_beta").info(
+                "启动时正式模型已恢复: registered=%s quarantined=%s staging_cleaned=%s",
+                recovery.get("registered", 0),
+                recovery.get("quarantined", 0),
+                recovery.get("staging_cleaned", 0),
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger("mergeKit_beta").warning("启动时正式模型恢复跳过: %s", e)
     return app
 
 

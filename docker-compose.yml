@@ -33,6 +33,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - LOCAL_MODELS_PATH=/data/Models
       - MERGEKIT_MODEL_POOL=/data/models_pool
+      - MERGEKIT_PUBLISHED_MODELS_PATH=/data/PublishedModels
       - DATABASE_URL=${DATABASE_URL:-}
       # Empty keeps legacy SQLite compatibility. The research profile sets this
       # to the dedicated PostgreSQL service before any production cutover.
@@ -106,6 +107,7 @@ services:
       - ./mergeKit_beta:/app/ServiceEndFiles/Workspaces/mergeKit_beta
       - ${HOST_MODELS:-../Models}:/data/Models:ro
       - ${HOST_MODEL_POOL:-../mergeKit/models_pool}:/data/models_pool
+      - ${HOST_PUBLISHED_MODELS:-/home/a/Model_factory_data/published_models}:/data/PublishedModels
       - ${HOST_PACKAGES:-../Packages}:/app/ServiceEndFiles/Packages:ro
       - ${HOST_MERGES:-./mergeKit_beta/merges}:/app/ServiceEndFiles/Workspaces/mergeKit_beta/merges
       - ${HOST_HF_DATASETS:-./hf_datasets_cache}:/data/hf_datasets

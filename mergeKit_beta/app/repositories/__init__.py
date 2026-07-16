@@ -190,6 +190,19 @@ def model_register(
     return model
 
 
+def model_register_published(path: str, manifest: dict) -> Model:
+    """Register a formal publication in the core ORM only."""
+    return model_register(
+        path=path,
+        name=manifest["display_name"],
+        source="published",
+        task_id=manifest["provenance"]["task_id"],
+        architecture=manifest["model"]["model_type"],
+        is_vlm=manifest["artifact_type"] == "vlm",
+        size_bytes=manifest["files"]["total_bytes"],
+    )
+
+
 def model_get_by_path(path: str) -> Model | None:
     """按路径查询模型。"""
     path = path.rstrip("/")
