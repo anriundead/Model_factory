@@ -12,6 +12,8 @@ import tempfile
 import time
 from typing import Callable, Sequence
 
+from sqlalchemy.orm import Session
+
 from app.model_inspection import ModelInspection
 
 
@@ -547,30 +549,90 @@ def delete_published_asset(
     return {"publication_id": publication_id, "deleted": True}
 
 
-def delete_registered_published_asset(publication_id: str, root: str) -> dict:
-    """Delete a formal asset only when no active task or Gateway row references it."""
+def _registered_asset_is_referenced(candidate_id: str, path: str) -> bool:
     from app.extensions import db
     from app.model_gateway.models import ServingModelService
-    from app.models import Model
-    from app.repositories import model_delete_by_canonical_path, publication_task_is_active
+    from app.models import Model, Task
 
-    def reference_check(candidate_id: str, path: str) -> bool:
-        real_path = os.path.realpath(os.path.abspath(path.rstrip(os.sep)))
-        models = db.session.query(Model).filter(Model.source == "published").all()
+    real_path = os.path.realpath(os.path.abspath(path.rstrip(os.sep)))
+    active_statuses = {"queued", "materializing", "validating", "registration_pending", "running"}
+    core_session = Session(bind=db.engine)
+    try:
+        models = core_session.query(Model).filter(Model.source == "published").all()
         model = next(
             (row for row in models if os.path.realpath(os.path.abspath(row.path.rstrip(os.sep))) == real_path),
             None,
         )
-        if publication_task_is_active(candidate_id) is not False:
+        try:
+            tasks = (
+                core_session.query(Task)
+                .filter(Task.task_type == "model_publication", Task.status.in_(active_statuses))
+                .all()
+            )
+        except Exception:
+            core_session.rollback()
             return True
-        for service in db.session.query(ServingModelService).filter(ServingModelService.status != "deleted").all():
-            service_path = os.path.realpath(os.path.abspath(service.model_path.rstrip(os.sep)))
-            if service_path == real_path or (model is not None and service.model_id == model.id):
-                return True
-        return False
+        task_active = any(
+            task.id == candidate_id
+            or (isinstance(task.config, dict) and task.config.get("publication_id") == candidate_id)
+            for task in tasks
+        )
+        model_id = model.id if model is not None else None
+        core_session.rollback()
+    finally:
+        core_session.close()
+    if task_active:
+        return True
 
+    gateway_session = Session(bind=db.engines["model_gateway"])
     try:
-        return delete_published_asset(publication_id, root, reference_check, model_delete_by_canonical_path)
+        services = gateway_session.query(ServingModelService).filter(ServingModelService.status != "deleted").all()
+        referenced = False
+        for service in services:
+            service_path = os.path.realpath(os.path.abspath(service.model_path.rstrip(os.sep)))
+            if service_path == real_path or (model_id is not None and service.model_id == model_id):
+                referenced = True
+                break
+        gateway_session.rollback()
+        return referenced
+    finally:
+        gateway_session.close()
+
+
+def _delete_core_model_by_canonical_path(path: str) -> bool:
+    from app.extensions import db
+    from app.models import Model
+
+    real_path = os.path.realpath(os.path.abspath(path.rstrip(os.sep)))
+    core_session = Session(bind=db.engine)
+    try:
+        model = next(
+            (row for row in core_session.query(Model).all()
+             if os.path.realpath(os.path.abspath(row.path.rstrip(os.sep))) == real_path),
+            None,
+        )
+        if model is None:
+            core_session.rollback()
+            return False
+        core_session.delete(model)
+        core_session.commit()
+        return True
+    except Exception:
+        core_session.rollback()
+        raise
+    finally:
+        core_session.close()
+
+
+def delete_registered_published_asset(publication_id: str, root: str) -> dict:
+    """Delete a formal asset only when no active task or Gateway row references it."""
+    try:
+        return delete_published_asset(
+            publication_id,
+            root,
+            _registered_asset_is_referenced,
+            _delete_core_model_by_canonical_path,
+        )
     except PublicationError as exc:
         if exc.code == "publication_referenced":
             raise _error("asset_in_use", "publication is still referenced") from exc

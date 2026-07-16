@@ -934,6 +934,10 @@ def register_routes(app, state, services, dataset_service):
             path = services.model_get_path_by_id(model_id)
             if not path:
                 return jsonify({"status": "error", "message": "模型不存在"}), 404
+        published_response = _delete_formal_published_model(path=path)
+        if published_response is not None:
+            return published_response
+        if not m:
             if os.path.isdir(path):
                 try:
                     shutil.rmtree(path)

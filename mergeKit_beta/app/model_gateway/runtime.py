@@ -11,6 +11,9 @@ import subprocess
 import time
 import urllib.request
 
+from sqlalchemy import update
+from sqlalchemy.orm import Session
+
 from app.extensions import db
 from app.model_gateway.auth import hash_secret
 from app.model_gateway.models import ServingModelService, ServingRequest
@@ -93,12 +96,17 @@ def _validate_formal_service_asset(service: ServingModelService, config) -> None
         if formal_path:
             raise PublicationError("asset_unavailable", "asset_unavailable: published asset is not bound to a core model")
         return
-    model = db.session.get(Model, service.model_id)
-    if not model or model.source != "published":
-        raise PublicationError("asset_unavailable", "asset_unavailable: formal published model is unavailable")
-    if _real(service.model_path) != _real(model.path):
-        raise PublicationError("asset_identity_mismatch", "asset_identity_mismatch: service path does not match its formal model")
-    manifest = validate_formal_published_model(model, root, full_hash=True)
+    core_session = Session(bind=db.engine)
+    try:
+        model = core_session.get(Model, service.model_id)
+        if not model or model.source != "published":
+            raise PublicationError("asset_unavailable", "asset_unavailable: formal published model is unavailable")
+        if _real(service.model_path) != _real(model.path):
+            raise PublicationError("asset_identity_mismatch", "asset_identity_mismatch: service path does not match its formal model")
+        manifest = validate_formal_published_model(model, root, full_hash=True)
+        core_session.rollback()
+    finally:
+        core_session.close()
     serving = current_serving_compatibility(manifest)
     if serving.get("status") != "ready":
         code = serving.get("reason_code") or serving.get("status") or "asset_unavailable"
@@ -282,47 +290,78 @@ def start_service(service_id: str, config=None, timeout_s: int = 120) -> Serving
         raise ServiceStateError("service_deleted", "deleted service is terminal")
     if service.status == "running":
         return service
+    if service.status not in ("stopped", "failed"):
+        raise ServiceStateError("service_state_conflict", "service lifecycle transition is already in progress")
 
-    _validate_formal_service_asset(service, config)
-    validate_model_path(service.model_path, allowed_model_roots(config))
-    validate_gpu_availability(
-        service,
-        max_used_mib=getattr(config, "MERGEKIT_MODEL_GATEWAY_GPU_MAX_USED_MIB", 1024),
-        min_free_mib=getattr(config, "MERGEKIT_MODEL_GATEWAY_GPU_MIN_FREE_MIB", 4096),
+    claimed = db.session.execute(
+        update(ServingModelService)
+        .where(
+            ServingModelService.id == service_id,
+            ServingModelService.status.in_(("stopped", "failed")),
+        )
+        .values(status="starting", last_error=None)
+        .execution_options(synchronize_session=False)
     )
-    if not service.vllm_port:
-        service.vllm_port = find_free_port(
-            getattr(config, "MERGEKIT_MODEL_GATEWAY_PORT_START", 18000),
-            getattr(config, "MERGEKIT_MODEL_GATEWAY_PORT_END", 18999),
-            _reserved_ports(exclude_service_id=service.id),
-        )
-    service.vllm_host = "127.0.0.1"
-    _ensure_internal_key(service)
-    service.status = "starting"
-    service.last_error = None
-    db.session.add(service)
+    if claimed.rowcount != 1:
+        db.session.rollback()
+        db.session.expire_all()
+        current = db.session.get(ServingModelService, service_id)
+        if current and current.status == "running":
+            return current
+        if current and current.status == "deleted":
+            raise ServiceStateError("service_deleted", "deleted service is terminal")
+        raise ServiceStateError("service_state_conflict", "service lifecycle transition is already in progress")
     db.session.commit()
+    db.session.expire_all()
+    service = db.session.get(ServingModelService, service_id)
 
-    log_dir = getattr(config, "MERGEKIT_MODEL_GATEWAY_LOG_DIR", os.path.join(os.getcwd(), "logs", "model_gateway"))
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f"{service.id}.log")
-    env = _with_model_gateway_pythonpath(os.environ.copy(), config)
-    env["MERGEKIT_MODEL_GATEWAY_SERVICE_ID"] = service.id
-    env["MERGEKIT_MODEL_GATEWAY_INTERNAL_API_KEY"] = service.internal_api_key
-    gpu_ids = service.gpu_ids or []
-    if gpu_ids:
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpu_ids)
-
-    cmd = build_vllm_command(service, config)
-    with open(log_path, "ab") as log_file:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=log_file,
-            env=env,
-            cwd=getattr(config, "PROJECT_ROOT", None) or os.getcwd(),
-            **ProcessManager.create_process_group_kwargs(),
+    try:
+        _validate_formal_service_asset(service, config)
+        validate_model_path(service.model_path, allowed_model_roots(config))
+        validate_gpu_availability(
+            service,
+            max_used_mib=getattr(config, "MERGEKIT_MODEL_GATEWAY_GPU_MAX_USED_MIB", 1024),
+            min_free_mib=getattr(config, "MERGEKIT_MODEL_GATEWAY_GPU_MIN_FREE_MIB", 4096),
         )
+        if not service.vllm_port:
+            service.vllm_port = find_free_port(
+                getattr(config, "MERGEKIT_MODEL_GATEWAY_PORT_START", 18000),
+                getattr(config, "MERGEKIT_MODEL_GATEWAY_PORT_END", 18999),
+                _reserved_ports(exclude_service_id=service.id),
+            )
+        service.vllm_host = "127.0.0.1"
+        _ensure_internal_key(service)
+
+        log_dir = getattr(config, "MERGEKIT_MODEL_GATEWAY_LOG_DIR", os.path.join(os.getcwd(), "logs", "model_gateway"))
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"{service.id}.log")
+        env = _with_model_gateway_pythonpath(os.environ.copy(), config)
+        env["MERGEKIT_MODEL_GATEWAY_SERVICE_ID"] = service.id
+        env["MERGEKIT_MODEL_GATEWAY_INTERNAL_API_KEY"] = service.internal_api_key
+        gpu_ids = service.gpu_ids or []
+        if gpu_ids:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpu_ids)
+
+        cmd = build_vllm_command(service, config)
+        with open(log_path, "ab") as log_file:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=log_file,
+                env=env,
+                cwd=getattr(config, "PROJECT_ROOT", None) or os.getcwd(),
+                **ProcessManager.create_process_group_kwargs(),
+            )
+    except Exception as exc:
+        db.session.rollback()
+        db.session.execute(
+            update(ServingModelService)
+            .where(ServingModelService.id == service_id, ServingModelService.status == "starting")
+            .values(status="failed", last_error=str(exc), stopped_at=datetime.utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        db.session.commit()
+        raise
 
     service.vllm_pid = proc.pid
     try:
@@ -443,6 +482,8 @@ def stop_service(service_id: str, timeout_s: int = 30) -> ServingModelService:
         raise ValueError("serving model service not found")
     if service.status == "deleted":
         raise ServiceStateError("service_deleted", "deleted service is terminal")
+    if service.status == "starting":
+        raise ServiceStateError("service_starting", "service is still starting")
 
     stored_pid = service.vllm_pid
     pids = _find_marked_service_pids(service.id)

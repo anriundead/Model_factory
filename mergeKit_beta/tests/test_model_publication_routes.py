@@ -853,6 +853,61 @@ class PublicationRouteTest(unittest.TestCase):
         self.assertEqual(authorized.status_code, 200)
         self.assertFalse(os.path.exists(model.path))
 
+    def test_legacy_raw_id_cannot_bypass_published_auth_or_reference_guard(self):
+        model = self._published_model("legacy-raw-id-guard")
+        self._gateway_service(model, status="stopped")
+        self.services.model_repo_save_raw({
+            "alternate-raw-id": {"path": model.path + os.sep, "name": "alias"},
+        })
+
+        unauthorized = self.app.test_client().delete("/api/model_repo/alternate-raw-id")
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertTrue(os.path.isdir(model.path))
+        self.assertIn("alternate-raw-id", self.services.model_repo_load_raw())
+
+        authorized = self.app.test_client().delete(
+            "/api/model_repo/alternate-raw-id",
+            headers=self.headers,
+        )
+        self.assertEqual(authorized.status_code, 409)
+        self.assertEqual(authorized.get_json()["error"]["code"], "asset_in_use")
+        self.assertTrue(os.path.isdir(model.path))
+        self.assertIn("alternate-raw-id", self.services.model_repo_load_raw())
+
+    def test_legacy_core_id_alias_cannot_bypass_unconfigured_admin_or_reference_guard(self):
+        model = self._published_model("legacy-core-id-guard")
+        self._gateway_service(model, status="stopped")
+        alias = os.path.join(self.tmpdir.name, "legacy-core-id-alias")
+        os.symlink(model.path, alias)
+        with self.app.app_context():
+            self.db.session.add(self.Model(
+                id="alternate-core-id",
+                name="alias",
+                path=alias + os.sep,
+                source="base",
+            ))
+            self.db.session.commit()
+
+        token = self.app.config["MERGEKIT_MODEL_GATEWAY_ADMIN_TOKEN"]
+        self.app.config["MERGEKIT_MODEL_GATEWAY_ADMIN_TOKEN"] = ""
+        unavailable = self.app.test_client().delete(
+            "/api/model_repo/alternate-core-id",
+            headers=self.headers,
+        )
+        self.assertEqual(unavailable.status_code, 503)
+        self.assertTrue(os.path.isdir(model.path))
+        self.assertTrue(os.path.lexists(alias))
+
+        self.app.config["MERGEKIT_MODEL_GATEWAY_ADMIN_TOKEN"] = token
+        authorized = self.app.test_client().delete(
+            "/api/model_repo/alternate-core-id",
+            headers=self.headers,
+        )
+        self.assertEqual(authorized.status_code, 409)
+        self.assertEqual(authorized.get_json()["error"]["code"], "asset_in_use")
+        self.assertTrue(os.path.isdir(model.path))
+        self.assertTrue(os.path.lexists(alias))
+
     def test_legacy_delete_routes_preserve_unauthenticated_non_published_behavior(self):
         path = self._make_legacy_model_dir("legacy-path")
 
@@ -885,7 +940,7 @@ class PublicationRouteTest(unittest.TestCase):
     def test_formal_delete_route_restores_asset_when_core_delete_raises(self):
         model = self._published_model("rollback-core-delete")
 
-        with mock.patch("app.repositories.model_delete_by_canonical_path", side_effect=RuntimeError("db failed")):
+        with mock.patch("app.model_publication._delete_core_model_by_canonical_path", side_effect=RuntimeError("db failed")):
             response = self.app.test_client().delete(
                 "/api/model-publications/rollback-core-delete",
                 headers=self.headers,

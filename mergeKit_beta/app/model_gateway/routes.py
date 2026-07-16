@@ -12,7 +12,9 @@ import uuid
 
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 import requests
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.extensions import db
 from app.models import Model
@@ -337,46 +339,58 @@ def admin_create_model_service():
     root = current_app.config.get("PUBLISHED_MODELS_PATH", "")
     try:
         with publication_lock(root):
-            db.session.expire_all()
-            if db.session.query(ServingModelService).filter(
-                ServingModelService.served_model_name == served_model_name,
-            ).first():
-                return _error(409, "served_model_name_exists", "served_model_name already exists")
-            model = db.session.get(Model, model_id)
-            if not model or model.source != "published":
-                return _error(409, "asset_unavailable", "model_id is not a formal published asset")
-            manifest = _formal_published_asset(model, full_hash=True)
-            serving = current_serving_compatibility(manifest)
-            if serving.get("status") != "ready":
-                return _error(409, serving.get("reason_code") or "asset_unavailable", "published asset is not selectable")
+            core_session = Session(bind=db.engine)
+            try:
+                model = core_session.get(Model, model_id)
+                if not model or model.source != "published":
+                    raise PublicationError("asset_unavailable", "model_id is not a formal published asset")
+                manifest = _formal_published_asset(model, full_hash=True)
+                serving = current_serving_compatibility(manifest)
+                if serving.get("status") != "ready":
+                    code = serving.get("reason_code") or "asset_unavailable"
+                    raise PublicationError(code, "published asset is not selectable")
+                model_snapshot = {"id": model.id, "path": model.path}
+                core_session.rollback()
+            finally:
+                core_session.close()
 
-            service = ServingModelService(
-                model_id=model.id,
-                model_path=model.path,
-                display_name=display_name,
-                served_model_name=served_model_name,
-                model_type=manifest["artifact_type"],
-                backend_type="vllm",
-                status="stopped",
-                vllm_host="127.0.0.1",
-                gpu_ids=gpu_ids,
-                tensor_parallel_size=tp,
-                gpu_memory_utilization=gpu_mem,
-                dtype=(data.get("dtype") or "auto").strip() or "auto",
-                max_model_len=max_model_len,
-                max_num_seqs=max_num_seqs,
-                max_num_batched_tokens=max_num_batched_tokens,
-                trust_remote_code=bool(data.get("trust_remote_code", False)),
-            )
-            db.session.add(service)
-            db.session.commit()
+            gateway_session = Session(bind=db.engines["model_gateway"])
+            try:
+                if gateway_session.query(ServingModelService).filter(
+                    ServingModelService.served_model_name == served_model_name,
+                ).first():
+                    return _error(409, "served_model_name_exists", "served_model_name already exists")
+                service = ServingModelService(
+                    model_id=model_snapshot["id"],
+                    model_path=model_snapshot["path"],
+                    display_name=display_name,
+                    served_model_name=served_model_name,
+                    model_type=manifest["artifact_type"],
+                    backend_type="vllm",
+                    status="stopped",
+                    vllm_host="127.0.0.1",
+                    gpu_ids=gpu_ids,
+                    tensor_parallel_size=tp,
+                    gpu_memory_utilization=gpu_mem,
+                    dtype=(data.get("dtype") or "auto").strip() or "auto",
+                    max_model_len=max_model_len,
+                    max_num_seqs=max_num_seqs,
+                    max_num_batched_tokens=max_num_batched_tokens,
+                    trust_remote_code=bool(data.get("trust_remote_code", False)),
+                )
+                gateway_session.add(service)
+                gateway_session.commit()
+                service_payload = service.to_dict()
+            except Exception:
+                gateway_session.rollback()
+                raise
+            finally:
+                gateway_session.close()
     except PublicationError as exc:
-        db.session.rollback()
         return _asset_error(exc)
     except IntegrityError:
-        db.session.rollback()
         return _error(409, "served_model_name_exists", "served_model_name already exists")
-    return jsonify({"status": "success", "service": service.to_dict()}), 201
+    return jsonify({"status": "success", "service": service_payload}), 201
 
 
 @model_gateway_bp.get("/api/model-gateway/admin/model-services/<service_id>")
@@ -389,16 +403,24 @@ def admin_get_model_service(service_id):
 
 @model_gateway_bp.delete("/api/model-gateway/admin/model-services/<service_id>")
 def admin_delete_model_service(service_id):
-    service = db.session.get(ServingModelService, service_id)
-    if not service:
-        return _error(404, "not_found", "Model service not found")
-    if service.status not in ("stopped", "failed"):
+    claimed = db.session.execute(
+        update(ServingModelService)
+        .where(
+            ServingModelService.id == service_id,
+            ServingModelService.status.in_(("stopped", "failed")),
+        )
+        .values(status="deleted", vllm_pid=None, vllm_pgid=None)
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != 1:
+        db.session.rollback()
+        db.session.expire_all()
+        if db.session.get(ServingModelService, service_id) is None:
+            return _error(404, "not_found", "Model service not found")
         return _error(409, "service_not_stopped", "Model service must be stopped before deletion")
-    service.status = "deleted"
-    service.vllm_pid = None
-    service.vllm_pgid = None
-    db.session.add(service)
     db.session.commit()
+    db.session.expire_all()
+    service = db.session.get(ServingModelService, service_id)
     return jsonify({"status": "success", "service": service.to_dict()})
 
 
