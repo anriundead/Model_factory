@@ -209,7 +209,7 @@
         if (!select || !summary || !unavailable) return;
         select.disabled = true;
         select.innerHTML = '<option value="">加载正式资产...</option>';
-        summary.innerHTML = '<span>类型：加载中</span><span>兼容性：加载中</span>';
+        setPublishedModelSummary(summary, [["类型", "加载中"], ["路径", "加载中"], ["兼容性", "加载中"]]);
         unavailable.innerHTML = "";
     }
 
@@ -220,7 +220,7 @@
         if (!select || !summary || !unavailable) return;
         select.disabled = true;
         select.innerHTML = '<option value="">无法加载正式资产</option>';
-        summary.innerHTML = `<span>类型：不可用</span><span>兼容性：${error.status === 401 ? "未授权" : "加载失败"}</span>`;
+        setPublishedModelSummary(summary, [["类型", "不可用"], ["路径", "不可用"], ["兼容性", error.status === 401 ? "未授权" : "加载失败"]]);
         unavailable.innerHTML = `<button class="gateway-small-btn" type="button" data-retry-published-models>重试加载正式资产</button>`;
     }
 
@@ -232,7 +232,7 @@
         if (!gatewayState.adminToken) {
             select.disabled = true;
             select.innerHTML = '<option value="">连接 Admin Token 后加载</option>';
-            summary.innerHTML = '<span>类型：待选择</span><span>兼容性：待检查</span>';
+            setPublishedModelSummary(summary, [["类型", "待选择"], ["路径", "待选择"], ["兼容性", "待检查"]]);
             unavailable.innerHTML = "";
             return;
         }
@@ -253,9 +253,23 @@
         const select = $("gateway-published-model");
         if (!summary || !select) return;
         const model = gatewayState.publishableModels.find((item) => item.model_id === select.value);
-        summary.innerHTML = model
-            ? `<span>类型：${escapeHtml(model.artifact_type || "text")}</span><span>兼容性：${model.selectable ? "ready" : escapeHtml(model.blocked_reason_code || "blocked")}</span>`
-            : '<span>类型：待选择</span><span>兼容性：待检查</span>';
+        if (!model || !model.selectable) {
+            setPublishedModelSummary(summary, [["类型", "待选择"], ["路径", "待选择"], ["兼容性", "待检查"]]);
+            return;
+        }
+        setPublishedModelSummary(summary, [
+            ["类型", model.artifact_type || "text"],
+            ["路径", model.model_path || "不可用"],
+            ["兼容性", "ready"]
+        ]);
+    }
+
+    function setPublishedModelSummary(summary, entries) {
+        summary.replaceChildren(...entries.map(([label, value]) => {
+            const item = document.createElement("span");
+            item.textContent = `${label}：${value == null ? "" : value}`;
+            return item;
+        }));
     }
 
     async function loadUserModels() {

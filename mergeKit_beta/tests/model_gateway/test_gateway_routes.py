@@ -706,6 +706,7 @@ class TestOpenAiCompatibleRoutes(ServingRoutesTestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["object"], "list")
         self.assertEqual(resp.get_json()["data"][0]["id"], "qwen-demo")
+        self.assertNotIn("model_path", resp.get_data(as_text=True))
 
     def test_chat_completions_proxies_to_vllm_and_records_usage(self):
         from app.model_gateway.models import ServingRequest, ServingUsageRecord

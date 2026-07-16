@@ -107,11 +107,14 @@ class TestPublishableModels(PublicationGatewayTestCase):
         self.assertTrue(rows[self.published_text.id]["selectable"])
         self.assertFalse(rows[self.published_vlm.id]["selectable"])
         self.assertEqual(rows[self.published_vlm.id]["blocked_reason_code"], "unsupported_architecture")
+        self.assertEqual(rows[self.published_text.id]["model_path"], self.published_text.path)
+        self.assertEqual(rows[self.published_vlm.id]["model_path"], self.published_vlm.path)
 
     def test_publishable_models_requires_admin_token(self):
         response = self.client.get("/api/model-gateway/admin/publishable-models")
 
         self.assertEqual(response.status_code, 401)
+        self.assertNotIn("model_path", response.get_data(as_text=True))
 
     def test_publishable_models_uses_quick_inventory_without_full_hash(self):
         from app.model_gateway.routes import _formal_published_asset

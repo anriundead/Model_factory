@@ -61,16 +61,30 @@ class ModelPublicationPortalTestCase(unittest.TestCase):
 
         self.assertIn('id="gateway-published-model"', page)
         self.assertNotIn('id="gateway-model-path"', page)
+        self.assertIn('id="gateway-published-summary"', page)
+        self.assertNotIn("<datalist", page)
         self.assertIn(".gateway-admin-layout {", css)
         self.assertIn("grid-template-columns: minmax(360px, 1fr) minmax(320px, 1fr);", css)
         self.assertIn(".gateway-inline-field {", css)
         self.assertIn("grid-template-columns: minmax(0, 1fr) auto;", css)
+        self.assertIn("overflow-wrap: anywhere;", css)
         self.assertIn("/api/model-gateway/admin/publishable-models", script)
         self.assertIn("blocked_reason", script)
+        self.assertIn("model_path", script)
+        self.assertIn("textContent", script)
+        self.assertIn("replaceChildren", script)
+        self.assertNotIn("gateway-model-path", script)
         self.assertIn("Promise.allSettled", script)
         self.assertIn("renderServicesResult", script)
         self.assertIn("renderKeysResult", script)
         self.assertIn("renderPublishedModelsResult", script)
+
+    def test_user_research_portal_has_no_formal_model_path_surface(self):
+        page = self._read("templates", "model_gateway", "research.html")
+        script = self._read("static", "model_gateway", "research.js")
+
+        self.assertNotIn("model_path", page)
+        self.assertNotIn("model_path", script)
 
 
 if __name__ == "__main__":

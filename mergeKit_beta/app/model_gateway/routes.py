@@ -287,9 +287,11 @@ def admin_list_publishable_models():
         selectable = False
         reason_code = None
         artifact_type = model.architecture or "text"
+        model_path = None
         try:
             manifest = _formal_published_asset(model, full_hash=False)
             artifact_type = manifest["artifact_type"]
+            model_path = os.path.realpath(os.path.abspath(model.path))
             serving = current_serving_compatibility(manifest)
             selectable = serving.get("status") == "ready"
             reason_code = None if selectable else serving.get("reason_code") or serving.get("status")
@@ -301,6 +303,7 @@ def admin_list_publishable_models():
             "artifact_type": artifact_type,
             "selectable": selectable,
             "blocked_reason_code": reason_code,
+            **({"model_path": model_path} if model_path else {}),
         })
     return jsonify({"status": "success", "models": rows})
 
