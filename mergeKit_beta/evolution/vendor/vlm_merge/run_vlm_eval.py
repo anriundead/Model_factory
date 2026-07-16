@@ -20,9 +20,9 @@ from mergekit.config import MergeConfiguration
 from mergekit.merge import MergeOptions, run_merge
 
 try:
-    from .model_composition import replace_language_model_weights
+    from .model_composition import load_merged_language_model_on_cpu, replace_language_model_weights
 except ImportError:
-    from model_composition import replace_language_model_weights
+    from model_composition import load_merged_language_model_on_cpu, replace_language_model_weights
 
 logging.basicConfig(
     level=logging.INFO,
@@ -122,7 +122,7 @@ def _run_vlm_with_custom_llm(llm_dir: str, vlm_path: str, hf_subsets: list[str],
         from transformers.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
     except ImportError:
         from transformers import Qwen2_5_VLForConditionalGeneration  # type: ignore
-    from transformers import AutoModelForCausalLM, AutoProcessor
+    from transformers import AutoProcessor
     from datasets import load_dataset
 
     from vlm_fitness import build_cmmmu_prompt, parse_choice
@@ -135,12 +135,7 @@ def _run_vlm_with_custom_llm(llm_dir: str, vlm_path: str, hf_subsets: list[str],
         device_map=device,
         trust_remote_code=True,
     )
-    merged_lm = AutoModelForCausalLM.from_pretrained(
-        llm_dir,
-        torch_dtype=torch_dtype,
-        device_map=device,
-        trust_remote_code=True,
-    )
+    merged_lm = load_merged_language_model_on_cpu(llm_dir, torch_dtype)
     replace_language_model_weights(vlm, merged_lm)
     del merged_lm
     torch.cuda.empty_cache()

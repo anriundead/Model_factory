@@ -16,12 +16,12 @@ from typing import Any
 import torch
 import yaml
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoProcessor
 
 try:
-    from .model_composition import replace_language_model_weights
+    from .model_composition import load_merged_language_model_on_cpu, replace_language_model_weights
 except ImportError:
-    from model_composition import replace_language_model_weights
+    from model_composition import load_merged_language_model_on_cpu, replace_language_model_weights
 
 logger = logging.getLogger(__name__)
 
@@ -195,12 +195,7 @@ def vlm_cmmmu_fitness(
     )
     vlm.eval()
 
-    merged_lm = AutoModelForCausalLM.from_pretrained(
-        merged_llm_dir,
-        torch_dtype=torch_dtype,
-        device_map=device,
-        trust_remote_code=True,
-    )
+    merged_lm = load_merged_language_model_on_cpu(merged_llm_dir, torch_dtype)
     replace_language_model_weights(vlm, merged_lm)
     del merged_lm
     torch.cuda.empty_cache()

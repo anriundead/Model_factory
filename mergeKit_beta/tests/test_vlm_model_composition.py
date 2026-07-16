@@ -7,6 +7,7 @@ from unittest import mock
 import torch
 
 from evolution.vendor.vlm_merge.model_composition import (
+    load_merged_language_model_on_cpu,
     materialize_full_vlm,
     replace_language_model_weights,
 )
@@ -65,6 +66,22 @@ class FakeProcessor:
 
 
 class CompositionTest(unittest.TestCase):
+    def test_loads_temporary_merged_language_model_on_cpu(self):
+        sentinel = object()
+        with mock.patch(
+            "transformers.AutoModelForCausalLM.from_pretrained",
+            return_value=sentinel,
+        ) as load:
+            result = load_merged_language_model_on_cpu("merged", torch.bfloat16)
+
+        self.assertIs(result, sentinel)
+        load.assert_called_once_with(
+            "merged",
+            torch_dtype=torch.bfloat16,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
+
     def test_replaces_exact_language_state_and_preserves_visual_state(self):
         vlm = FakeVlm()
         merged = FakeLanguage(fill=7.0)

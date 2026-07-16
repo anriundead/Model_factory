@@ -1,6 +1,18 @@
 """Strictly combine a merged language model with a complete VLM."""
 
 
+def load_merged_language_model_on_cpu(model_path, torch_dtype):
+    """Keep the temporary source tower off GPU while copying its weights."""
+    from transformers import AutoModelForCausalLM
+
+    return AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch_dtype,
+        device_map="cpu",
+        trust_remote_code=True,
+    )
+
+
 def language_model_of(vlm):
     target = getattr(vlm, "language_model", None)
     if target is None and hasattr(vlm, "model"):
