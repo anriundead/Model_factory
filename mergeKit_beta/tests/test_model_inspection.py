@@ -105,6 +105,16 @@ class ModelInspectionTest(unittest.TestCase):
         self.assertEqual(info.processor_class, "Qwen2_5_VLProcessor")
         self.assertTrue(info.is_complete_vlm)
 
+    def test_preprocessor_image_processor_type_is_processor_evidence(self):
+        path = self.complete_vlm("qwen-image-processor")
+        os.unlink(os.path.join(path, "processor_config.json"))
+        self.write_json(path, "preprocessor_config.json", {"image_processor_type": "Qwen2VLImageProcessor"})
+
+        info = inspect_model(path)
+
+        self.assertEqual(info.processor_class, "Qwen2VLImageProcessor")
+        self.assertTrue(info.is_complete_vlm)
+
     def test_known_visual_weight_prefixes_are_recognized(self):
         prefixes = (
             "visual.blocks.0.weight",

@@ -111,14 +111,19 @@ def _read_weight_keys(model_path: str) -> set[str]:
 
 
 def _read_processor_class(model_path: str) -> str | None:
+    image_processor_type = None
     for name in ("processor_config.json", "preprocessor_config.json"):
         path = os.path.join(model_path, name)
         if not os.path.isfile(path):
             continue
-        value = _read_json(path).get("processor_class")
+        config = _read_json(path)
+        value = config.get("processor_class")
         if isinstance(value, str) and value:
             return value
-    return None
+        value = config.get("image_processor_type")
+        if image_processor_type is None and isinstance(value, str) and value:
+            image_processor_type = value
+    return image_processor_type
 
 
 def _as_int(value: object) -> int | None:
