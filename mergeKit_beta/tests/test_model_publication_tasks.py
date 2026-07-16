@@ -465,7 +465,10 @@ class PublicationTaskTest(unittest.TestCase):
         }
         with self.app.app_context():
             self._staging_task()
-            baseline = self.db.session.get(Task, "task-a").config["staging_inventory"]
+            task = self.db.session.get(Task, "task-a")
+            task.error = "old validation failure"
+            self.db.session.commit()
+            baseline = task.config["staging_inventory"]
             manifest = {
                 "publication_id": "publication-a",
                 "files": {"entries": baseline["files"], "total_bytes": baseline["total_bytes"]},
@@ -479,8 +482,11 @@ class PublicationTaskTest(unittest.TestCase):
                                     "task-a", [0], self.progress, {"aborted": False, "lock": threading.Lock()},
                                     functional_validate_fn=lambda *_args: functional,
                                 )
+            task = self.db.session.get(Task, "task-a")
 
         self.assertEqual(build.call_args.args[3]["evaluation"], functional["evaluation"])
+        self.assertEqual(task.status, "completed")
+        self.assertEqual(task.error, "")
 
     def test_preflight_fails_closed_for_process_query_memory_and_uuid(self):
         from core.gpu_topology import GpuInfo

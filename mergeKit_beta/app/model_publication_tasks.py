@@ -557,6 +557,7 @@ def run_publication_validation(
         _set_status(
             task_id,
             "registration_pending",
+            error="",
             config_patch={"commit_in_progress": True, "gpu_snapshot": gpu_snapshot, "error_code": None},
         )
 
@@ -568,6 +569,7 @@ def run_publication_validation(
         _set_status(
             task_id,
             "completed",
+            error="",
             model_path=os.path.join(_root(params), committed["publication_id"]),
             config_patch={"commit_in_progress": False, "publication_id": committed["publication_id"], "error_code": None},
         )
