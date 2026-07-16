@@ -607,7 +607,10 @@ def _delete_core_model_by_canonical_path(path: str) -> bool:
     core_session = Session(bind=db.engine)
     try:
         model = next(
-            (row for row in core_session.query(Model).all()
+            (row for row in core_session.query(Model)
+             .filter(Model.source == "published")
+             .order_by(Model.id.asc())
+             .all()
              if os.path.realpath(os.path.abspath(row.path.rstrip(os.sep))) == real_path),
             None,
         )

@@ -466,7 +466,7 @@ class TestPublishedServiceLifecycle(PublicationGatewayTestCase):
         self.db.session.add(service)
         self.db.session.commit()
 
-        with mock.patch("app.model_gateway.runtime._find_marked_service_pids") as find_pids, \
+        with mock.patch("app.model_gateway.runtime._find_marked_service_pids", return_value=[]) as find_pids, \
             mock.patch("app.model_gateway.runtime._terminate_service_processes") as terminate, \
             self.assertRaisesRegex(ValueError, "deleted"):
             stop_service(service.id)
@@ -536,6 +536,29 @@ class TestPublishedAssetDeleteGuard(PublicationGatewayTestCase):
 
         self.assertEqual(raised.exception.code, "asset_in_use")
         self.assertTrue(os.path.isdir(model_path))
+
+    def test_delete_removes_formal_row_when_legacy_alias_was_inserted_first(self):
+        from app.model_publication import delete_registered_published_asset
+
+        formal = self._published_model("alias-first-delete", "ready")
+        formal_id = formal.id
+        formal_path = formal.path
+        self.db.session.delete(formal)
+        self.db.session.commit()
+
+        alias_path = os.path.join(self.tmp, "alias-first-delete")
+        os.symlink(formal_path, alias_path)
+        alias = self.Model(id="legacy-alias-first", name="legacy alias", path=alias_path, source="merged")
+        formal = self.Model(id=formal_id, name="formal", path=formal_path, source="published")
+        self.db.session.add_all((alias, formal))
+        self.db.session.commit()
+
+        result = delete_registered_published_asset("alias-first-delete", self.published)
+
+        self.assertTrue(result["deleted"])
+        self.db.session.expire_all()
+        self.assertIsNone(self.db.session.get(self.Model, formal_id))
+        self.assertIsNotNone(self.db.session.get(self.Model, alias.id))
 
 
 class TestServiceLifecycleRace(PublicationGatewayTestCase):
@@ -673,20 +696,50 @@ class TestServiceLifecycleRace(PublicationGatewayTestCase):
         self.db.session.expire_all()
         self.assertEqual(self.db.session.get(ServingModelService, service_id).status, "deleted")
 
-    def test_stop_rejects_unlaunched_starting_service(self):
+    def test_stop_is_idempotent_for_stopped_and_rejects_inflight_states(self):
+        from app.model_gateway.runtime import ServiceStateError, stop_service
+
+        stopped_id = self._service("already-stopped", status="stopped")
+        starting_id = self._service("starting-stop", status="starting")
+        stopping_id = self._service("stopping-stop", status="stopping")
+
+        with mock.patch("app.model_gateway.runtime._find_marked_service_pids") as find_pids, \
+            mock.patch.object(self.db.session, "commit") as commit:
+            self.assertEqual(stop_service(stopped_id).status, "stopped")
+            for service_id in (starting_id, stopping_id):
+                with self.subTest(service_id=service_id), self.assertRaises(ServiceStateError) as raised:
+                    stop_service(service_id)
+                self.assertEqual(raised.exception.code, "service_state_conflict")
+
+        find_pids.assert_not_called()
+        commit.assert_not_called()
+        self.db.session.expire_all()
+
+    def test_stop_refreshes_a_stale_stopped_identity_before_returning(self):
+        from sqlalchemy import update
+        from sqlalchemy.orm import Session
+
         from app.model_gateway.models import ServingModelService
         from app.model_gateway.runtime import ServiceStateError, stop_service
 
-        service_id = self._service("starting-stop", status="starting")
+        service_id = self._service("stale-stopped-stop", status="stopped")
+        stale = self.db.session.get(ServingModelService, service_id)
+        other = Session(bind=self.db.engines["model_gateway"])
+        try:
+            other.execute(
+                update(ServingModelService)
+                .where(ServingModelService.id == service_id, ServingModelService.status == "stopped")
+                .values(status="starting")
+            )
+            other.commit()
+        finally:
+            other.close()
+        self.assertEqual(stale.status, "stopped")
 
-        with mock.patch("app.model_gateway.runtime._find_marked_service_pids") as find_pids, \
-            self.assertRaises(ServiceStateError) as raised:
+        with self.assertRaises(ServiceStateError) as raised:
             stop_service(service_id)
 
-        self.assertEqual(raised.exception.code, "service_starting")
-        find_pids.assert_not_called()
-        self.db.session.expire_all()
-        self.assertEqual(self.db.session.get(ServingModelService, service_id).status, "starting")
+        self.assertEqual(raised.exception.code, "service_state_conflict")
 
     def test_start_is_idempotent_only_for_running_and_rejects_inflight_states(self):
         from app.model_gateway.runtime import ServiceStateError, start_service
@@ -707,6 +760,173 @@ class TestServiceLifecycleRace(PublicationGatewayTestCase):
         validate.assert_not_called()
         gpu.assert_not_called()
         popen.assert_not_called()
+
+    def test_failed_stop_loses_to_start_without_resurrecting_stale_state(self):
+        from sqlalchemy import event
+
+        from app.model_gateway.models import ServingModelService
+        from app.model_gateway.runtime import ServiceStateError, start_service, stop_service
+
+        service_id = self._service("failed-stop-start", status="failed")
+        stop_loaded = threading.Event()
+        release_stop = threading.Event()
+        start_claimed = threading.Event()
+        release_start = threading.Event()
+        stop_result = {}
+        start_result = {}
+
+        def block_stop_cas(_conn, _cursor, statement, parameters, _context, _many):
+            if (
+                threading.current_thread().name == "failed-stopper"
+                and statement.lstrip().upper().startswith("UPDATE SERVING_MODEL_SERVICES")
+                and "stopped" in parameters
+                and "failed" in parameters
+            ):
+                stop_loaded.set()
+                self.assertTrue(release_stop.wait(5))
+
+        def block_start(_service, _config):
+            start_claimed.set()
+            self.assertTrue(release_start.wait(5))
+            raise RuntimeError("validation failed")
+
+        def stop():
+            with self.app.app_context():
+                try:
+                    stop_service(service_id)
+                except ServiceStateError as exc:
+                    stop_result["code"] = exc.code
+
+        def start():
+            with self.app.app_context():
+                try:
+                    start_service(service_id, config=object(), timeout_s=0)
+                except Exception as exc:
+                    start_result["error"] = exc
+
+        gateway_engine = self.db.engines["model_gateway"]
+        event.listen(gateway_engine, "before_cursor_execute", block_stop_cas)
+        try:
+            with mock.patch("app.model_gateway.runtime._validate_formal_service_asset", side_effect=block_start), \
+                mock.patch("app.model_gateway.runtime.subprocess.Popen") as popen:
+                stopper = threading.Thread(name="failed-stopper", target=stop)
+                stopper.start()
+                self.assertTrue(stop_loaded.wait(5))
+                starter = threading.Thread(target=start)
+                starter.start()
+                self.assertTrue(start_claimed.wait(5))
+                release_stop.set()
+                stopper.join(5)
+                release_start.set()
+                starter.join(5)
+        finally:
+            release_stop.set()
+            release_start.set()
+            event.remove(gateway_engine, "before_cursor_execute", block_stop_cas)
+
+        self.assertFalse(stopper.is_alive())
+        self.assertFalse(starter.is_alive())
+        self.assertEqual(stop_result.get("code"), "service_state_conflict")
+        self.assertIsInstance(start_result.get("error"), RuntimeError)
+        popen.assert_not_called()
+        self.db.session.expire_all()
+        self.assertEqual(self.db.session.get(ServingModelService, service_id).status, "failed")
+
+    def test_failed_stop_loses_to_delete_without_resurrection(self):
+        from sqlalchemy import event
+
+        from app.model_gateway.models import ServingModelService
+        from app.model_gateway.runtime import ServiceStateError, stop_service
+
+        service_id = self._service("failed-stop-delete", status="failed")
+        stop_loaded = threading.Event()
+        release_stop = threading.Event()
+        stop_result = {}
+
+        def block_stop_cas(_conn, _cursor, statement, parameters, _context, _many):
+            if (
+                threading.current_thread().name == "failed-stopper"
+                and statement.lstrip().upper().startswith("UPDATE SERVING_MODEL_SERVICES")
+                and "stopped" in parameters
+                and "failed" in parameters
+            ):
+                stop_loaded.set()
+                self.assertTrue(release_stop.wait(5))
+
+        def stop():
+            with self.app.app_context():
+                try:
+                    stop_service(service_id)
+                except ServiceStateError as exc:
+                    stop_result["code"] = exc.code
+
+        gateway_engine = self.db.engines["model_gateway"]
+        event.listen(gateway_engine, "before_cursor_execute", block_stop_cas)
+        try:
+            with mock.patch("app.model_gateway.runtime.subprocess.Popen") as popen:
+                stopper = threading.Thread(name="failed-stopper", target=stop)
+                stopper.start()
+                self.assertTrue(stop_loaded.wait(5))
+                deleted = self.app.test_client().delete(
+                    "/api/model-gateway/admin/model-services/%s" % service_id,
+                    headers=self.admin_headers(),
+                )
+                release_stop.set()
+                stopper.join(5)
+        finally:
+            release_stop.set()
+            event.remove(gateway_engine, "before_cursor_execute", block_stop_cas)
+
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(stop_result.get("code"), "service_deleted")
+        popen.assert_not_called()
+        self.db.session.expire_all()
+        self.assertEqual(self.db.session.get(ServingModelService, service_id).status, "deleted")
+
+    def test_pid_commit_failure_terminates_spawn_and_leaves_service_retryable(self):
+        from app.model_gateway.models import ServingModelService
+        from app.model_gateway.runtime import start_service, stop_service
+
+        service_id = self._service("pid-commit-failure")
+        process = mock.Mock(pid=12345)
+        process.poll.return_value = None
+        alive = {"value": True}
+        original_commit = self.db.session.commit
+        commits = {"count": 0}
+        commit_error = "pid commit failed " + ("x" * 3000)
+
+        def fail_pid_commit():
+            commits["count"] += 1
+            if commits["count"] == 2:
+                raise RuntimeError(commit_error)
+            return original_commit()
+
+        def terminate(_pgid, _pid, timeout_s):
+            alive["value"] = False
+
+        with mock.patch("app.model_gateway.runtime._validate_formal_service_asset"), \
+            mock.patch("app.model_gateway.runtime.validate_model_path"), \
+            mock.patch("app.model_gateway.runtime.validate_gpu_availability"), \
+            mock.patch("app.model_gateway.runtime.subprocess.Popen", return_value=process), \
+            mock.patch("app.model_gateway.runtime.os.getpgid", return_value=12345), \
+            mock.patch("app.model_gateway.runtime._terminate_process_group", side_effect=terminate) as terminate_tree, \
+            mock.patch.object(self.db.session, "commit", side_effect=fail_pid_commit):
+            with self.assertRaisesRegex(RuntimeError, "pid commit failed"):
+                start_service(service_id, config=object(), timeout_s=0)
+
+        terminate_tree.assert_called_once_with(12345, 12345, timeout_s=10)
+        self.assertFalse(alive["value"])
+        self.db.session.remove()
+        failed = self.db.session.get(ServingModelService, service_id)
+        self.assertEqual(failed.status, "failed")
+        self.assertIsNone(failed.vllm_pid)
+        self.assertIsNone(failed.vllm_pgid)
+        self.assertIn("pid commit failed", failed.last_error)
+        self.assertLessEqual(len(failed.last_error), 2048)
+
+        stopped = stop_service(service_id)
+        self.assertEqual(stopped.status, "stopped")
 
 
 class TestServiceCreateDeleteRace(PublicationGatewayTestCase):

@@ -917,6 +917,26 @@ class PublicationRouteTest(unittest.TestCase):
         self.assertEqual(by_path.status_code, 200)
         self.assertEqual(by_id.status_code, 200)
 
+    def test_legacy_formal_delete_closes_request_core_transaction_before_shared_delete(self):
+        model = self._published_model("legacy-transaction-boundary")
+        observed = []
+
+        def inspect_request_transaction(_publication_id, _root):
+            observed.append(self.db.session().in_transaction())
+            return {"publication_id": "legacy-transaction-boundary", "deleted": True}
+
+        with mock.patch(
+            "app.model_publication.delete_registered_published_asset",
+            side_effect=inspect_request_transaction,
+        ):
+            response = self.app.test_client().delete(
+                "/api/model_repo/%s" % model.id,
+                headers=self.headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(observed, [False])
+
     def test_all_model_delete_routes_return_asset_in_use_for_active_gateway_service(self):
         model = self._published_model("cross-route-in-use")
         self._gateway_service(model)

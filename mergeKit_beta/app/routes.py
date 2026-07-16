@@ -219,23 +219,30 @@ def register_routes(app, state, services, dataset_service):
         from .extensions import db
         from .model_publication import PublicationError, delete_registered_published_asset
         from .models import Model
+        from sqlalchemy.orm import Session
 
-        model = db.session.get(Model, model_id) if model_id else None
-        if model is None and path:
-            real_path = os.path.realpath(os.path.abspath(path.rstrip(os.sep)))
-            model = next(
-                (row for row in db.session.query(Model).filter(Model.source == "published").all()
-                 if os.path.realpath(os.path.abspath(row.path.rstrip(os.sep))) == real_path),
-                None,
-            )
-        if model is None or model.source != "published":
+        core_session = Session(bind=db.engine)
+        try:
+            model = core_session.get(Model, model_id) if model_id else None
+            if model is None and path:
+                real_path = os.path.realpath(os.path.abspath(path.rstrip(os.sep)))
+                model = next(
+                    (row for row in core_session.query(Model).filter(Model.source == "published").all()
+                     if os.path.realpath(os.path.abspath(row.path.rstrip(os.sep))) == real_path),
+                    None,
+                )
+            model_path = model.path if model is not None and model.source == "published" else None
+            core_session.rollback()
+        finally:
+            core_session.close()
+        if model_path is None:
             return None
         denied = _publication_admin()
         if denied:
             return denied
         try:
             result = delete_registered_published_asset(
-                os.path.basename(os.path.realpath(os.path.abspath(model.path.rstrip(os.sep)))),
+                os.path.basename(os.path.realpath(os.path.abspath(model_path.rstrip(os.sep)))),
                 app.config.get("PUBLISHED_MODELS_PATH") or getattr(state.config, "PUBLISHED_MODELS_PATH", ""),
             )
         except PublicationError as exc:
