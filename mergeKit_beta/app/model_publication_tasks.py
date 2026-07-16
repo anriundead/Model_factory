@@ -244,6 +244,7 @@ def _materialize_recipe(task_id: str, params: dict, staging: str, progress: Call
                 "source_type": "recipe",
             },
             metadata_sync_db=False,
+            metadata_filename_override="_publication_recipe_metadata.json",
         )
         if result.get("status") != "success":
             raise _error("materialization_failed", result.get("error", "recipe materialization failed"))
@@ -373,8 +374,6 @@ def _normalize_gpu_ids(gpu_ids: list[int]) -> list[int]:
     normalized = list(gpu_ids)
     if len(normalized) != len(set(normalized)):
         raise _error("gpu_selection_required", "GPU ids must not repeat")
-    if 2 in normalized:
-        raise _error("protected_gpu", "GPU 2 is protected")
     return normalized
 
 

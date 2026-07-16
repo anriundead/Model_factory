@@ -271,7 +271,7 @@ class PublicationTaskTest(unittest.TestCase):
         self.assertEqual(task.status, "canceled")
         self.assertFalse(os.path.exists(os.path.join(self.root, ".staging", "publication-a")))
 
-    def test_validate_requires_explicit_non_gpu2_ids(self):
+    def test_validate_requires_explicit_unique_gpu_ids(self):
         from app.model_publication import PublicationError
         from app.model_publication_tasks import run_publication_validation
 
@@ -279,8 +279,9 @@ class PublicationTaskTest(unittest.TestCase):
             run_publication_validation("task-a", [], self.progress, {}, functional_validate_fn=lambda *_args: None)
         with self.assertRaisesRegex(PublicationError, "gpu_selection_required"):
             run_publication_validation("task-a", [1, 1], self.progress, {}, functional_validate_fn=lambda *_args: None)
-        with self.assertRaisesRegex(PublicationError, "protected_gpu"):
-            run_publication_validation("task-a", [2], self.progress, {}, functional_validate_fn=lambda *_args: None)
+        from app.model_publication_tasks import _normalize_gpu_ids
+
+        self.assertEqual(_normalize_gpu_ids([2]), [2])
 
     def test_preflight_failure_keeps_validating_staging_resumable(self):
         from app.models import Task
@@ -827,6 +828,10 @@ class PublicationTaskTest(unittest.TestCase):
                             provenance = _materialize_recipe("task-vlm", params, os.path.join(self.root, ".staging", "vlm"), self.progress, {})
         self.assertEqual(materialize.call_args.args[1], os.path.realpath(self.current_source))
         self.assertFalse(apply_recipe.call_args.kwargs["metadata_sync_db"])
+        self.assertEqual(
+            apply_recipe.call_args.kwargs["metadata_filename_override"],
+            "_publication_recipe_metadata.json",
+        )
         self.assertEqual(provenance["recipe_snapshot"], recipe_data)
         self.assertEqual(len(provenance["recipe_sha256"]), 64)
         self.assertEqual(provenance["parents"], [self.source, self.current_source])
@@ -993,9 +998,14 @@ class PublicationTaskTest(unittest.TestCase):
                         metadata_type_override="model_publication",
                         metadata_extra={"publication_id": "publication-meta", "recipe_path": publication_recipe_path},
                         metadata_sync_db=False,
+                        metadata_filename_override="_publication_recipe_metadata.json",
                     )
             sync_metadata.assert_not_called()
-            with open(os.path.join(task_root, task_id, "metadata.json"), encoding="utf-8") as handle:
+            self.assertFalse(os.path.exists(os.path.join(task_root, task_id, "metadata.json")))
+            with open(
+                os.path.join(task_root, task_id, "_publication_recipe_metadata.json"),
+                encoding="utf-8",
+            ) as handle:
                 metadata = json.load(handle)
         finally:
             merge_manager.MERGE_DIR = old_merge_dir

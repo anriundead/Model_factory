@@ -651,6 +651,7 @@ def run_recipe_apply_task(
     metadata_type_override=None,
     metadata_extra=None,
     metadata_sync_db=True,
+    metadata_filename_override=None,
 ):
     """
     按配方执行一次合并（固定 genotype，不进化）。用于「根据配方直接融合出最终模型」或中间物化。
@@ -699,7 +700,12 @@ def run_recipe_apply_task(
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(yaml_config_dir, exist_ok=True)
 
-    meta_path = os.path.join(task_dir, "metadata.json")
+    metadata_filename = metadata_filename_override or "metadata.json"
+    if os.path.basename(metadata_filename) != metadata_filename:
+        raise ValueError("metadata filename override must be a basename")
+    if metadata_filename_override and metadata_sync_db:
+        raise ValueError("alternate recipe metadata must not sync to the task database")
+    meta_path = os.path.join(task_dir, metadata_filename)
     metadata = {
         "id": task_id,
         "type": metadata_type_override or "recipe_apply",
@@ -712,12 +718,20 @@ def run_recipe_apply_task(
     }
     if isinstance(metadata_extra, dict):
         metadata.update(metadata_extra)
-    _write_metadata(task_id, task_dir, metadata, sync_db=metadata_sync_db)
+
+    def _write_recipe_metadata(value):
+        if metadata_filename_override:
+            with open(meta_path, "w", encoding="utf-8") as handle:
+                json.dump(value, handle, ensure_ascii=False, indent=2)
+            return
+        _write_metadata(task_id, task_dir, value, sync_db=metadata_sync_db)
+
+    _write_recipe_metadata(metadata)
 
     def _write_error_status(err_msg):
         metadata["status"] = "error"
         metadata["error"] = err_msg
-        _write_metadata(task_id, task_dir, metadata, sync_db=metadata_sync_db)
+        _write_recipe_metadata(metadata)
 
     try:
         import subprocess
@@ -829,7 +843,7 @@ def run_recipe_apply_task(
         metadata["status"] = "success"
         metadata["model_path"] = output_dir
         metadata["metrics"] = {"output_path": output_dir}
-        _write_metadata(task_id, task_dir, metadata, sync_db=metadata_sync_db)
+        _write_recipe_metadata(metadata)
         update_progress_callback(100, "配方融合完成")
         return {"status": "success", "output_path": output_dir}
     except Exception as e:
