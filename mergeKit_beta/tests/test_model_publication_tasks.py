@@ -830,6 +830,46 @@ class PublicationTaskTest(unittest.TestCase):
                                 {},
                             )
 
+    def test_recipe_materialization_rejects_parent_changed_since_search(self):
+        from app.model_publication import PublicationError
+        from app.model_publication_tasks import _materialize_recipe
+
+        recipe = os.path.join(self.tmpdir.name, "recipe.json")
+        recorded = {
+            "source_path": os.path.realpath(self.source),
+            "weights_sha256": "a" * 64,
+            "weight_bytes": 7,
+            "weight_files": [{
+                "path": "model.safetensors",
+                "size_bytes": 7,
+                "sha256": "a" * 64,
+            }],
+        }
+        recipe_data = {
+            "artifact_type": "text",
+            "model_paths": [self.source],
+            "parent_fingerprints": [recorded],
+            "best_genotype": [1.0],
+        }
+        with open(recipe, "w", encoding="utf-8") as handle:
+            json.dump(recipe_data, handle)
+        changed = {**recorded, "weights_sha256": "b" * 64}
+
+        with self.app.app_context():
+            with mock.patch("app.model_publication_tasks._resolve_recipe", return_value=(recipe, recipe_data)):
+                with mock.patch("app.model_publication_tasks.model_weight_fingerprint", return_value=changed):
+                    with mock.patch("merge_manager.run_recipe_apply_task") as apply_recipe:
+                        with self.assertRaisesRegex(PublicationError, "source_fingerprint_mismatch"):
+                            _materialize_recipe(
+                                "task-text",
+                                {"recipe_id": "recipe", "recipe_path": recipe},
+                                os.path.join(self.root, ".staging", "text"),
+                                self.progress,
+                                {},
+                            )
+
+        apply_recipe.assert_not_called()
+
     def test_recipe_provenance_is_persisted_before_explicit_validation(self):
         from app.models import Task
         from app.model_publication_tasks import run_model_publication_task

@@ -38,7 +38,10 @@ class VlmRecipeContractTest(unittest.TestCase):
         self.fingerprint_patch = mock.patch.object(
             runner,
             "model_weight_fingerprint",
-            return_value=self.weight_fingerprint,
+            side_effect=lambda path: {
+                **self.weight_fingerprint,
+                "source_path": os.path.realpath(path),
+            },
         )
         self.fingerprint_patch.start()
 
@@ -46,7 +49,12 @@ class VlmRecipeContractTest(unittest.TestCase):
         self.fingerprint_patch.stop()
 
     def test_vlm_recipe_fields_are_additive_and_json_safe(self):
-        meta = {"status": "running", "best_genotype": [0.2, 0.8], "custom_field": "kept"}
+        meta = {
+            "status": "running",
+            "model_paths": [self.inspection.path],
+            "best_genotype": [0.2, 0.8],
+            "custom_field": "kept",
+        }
 
         enriched = runner.build_recipe_vlm_fields(meta, self.inspection)
 
@@ -56,10 +64,27 @@ class VlmRecipeContractTest(unittest.TestCase):
         self.assertEqual(enriched["vlm_path"], self.inspection.path)
         self.assertEqual(enriched["vlm_base"]["config_sha256"], self.inspection.config_sha256)
         self.assertEqual(enriched["vlm_base"]["weights_sha256"], "d" * 64)
+        self.assertEqual(enriched["parent_fingerprints"][0]["weights_sha256"], "d" * 64)
         self.assertEqual(enriched["status"], "success")
         self.assertIn("best_genotype", enriched)
         self.assertEqual(enriched["custom_field"], "kept")
         json.dumps(enriched)
+
+    def test_recipe_rejects_parent_changed_since_search(self):
+        recorded = {
+            **self.weight_fingerprint,
+            "source_path": self.inspection.path,
+            "weights_sha256": "f" * 64,
+        }
+
+        with self.assertRaisesRegex(ValueError, "source_fingerprint_mismatch"):
+            runner.build_recipe_vlm_fields(
+                {
+                    "model_paths": [self.inspection.path],
+                    "parent_fingerprints": [recorded],
+                },
+                self.inspection,
+            )
 
     def test_atomic_recipe_is_readable_outside_the_container_owner(self):
         with tempfile.TemporaryDirectory() as tmpdir:

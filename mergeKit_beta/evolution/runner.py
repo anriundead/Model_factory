@@ -85,10 +85,21 @@ def _serialize_vlm_base(inspection, recorded: object = None) -> dict:
     return value
 
 
+def _fingerprint_recipe_parents(model_paths: list[str], recorded: object = None) -> list[dict]:
+    fingerprints = [model_weight_fingerprint(path) for path in model_paths]
+    if recorded is not None and recorded != fingerprints:
+        raise ValueError("source_fingerprint_mismatch: parent weights changed during evolution")
+    return fingerprints
+
+
 def build_recipe_vlm_fields(meta: dict, inspection) -> dict:
     recipe = dict(meta)
     recipe["status"] = "success"
     recipe["recipe_schema_version"] = 2
+    recipe["parent_fingerprints"] = _fingerprint_recipe_parents(
+        list(recipe.get("model_paths") or []),
+        recipe.get("parent_fingerprints"),
+    )
     if inspection is None:
         recipe["artifact_type"] = "text"
         recipe["capabilities"] = ["text_generation"]
@@ -767,10 +778,14 @@ def main():
     dtype = meta.get("dtype") or "bfloat16"
     ray_num_gpus = int(meta.get("ray_num_gpus") or 1)
     testset_id = (meta.get("testset_id") or "").strip()
+    meta["parent_fingerprints"] = _fingerprint_recipe_parents(
+        model_paths,
+        meta.get("parent_fingerprints"),
+    )
     vlm_mode, eval_mode, resolved_vlm_path, vlm_inspection = resolve_vlm_preflight(meta)
     if vlm_inspection is not None:
         meta["vlm_base"] = _serialize_vlm_base(vlm_inspection, meta.get("vlm_base"))
-        _write_metadata_safe(task_id, merge_dir, meta, logger)
+    _write_metadata_safe(task_id, merge_dir, meta, logger)
 
     logger.info("=" * 80)
     logger.info("进化融合 Runner 启动")

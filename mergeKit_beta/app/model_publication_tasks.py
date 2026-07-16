@@ -217,11 +217,15 @@ def _materialize_recipe(task_id: str, params: dict, staging: str, progress: Call
     if vlm_inspection is not None:
         fingerprint_paths.append(vlm_inspection.path)
     source_fingerprints = _fingerprint_sources(fingerprint_paths)
+    parent_fingerprints = [source_fingerprints[path] for path in parents]
+    recorded_parent_fingerprints = recipe.get("parent_fingerprints")
+    if recorded_parent_fingerprints is not None and recorded_parent_fingerprints != parent_fingerprints:
+        raise _error("source_fingerprint_mismatch", "recipe parent weights differ from current sources")
     provenance = {
         "recipe_sha256": recipe_sha256,
         "recipe_snapshot": json.loads(json.dumps(recipe)),
         "parents": parents,
-        "parent_fingerprints": [source_fingerprints[path] for path in parents],
+        "parent_fingerprints": parent_fingerprints,
         "vlm_base": {},
     }
     output_dir = staging if not is_vlm else "%s.language" % staging
