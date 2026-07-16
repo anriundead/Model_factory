@@ -243,6 +243,7 @@ def _materialize_recipe(task_id: str, params: dict, staging: str, progress: Call
                 "display_name": params.get("display_name"),
                 "source_type": "recipe",
             },
+            metadata_sync_db=False,
         )
         if result.get("status") != "success":
             raise _error("materialization_failed", result.get("error", "recipe materialization failed"))

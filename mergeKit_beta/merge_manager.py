@@ -650,6 +650,7 @@ def run_recipe_apply_task(
     output_dir_override=None,
     metadata_type_override=None,
     metadata_extra=None,
+    metadata_sync_db=True,
 ):
     """
     按配方执行一次合并（固定 genotype，不进化）。用于「根据配方直接融合出最终模型」或中间物化。
@@ -711,12 +712,12 @@ def run_recipe_apply_task(
     }
     if isinstance(metadata_extra, dict):
         metadata.update(metadata_extra)
-    _write_metadata(task_id, task_dir, metadata)
+    _write_metadata(task_id, task_dir, metadata, sync_db=metadata_sync_db)
 
     def _write_error_status(err_msg):
         metadata["status"] = "error"
         metadata["error"] = err_msg
-        _write_metadata(task_id, task_dir, metadata)
+        _write_metadata(task_id, task_dir, metadata, sync_db=metadata_sync_db)
 
     try:
         import subprocess
@@ -828,7 +829,7 @@ def run_recipe_apply_task(
         metadata["status"] = "success"
         metadata["model_path"] = output_dir
         metadata["metrics"] = {"output_path": output_dir}
-        _write_metadata(task_id, task_dir, metadata)
+        _write_metadata(task_id, task_dir, metadata, sync_db=metadata_sync_db)
         update_progress_callback(100, "配方融合完成")
         return {"status": "success", "output_path": output_dir}
     except Exception as e:

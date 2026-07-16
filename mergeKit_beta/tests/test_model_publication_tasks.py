@@ -810,7 +810,7 @@ class PublicationTaskTest(unittest.TestCase):
             recipe_data = json.load(handle)
         with self.app.app_context():
             with mock.patch("app.model_publication_tasks._resolve_recipe", return_value=(recipe, recipe_data)):
-                with mock.patch("merge_manager.run_recipe_apply_task", return_value={"status": "success"}):
+                with mock.patch("merge_manager.run_recipe_apply_task", return_value={"status": "success"}) as apply_recipe:
                     inspection = SimpleNamespace(
                         path=self.current_source,
                         model_type="qwen2_5_vl",
@@ -826,6 +826,7 @@ class PublicationTaskTest(unittest.TestCase):
                         with mock.patch("evolution.vendor.vlm_merge.model_composition.materialize_full_vlm") as materialize:
                             provenance = _materialize_recipe("task-vlm", params, os.path.join(self.root, ".staging", "vlm"), self.progress, {})
         self.assertEqual(materialize.call_args.args[1], os.path.realpath(self.current_source))
+        self.assertFalse(apply_recipe.call_args.kwargs["metadata_sync_db"])
         self.assertEqual(provenance["recipe_snapshot"], recipe_data)
         self.assertEqual(len(provenance["recipe_sha256"]), 64)
         self.assertEqual(provenance["parents"], [self.source, self.current_source])
@@ -983,14 +984,17 @@ class PublicationTaskTest(unittest.TestCase):
         merge_manager.RECIPES_DIR = self.tmpdir.name
         try:
             with mock.patch("merge_manager.subprocess.run", return_value=SimpleNamespace(returncode=1, stdout="", stderr="failed")):
-                merge_manager.run_recipe_apply_task(
-                    task_id,
-                    {"recipe_id": recipe_id},
-                    self.progress,
-                    output_dir_override=output_root,
-                    metadata_type_override="model_publication",
-                    metadata_extra={"publication_id": "publication-meta", "recipe_path": publication_recipe_path},
-                )
+                with mock.patch("merge_manager._sync_metadata_to_db") as sync_metadata:
+                    merge_manager.run_recipe_apply_task(
+                        task_id,
+                        {"recipe_id": recipe_id},
+                        self.progress,
+                        output_dir_override=output_root,
+                        metadata_type_override="model_publication",
+                        metadata_extra={"publication_id": "publication-meta", "recipe_path": publication_recipe_path},
+                        metadata_sync_db=False,
+                    )
+            sync_metadata.assert_not_called()
             with open(os.path.join(task_root, task_id, "metadata.json"), encoding="utf-8") as handle:
                 metadata = json.load(handle)
         finally:
