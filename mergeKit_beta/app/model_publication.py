@@ -175,7 +175,7 @@ def _inventory(path: str, include_hash: bool = True) -> tuple[list[dict], int]:
         for name in files:
             absolute = os.path.join(current, name)
             relative = os.path.relpath(absolute, path).replace(os.sep, "/")
-            if relative == _MANIFEST_NAME or os.path.basename(relative).startswith(".manifest-"):
+            if relative == _MANIFEST_NAME or ("/" not in relative and relative.startswith(".manifest-")):
                 continue
             if os.path.islink(absolute) or not _regular_file(absolute):
                 raise _error("validation_failed", "published assets must contain regular files only")
@@ -270,6 +270,10 @@ def _safe_entry_path(value: object) -> bool:
     return all(part and part not in (".", "..") for part in parts)
 
 
+def _sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdefABCDEF" for character in value)
+
+
 def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
     try:
         publication_id = _publication_id(manifest.get("publication_id"))
@@ -313,8 +317,7 @@ def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
         if not isinstance(expected_entries, list) or any(
             not isinstance(entry, dict)
             or not _safe_entry_path(entry.get("path"))
-            or not isinstance(entry.get("sha256"), str)
-            or len(entry["sha256"]) != 64
+            or not _sha256(entry.get("sha256"))
             or not isinstance(entry.get("size_bytes"), int)
             or entry["size_bytes"] < 0
             for entry in expected_entries
@@ -329,6 +332,10 @@ def _validate_manifest(path: str, manifest: dict, full_hash: bool) -> dict:
     actual_paths = [entry["path"] for entry in actual_entries]
     if expected_paths != actual_paths or files["total_bytes"] != actual_total:
         raise _error("validation_failed", "manifest file inventory does not match asset")
+    if [(entry["path"], entry["size_bytes"]) for entry in expected_entries] != [
+        (entry["path"], entry["size_bytes"]) for entry in actual_entries
+    ]:
+        raise _error("validation_failed", "manifest file sizes do not match asset")
     if full_hash and [(entry["path"], entry["sha256"]) for entry in expected_entries] != [(entry["path"], entry["sha256"]) for entry in actual_entries]:
         raise _error("validation_failed", "manifest file hashes do not match asset")
     return manifest
@@ -342,7 +349,10 @@ def commit_staging(staging: str, root: str, manifest: dict, register_fn: Callabl
     root = _publication_root(root, create=True)
     publication_id = _publication_id(manifest.get("publication_id"))
     with publication_lock(root) as root:
+        staging_parent = _control_dir(root, ".staging")
         staging = _staging_dir(root, staging, publication_id)
+        if os.stat(staging).st_dev != os.stat(root).st_dev:
+            raise _error("cross_device_staging", "staging and publication root must share a filesystem")
         final = _asset_dir(root, publication_id, required=False)
         if final is not None:
             raise _error("publication_exists", "publication directory already exists")
@@ -354,7 +364,9 @@ def commit_staging(staging: str, root: str, manifest: dict, register_fn: Callabl
         _fsync_directory(staging)
         final = _child(root, publication_id)
         os.replace(staging, final)
+        _fsync_directory(staging_parent)
         _fsync_directory(root)
+        _fsync_directory(final)
         try:
             register_fn(_directory(final), pending_manifest)
         except Exception:

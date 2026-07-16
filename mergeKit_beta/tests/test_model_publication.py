@@ -165,6 +165,43 @@ class PublicationFilesystemTest(unittest.TestCase):
         with self.assertRaisesRegex(PublicationError, "validation_failed"):
             validate_published_asset(final, full_hash=True)
 
+    def test_manifest_rejects_wrong_individual_file_size(self):
+        committed = commit_staging(self.staging, self.root, self._manifest(), self._register)
+        final = os.path.join(self.root, committed["publication_id"])
+        manifest_path = os.path.join(final, "publication_manifest.json")
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        manifest["files"]["entries"][0]["size_bytes"] += 1
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+
+        with self.assertRaisesRegex(PublicationError, "validation_failed"):
+            validate_published_asset(final, full_hash=False)
+
+    def test_manifest_rejects_non_hex_sha256_without_hashing_files(self):
+        committed = commit_staging(self.staging, self.root, self._manifest(), self._register)
+        final = os.path.join(self.root, committed["publication_id"])
+        manifest_path = os.path.join(final, "publication_manifest.json")
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        manifest["files"]["entries"][0]["sha256"] = "z" * 64
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+
+        with self.assertRaisesRegex(PublicationError, "validation_failed"):
+            validate_published_asset(final, full_hash=False)
+
+    def test_nested_manifest_temp_file_is_part_of_inventory(self):
+        committed = commit_staging(self.staging, self.root, self._manifest(), self._register)
+        final = os.path.join(self.root, committed["publication_id"])
+        nested = os.path.join(final, "nested")
+        os.makedirs(nested)
+        with open(os.path.join(nested, ".manifest-interrupted.json"), "w", encoding="utf-8") as handle:
+            handle.write("nested")
+
+        with self.assertRaisesRegex(PublicationError, "validation_failed"):
+            validate_published_asset(final, full_hash=True)
+
     def test_symlinks_are_rejected_from_full_inventory(self):
         os.symlink("model.safetensors", os.path.join(self.staging, "linked-weights"))
 
@@ -213,6 +250,46 @@ class PublicationFilesystemTest(unittest.TestCase):
             handle.write(b"changed")
         with self.assertRaisesRegex(PublicationError, "validation_failed"):
             commit_staging(self.staging, self.root, manifest, self._register)
+
+    def test_commit_rejects_cross_device_staging(self):
+        real_stat = os.stat
+
+        def stat_with_other_root_device(path, *args, **kwargs):
+            value = real_stat(path, *args, **kwargs)
+            if os.path.abspath(path) == os.path.abspath(self.root):
+                return SimpleNamespace(st_dev=value.st_dev + 1)
+            return value
+
+        with mock.patch("app.model_publication.os.stat", side_effect=stat_with_other_root_device):
+            with self.assertRaisesRegex(PublicationError, "cross_device_staging"):
+                commit_staging(self.staging, self.root, self._manifest(), self._register)
+
+    def test_commit_fsyncs_staging_parent_after_rename(self):
+        events = []
+        final = os.path.join(self.root, self.publication_id)
+        real_fsync = __import__("app.model_publication", fromlist=["_fsync_directory"])._fsync_directory
+        real_replace = os.replace
+
+        def record_fsync(path):
+            events.append(("fsync", os.path.realpath(path)))
+            return real_fsync(path)
+
+        def record_replace(source, destination):
+            events.append(("replace", os.path.realpath(source), os.path.realpath(destination)))
+            return real_replace(source, destination)
+
+        with mock.patch("app.model_publication._fsync_directory", side_effect=record_fsync), mock.patch(
+            "app.model_publication.os.replace", side_effect=record_replace
+        ):
+            commit_staging(self.staging, self.root, self._manifest(), self._register)
+
+        rename_index = next(
+            index for index, event in enumerate(events)
+            if event[0] == "replace" and event[1] == os.path.realpath(self.staging) and event[2] == os.path.realpath(final)
+        )
+        fsyncs_after_rename = [event[1] for event in events[rename_index + 1:] if event[0] == "fsync"]
+        self.assertIn(os.path.realpath(os.path.join(self.root, ".staging")), fsyncs_after_rename)
+        self.assertIn(os.path.realpath(self.root), fsyncs_after_rename)
 
     def test_validate_rejects_wrong_directory_and_manifest_contract(self):
         committed = commit_staging(self.staging, self.root, self._manifest(), self._register)
