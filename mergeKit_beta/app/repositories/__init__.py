@@ -261,6 +261,26 @@ def model_register_published(path: str, manifest: dict) -> Model:
     )
 
 
+def model_register_recovered_publication(path: str, manifest: dict) -> Model:
+    """Register a recovered formal asset and close its interrupted task."""
+    model = model_register_published(path, manifest)
+    task_id = str((manifest.get("provenance") or {}).get("task_id") or "").strip()
+    task = db.session.get(Task, task_id) if task_id else None
+    if task is not None and task.task_type == "model_publication" and task.status == "registration_pending":
+        task_set_status(
+            task_id,
+            "completed",
+            error="",
+            model_path=path,
+            config_patch={
+                "commit_in_progress": False,
+                "validation_enqueued": False,
+                "error_code": None,
+            },
+        )
+    return model
+
+
 def publication_task_is_active(task_id: str) -> bool | None:
     """Return None when task state cannot be read so staging cleanup fails closed."""
     publication_id = (task_id or "").strip()

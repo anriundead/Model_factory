@@ -125,6 +125,22 @@ class PublicationFilesystemTest(unittest.TestCase):
         manifest = validate_published_asset(final, full_hash=True)
         self.assertEqual(manifest["publication_state"], "registration_pending")
 
+    def test_explicit_test_fault_exits_after_rename_before_registration(self):
+        with mock.patch.dict(os.environ, {
+            "MERGEKIT_ENABLE_TEST_FAULTS": "1",
+            "MERGEKIT_PUBLICATION_TEST_CRASH_AFTER_RENAME": "1",
+        }, clear=False):
+            with mock.patch("app.model_publication.os._exit", side_effect=RuntimeError("simulated crash")) as exit_process:
+                with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+                    commit_staging(self.staging, self.root, self._manifest(), register_fn=self._register)
+
+        final = os.path.join(self.root, self.publication_id)
+        exit_process.assert_called_once_with(86)
+        self.assertFalse(os.path.exists(self.staging))
+        self.assertTrue(os.path.isdir(final))
+        self.assertEqual(self.registered, [])
+        self.assertEqual(validate_published_asset(final, full_hash=True)["publication_state"], "registration_pending")
+
     def test_recipe_manifest_rejects_missing_snapshot_and_hash(self):
         manifest = self._manifest()
         manifest["provenance"]["recipe_snapshot"] = {}
@@ -630,6 +646,36 @@ class PublishedSyncGuardTest(unittest.TestCase):
             architecture="qwen2_5_vl",
             is_vlm=True,
             size_bytes=123,
+        )
+
+    def test_recovered_registration_completes_registration_pending_task(self):
+        from app.repositories import model_register_recovered_publication
+
+        task = SimpleNamespace(id="task-001", task_type="model_publication", status="registration_pending")
+        manifest = {
+            "display_name": "Recovered model",
+            "artifact_type": "text",
+            "provenance": {"task_id": task.id},
+            "model": {"model_type": "qwen2"},
+            "files": {"total_bytes": 123},
+        }
+        registered = object()
+        with mock.patch("app.repositories.model_register_published", return_value=registered):
+            with mock.patch("app.repositories.db.session.get", return_value=task):
+                with mock.patch("app.repositories.task_set_status") as set_status:
+                    result = model_register_recovered_publication("/published/model", manifest)
+
+        self.assertIs(result, registered)
+        set_status.assert_called_once_with(
+            task.id,
+            "completed",
+            error="",
+            model_path="/published/model",
+            config_patch={
+                "commit_in_progress": False,
+                "validation_enqueued": False,
+                "error_code": None,
+            },
         )
 
     def test_sync_queries_and_preserves_published_rows(self):

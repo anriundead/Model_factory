@@ -103,11 +103,11 @@ def create_app():
             logging.getLogger("mergeKit_beta").warning("启动时 models 表同步跳过: %s", e)
         try:
             from .model_publication import reconcile_publications
-            from .repositories import model_register_published, publication_task_is_active
+            from .repositories import model_register_recovered_publication, publication_task_is_active
 
             recovery = reconcile_publications(
                 Config.PUBLISHED_MODELS_PATH,
-                model_register_published,
+                model_register_recovered_publication,
                 active_check_fn=publication_task_is_active,
             )
             logging.getLogger("mergeKit_beta").info(

@@ -423,6 +423,11 @@ def commit_staging(staging: str, root: str, manifest: dict, register_fn: Callabl
         _fsync_directory(staging_parent)
         _fsync_directory(root)
         _fsync_directory(final)
+        if (
+            os.environ.get("MERGEKIT_ENABLE_TEST_FAULTS") == "1"
+            and os.environ.get("MERGEKIT_PUBLICATION_TEST_CRASH_AFTER_RENAME") == "1"
+        ):
+            os._exit(86)
         try:
             register_fn(_directory(final), pending_manifest)
         except Exception:
