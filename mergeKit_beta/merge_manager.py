@@ -1873,50 +1873,12 @@ def _load_model_config_json(model_path: str) -> dict | None:
 
 
 def _model_is_vlm(model_path: str) -> bool:
-    """
-    尽可能通用地判断一个模型目录是否包含视觉塔（VLM）。
-    注意：某些 *-TextOnly 导出在 config.json 上会退化为纯文本模型；此时仅靠 config 可能无法 100% 识别。
-    """
-    if not model_path or not os.path.isdir(model_path):
+    from app.model_inspection import inspect_model
+
+    try:
+        return inspect_model(model_path).is_vlm
+    except (OSError, ValueError):
         return False
-
-    # 目录名启发式（兜底）
-    dir_name = os.path.basename(model_path.rstrip(os.sep)).lower()
-    vlm_dir_keywords = (
-        "vl", "vision", "vlm", "_vl-", "-vl-", "-vl_", "qwen2.5vl", "qwen2vl",
-        "llava", "cogvlm", "minicpm-v", "minicpm_v", "visual", "qwen2_vl", "qwen2.5_vl",
-        "internvl", "omni", "multimodal",
-    )
-    if any(k in dir_name for k in vlm_dir_keywords):
-        return True
-
-    cfg = _load_model_config_json(model_path)
-    if not cfg:
-        return False
-
-    # 最强信号：显式 vision_config
-    if cfg.get("vision_config") is not None:
-        return True
-
-    # 常见视觉 token id
-    if any(cfg.get(k) is not None for k in ("image_token_id", "vision_start_token_id", "vision_token_id", "video_token_id")):
-        return True
-
-    # model_type / architectures 信号（含嵌套 text_config/decoder_config）
-    model_type = (cfg.get("model_type") or "").lower()
-    for sub in ("text_config", "decoder_config"):
-        sub_cfg = cfg.get(sub)
-        if isinstance(sub_cfg, dict) and (sub_cfg.get("model_type") or ""):
-            model_type = model_type or (sub_cfg.get("model_type") or "").lower()
-
-    archs = cfg.get("architectures") or []
-    arch_str = " ".join(str(a) for a in archs).lower()
-    vlm_indicators = ("vision", "vl", "qwen2_vl", "qwen2.5_vl", "qwen2vl", "qwen2_5_vl", "qwen3_vl", "llava", "cogvlm", "minicpm-v", "internvl", "multimodal")
-    if any(v in model_type for v in vlm_indicators):
-        return True
-    if any(v in arch_str for v in vlm_indicators):
-        return True
-    return False
 
 
 def _infer_lmms_model_backend(model_path: str) -> str:

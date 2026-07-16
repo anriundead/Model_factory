@@ -465,35 +465,12 @@ class ModelCompatibilityMixin(ModelPathMixin):
             return None
 
     def model_is_vlm(self, model_path: str) -> bool:
-        if not model_path or not os.path.isdir(model_path):
+        from app.model_inspection import inspect_model
+
+        try:
+            return inspect_model(model_path).is_vlm
+        except (OSError, ValueError):
             return False
-        dir_name = os.path.basename(model_path.rstrip(os.sep)).lower()
-        vlm_dir_keywords = (
-            "vl", "vision", "vlm", "_vl-", "-vl-", "-vl_", "qwen2.5vl", "qwen2vl",
-            "llava", "cogvlm", "minicpm-v", "minicpm_v", "visual", "qwen2_vl", "qwen2.5_vl", "qwen3_5",
-        )
-        if any(k in dir_name for k in vlm_dir_keywords):
-            return True
-        cfg = self._load_model_config(model_path)
-        if not cfg:
-            return False
-        if cfg.get("vision_config") is not None:
-            return True
-        if any(cfg.get(k) is not None for k in ("image_token_id", "vision_start_token_id", "vision_token_id")):
-            return True
-        model_type = (cfg.get("model_type") or "").lower()
-        for sub in ("text_config", "decoder_config"):
-            sub_cfg = cfg.get(sub)
-            if isinstance(sub_cfg, dict) and (sub_cfg.get("model_type") or ""):
-                model_type = model_type or (sub_cfg.get("model_type") or "").lower()
-        archs = cfg.get("architectures") or []
-        arch_str = " ".join(str(a) for a in archs).lower()
-        vlm_indicators = ("vision", "vl", "qwen2_vl", "qwen2.5_vl", "qwen2vl", "qwen3_5", "llava", "cogvlm", "minicpm-v", "visual")
-        if any(v in model_type for v in vlm_indicators):
-            return True
-        if any(v in arch_str for v in vlm_indicators):
-            return True
-        return False
 
     def get_model_type(self, model_path: str):
         cfg = self._load_model_config(model_path)
