@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -44,6 +45,55 @@ def _normalize_mmlu_subsets(hf_dataset: str, hf_subsets: list) -> list:
     if not hf_subsets or "mmlu" not in (hf_dataset or "").lower():
         return hf_subsets or []
     return [MMLU_SUBSET_TO_HF_CONFIG.get(s, s) for s in hf_subsets if s]
+
+
+def _is_vlm_mode(eval_mode: str, hf_dataset: str) -> bool:
+    return eval_mode == "vlm" or "cmmmu" in hf_dataset.lower()
+
+
+def _serialize_vlm_base(inspection) -> dict:
+    return {
+        "source_path": inspection.path,
+        "model_type": inspection.model_type,
+        "architectures": list(inspection.architectures),
+        "processor_class": inspection.processor_class,
+        "image_token_ids": dict(inspection.image_token_ids),
+        "visual_weight_count": inspection.visual_weight_count,
+        "language_weight_count": inspection.language_weight_count,
+        "language_signature": list(inspection.language_signature),
+        "config_sha256": inspection.config_sha256,
+    }
+
+
+def build_recipe_vlm_fields(meta: dict, inspection) -> dict:
+    recipe = dict(meta)
+    recipe["recipe_schema_version"] = 2
+    if inspection is None:
+        recipe["artifact_type"] = "text"
+        recipe["capabilities"] = ["text_generation"]
+        return recipe
+    recipe["artifact_type"] = "vlm"
+    recipe["capabilities"] = ["text_generation", "image_text_generation"]
+    recipe["vlm_path"] = inspection.path
+    recipe["vlm_base"] = _serialize_vlm_base(inspection)
+    return recipe
+
+
+def _write_json_atomically(path: str, value: dict) -> None:
+    directory = os.path.dirname(path) or "."
+    fd, temporary_path = tempfile.mkstemp(prefix=".%s." % os.path.basename(path), dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
+        raise
 
 logging.basicConfig(
     level=logging.INFO,
@@ -498,6 +548,11 @@ def _do_success_path(
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
     model_paths = meta.get("model_paths") or []
+    vlm_inspection = None
+    if _is_vlm_mode(meta.get("eval_mode") or "text", meta.get("hf_dataset") or ""):
+        from app.model_inspection import resolve_vlm_base
+
+        vlm_inspection = resolve_vlm_base(meta)
 
     def _safe_name(s):
         return re.sub(r"[^\w\-.]", "_", (os.path.basename(s) if s else "unknown").strip())[:64]
@@ -534,7 +589,8 @@ def _do_success_path(
             except Exception:
                 pass
 
-    fusion_info = {
+    fusion_info = build_recipe_vlm_fields(meta, vlm_inspection)
+    fusion_info.update({
         "task_id": task_id,
         "output_dir_name": named_dir_name,
         "custom_name": meta.get("custom_name", ""),
@@ -558,9 +614,8 @@ def _do_success_path(
         "current_best_acc": current_best_acc,
         "final_test_acc": final_test_acc,
         "final_test_duration": final_test_duration,
-    }
-    with open(os.path.join(named_dir, "fusion_info.json"), "w", encoding="utf-8") as f:
-        json.dump(fusion_info, f, ensure_ascii=False, indent=2)
+    })
+    _write_json_atomically(os.path.join(named_dir, "fusion_info.json"), fusion_info)
     readme_lines = [
         "# 融合输出",
         "",
@@ -589,8 +644,7 @@ def _do_success_path(
     recipes_dir = getattr(Config, "RECIPES_DIR", None) or os.path.join(PROJECT_ROOT, "recipes")
     os.makedirs(recipes_dir, exist_ok=True)
     recipe_path = os.path.join(recipes_dir, "%s.json" % task_id)
-    with open(recipe_path, "w", encoding="utf-8") as f:
-        json.dump(fusion_info, f, ensure_ascii=False, indent=2)
+    _write_json_atomically(recipe_path, fusion_info)
     logger.info("已保存配方到 %s", recipe_path)
 
     if os.path.lexists(output_dir):
@@ -681,6 +735,17 @@ def main():
     eval_mode = meta.get("eval_mode") or "text"
     vlm_path = meta.get("vlm_path") or ""
     testset_id = (meta.get("testset_id") or "").strip()
+    vlm_mode = _is_vlm_mode(eval_mode, hf_dataset)
+    if vlm_mode:
+        from app.model_inspection import assert_language_compatible, resolve_vlm_base
+
+        vlm_inspection = resolve_vlm_base(meta)
+        assert_language_compatible(model_paths, vlm_inspection)
+        vlm_path = vlm_inspection.path
+        eval_mode = "vlm"
+        meta["vlm_path"] = vlm_path
+        meta["vlm_base"] = _serialize_vlm_base(vlm_inspection)
+        _write_metadata_safe(task_id, merge_dir, meta, logger)
 
     logger.info("=" * 80)
     logger.info("进化融合 Runner 启动")
@@ -702,7 +767,7 @@ def main():
     logger.info("Runner 日志: %s", bridge_log_path)
     logger.info("-" * 80)
 
-    default_prompt_yaml = "eval/prompt.yaml" if eval_mode == "vlm" else PROMPT_MMLU
+    default_prompt_yaml = "eval/prompt.yaml" if vlm_mode else PROMPT_MMLU
     resolver = TestsetYamlResolver(getattr(Config, "TESTSET_DATA_PATH", "") or "")
     resolved_prompt_yaml = resolver.resolve(hf_dataset, hf_subsets, testset_id)
     if resolved_prompt_yaml:

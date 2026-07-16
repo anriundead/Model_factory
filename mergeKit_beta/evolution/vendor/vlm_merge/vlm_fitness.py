@@ -18,6 +18,11 @@ import yaml
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoProcessor
 
+try:
+    from .model_composition import replace_language_model_weights
+except ImportError:
+    from model_composition import replace_language_model_weights
+
 logger = logging.getLogger(__name__)
 
 # 默认 VLM（提供视觉塔 + tokenizer）
@@ -196,12 +201,7 @@ def vlm_cmmmu_fitness(
         device_map=device,
         trust_remote_code=True,
     )
-    lm_target = getattr(vlm, "language_model", None)
-    if lm_target is None and hasattr(vlm, "model") and hasattr(vlm.model, "language_model"):
-        lm_target = vlm.model.language_model
-    if lm_target is None:
-        raise RuntimeError("VLM 上找不到 language_model（transformers 结构变更？）")
-    lm_target.load_state_dict(merged_lm.state_dict(), strict=False)
+    replace_language_model_weights(vlm, merged_lm)
     del merged_lm
     torch.cuda.empty_cache()
 

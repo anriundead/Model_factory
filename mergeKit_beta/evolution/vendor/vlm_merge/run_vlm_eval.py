@@ -19,6 +19,11 @@ import yaml
 from mergekit.config import MergeConfiguration
 from mergekit.merge import MergeOptions, run_merge
 
+try:
+    from .model_composition import replace_language_model_weights
+except ImportError:
+    from model_composition import replace_language_model_weights
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -136,7 +141,7 @@ def _run_vlm_with_custom_llm(llm_dir: str, vlm_path: str, hf_subsets: list[str],
         device_map=device,
         trust_remote_code=True,
     )
-    vlm.language_model.load_state_dict(merged_lm.state_dict(), strict=False)
+    replace_language_model_weights(vlm, merged_lm)
     del merged_lm
     torch.cuda.empty_cache()
     vlm.eval()
