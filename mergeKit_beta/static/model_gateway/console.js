@@ -4,7 +4,7 @@
         services: [],
         apiKeys: [],
         userModels: [],
-        modelPaths: []
+        publishableModels: []
     };
 
     const $ = (id) => document.getElementById(id);
@@ -33,7 +33,10 @@
         }
         if (!res.ok) {
             const detail = data.error && data.error.message ? data.error.message : `HTTP ${res.status}`;
-            throw new Error(detail);
+            const error = new Error(detail);
+            error.status = res.status;
+            error.code = data.error && data.error.code;
+            throw error;
         }
         return data;
     }
@@ -77,7 +80,9 @@
             const gpuText = (svc.gpu_ids || []).join(",") || "未设置";
             const action = status === "running"
                 ? `<button class="gateway-small-btn danger" data-stop-service="${svc.id}">停止</button>`
-                : `<button class="gateway-small-btn primary" data-start-service="${svc.id}">启动</button>`;
+                : (["stopped", "failed"].includes(status)
+                    ? `<button class="gateway-small-btn primary" data-start-service="${svc.id}">启动</button><button class="gateway-small-btn danger" data-delete-service="${svc.id}">删除</button>`
+                    : "");
             return `
                 <article class="gateway-list-item">
                     <div class="gateway-item-top">
@@ -140,36 +145,131 @@
         if (!gatewayState.adminToken) {
             renderServices();
             renderKeys();
-            return;
+            renderPublishedModels();
+            return { failed: 0 };
         }
-        const [services, keys] = await Promise.all([
+        renderPublishedModelsLoading();
+        const results = await Promise.allSettled([
             requestJson("/api/model-gateway/admin/model-services", { headers: adminHeaders() }),
-            requestJson("/api/model-gateway/admin/api-keys", { headers: adminHeaders() })
+            requestJson("/api/model-gateway/admin/api-keys", { headers: adminHeaders() }),
+            requestJson("/api/model-gateway/admin/publishable-models", { headers: adminHeaders() })
         ]);
-        gatewayState.services = services.services || [];
-        gatewayState.apiKeys = keys.api_keys || [];
-        renderServices();
-        renderKeys();
+        renderServicesResult(results[0]);
+        renderKeysResult(results[1]);
+        renderPublishedModelsResult(results[2]);
+        const rejected = results.filter((result) => result.status === "rejected");
+        const authError = rejected.find((result) => [401, 403].includes((result.reason || {}).status));
+        if (authError) throw authError.reason;
+        return { failed: rejected.length };
     }
 
-    async function loadModelPaths() {
-        const datalist = $("gateway-model-paths");
-        if (!datalist) return;
-        try {
-            const [models, merged] = await Promise.allSettled([
-                requestJson("/api/models"),
-                requestJson("/api/merged_models")
-            ]);
-            const rows = [];
-            if (models.status === "fulfilled") rows.push(...(models.value.models || []));
-            if (merged.status === "fulfilled") rows.push(...(merged.value.models || merged.value.merged_models || []));
-            gatewayState.modelPaths = rows
-                .map((item) => item.path || item.model_path || item.output_path)
-                .filter(Boolean);
-            datalist.innerHTML = gatewayState.modelPaths.map((path) => `<option value="${escapeAttr(path)}"></option>`).join("");
-        } catch (err) {
-            showToast(`模型路径加载失败：${err.message}`, "error");
+    function renderServicesResult(result) {
+        if (result.status === "fulfilled") {
+            gatewayState.services = result.value.services || [];
+            renderServices();
+            return;
         }
+        const list = $("gateway-services-list");
+        if (list) list.innerHTML = '<div class="gateway-empty">服务列表加载失败，请重试。</div>';
+    }
+
+    function renderKeysResult(result) {
+        if (result.status === "fulfilled") {
+            gatewayState.apiKeys = result.value.api_keys || [];
+            renderKeys();
+            return;
+        }
+        const list = $("gateway-api-keys-list");
+        if (list) list.innerHTML = '<div class="gateway-empty">API Key 加载失败，请重试。</div>';
+    }
+
+    function renderPublishedModelsResult(result) {
+        if (result.status === "fulfilled") {
+            gatewayState.publishableModels = result.value.models || [];
+            renderPublishedModels();
+        } else {
+            gatewayState.publishableModels = [];
+            renderPublishedModelsError(result.reason || {});
+        }
+    }
+
+    async function loadPublishedModels() {
+        renderPublishedModelsLoading();
+        const result = await Promise.allSettled([
+            requestJson("/api/model-gateway/admin/publishable-models", { headers: adminHeaders() })
+        ]);
+        renderPublishedModelsResult(result[0]);
+        if (result[0].status === "rejected") throw result[0].reason;
+    }
+
+    function renderPublishedModelsLoading() {
+        const select = $("gateway-published-model");
+        const summary = $("gateway-published-summary");
+        const unavailable = $("gateway-unavailable-models");
+        if (!select || !summary || !unavailable) return;
+        select.disabled = true;
+        select.innerHTML = '<option value="">加载正式资产...</option>';
+        setPublishedModelSummary(summary, [["类型", "加载中"], ["路径", "加载中"], ["兼容性", "加载中"]]);
+        unavailable.innerHTML = "";
+    }
+
+    function renderPublishedModelsError(error) {
+        const select = $("gateway-published-model");
+        const summary = $("gateway-published-summary");
+        const unavailable = $("gateway-unavailable-models");
+        if (!select || !summary || !unavailable) return;
+        select.disabled = true;
+        select.innerHTML = '<option value="">无法加载正式资产</option>';
+        setPublishedModelSummary(summary, [["类型", "不可用"], ["路径", "不可用"], ["兼容性", error.status === 401 ? "未授权" : "加载失败"]]);
+        unavailable.innerHTML = `<button class="gateway-small-btn" type="button" data-retry-published-models>重试加载正式资产</button>`;
+    }
+
+    function renderPublishedModels() {
+        const select = $("gateway-published-model");
+        const summary = $("gateway-published-summary");
+        const unavailable = $("gateway-unavailable-models");
+        if (!select || !summary || !unavailable) return;
+        if (!gatewayState.adminToken) {
+            select.disabled = true;
+            select.innerHTML = '<option value="">连接 Admin Token 后加载</option>';
+            setPublishedModelSummary(summary, [["类型", "待选择"], ["路径", "待选择"], ["兼容性", "待检查"]]);
+            unavailable.innerHTML = "";
+            return;
+        }
+        const selectable = gatewayState.publishableModels.filter((model) => model.selectable);
+        const blocked = gatewayState.publishableModels.filter((model) => !model.selectable);
+        select.disabled = !selectable.length;
+        select.innerHTML = selectable.length
+            ? `<option value="">选择正式资产</option>${selectable.map((model) => `<option value="${escapeAttr(model.model_id)}">${escapeHtml(model.display_name || model.model_id)} (${escapeHtml(model.artifact_type || "text")})</option>`).join("")}`
+            : '<option value="">暂无可创建服务的正式资产</option>';
+        unavailable.innerHTML = blocked.length
+            ? `<p class="gateway-unavailable-title">不可创建服务的正式资产</p>${blocked.map((model) => `<div class="gateway-unavailable-item" aria-disabled="true"><strong>${escapeHtml(model.display_name || model.model_id)}</strong><span>${escapeHtml(model.artifact_type || "text")} · ${escapeHtml(model.blocked_reason_code || "blocked")}</span></div>`).join("")}`
+            : "";
+        updatePublishedModelSummary();
+    }
+
+    function updatePublishedModelSummary() {
+        const summary = $("gateway-published-summary");
+        const select = $("gateway-published-model");
+        if (!summary || !select) return;
+        const model = gatewayState.publishableModels.find((item) => item.model_id === select.value);
+        if (!model || !model.selectable) {
+            setPublishedModelSummary(summary, [["类型", "待选择"], ["路径", "待选择"], ["兼容性", "待检查"]]);
+            return;
+        }
+        setPublishedModelSummary(summary, [
+            ["类型", model.artifact_type || "text"],
+            ["路径", model.model_path || "不可用"],
+            ["兼容性", "ready"]
+        ]);
+    }
+
+    function setPublishedModelSummary(summary, entries) {
+        summary.replaceChildren(...entries.map(([label, value]) => {
+            const item = document.createElement("span");
+            item.textContent = `${label}：${value == null ? "" : value}`;
+            return item;
+        }));
     }
 
     async function loadUserModels() {
@@ -207,10 +307,23 @@
             event.preventDefault();
             gatewayState.adminToken = ($("gateway-admin-token").value || "").trim();
             try {
-                await loadAdminData();
-                showToast("管理员连接成功", "success");
+                const result = await loadAdminData();
+                showToast(result.failed ? "管理员已连接，部分数据加载失败" : "管理员连接成功", result.failed ? "error" : "success");
             } catch (err) {
                 showToast(`管理员连接失败：${err.message}`, "error");
+            }
+        });
+
+        const publishedModel = $("gateway-published-model");
+        if (publishedModel) publishedModel.addEventListener("change", updatePublishedModelSummary);
+        const unavailableModels = $("gateway-unavailable-models");
+        if (unavailableModels) unavailableModels.addEventListener("click", async (event) => {
+            if (!event.target.closest("[data-retry-published-models]")) return;
+            try {
+                await loadPublishedModels();
+                showToast("正式资产已刷新", "success");
+            } catch (err) {
+                showToast(`正式资产加载失败：${err.message}`, "error");
             }
         });
 
@@ -237,7 +350,7 @@
                 .filter(Boolean)
                 .map((item) => Number(item));
             const payload = {
-                model_path: $("gateway-model-path").value.trim(),
+                model_id: $("gateway-published-model").value,
                 display_name: $("gateway-display-name").value.trim(),
                 served_model_name: $("gateway-served-name").value.trim(),
                 gpu_ids: gpuIds,
@@ -254,6 +367,7 @@
                     body: JSON.stringify(payload)
                 });
                 serviceForm.reset();
+                renderPublishedModels();
                 $("gateway-gpu-ids").value = "0";
                 $("gateway-tp").value = "1";
                 $("gateway-gpu-memory").value = "0.85";
@@ -269,18 +383,20 @@
         if (servicesList) servicesList.addEventListener("click", async (event) => {
             const startId = event.target.closest("[data-start-service]")?.getAttribute("data-start-service");
             const stopId = event.target.closest("[data-stop-service]")?.getAttribute("data-stop-service");
-            const serviceId = startId || stopId;
+            const deleteId = event.target.closest("[data-delete-service]")?.getAttribute("data-delete-service");
+            const serviceId = startId || stopId || deleteId;
             if (!serviceId) return;
-            const action = startId ? "start" : "stop";
+            const action = startId ? "start" : (stopId ? "stop" : "delete");
             try {
-                await requestJson(`/api/model-gateway/admin/model-services/${encodeURIComponent(serviceId)}/${action}`, {
-                    method: "POST",
+                await requestJson(`/api/model-gateway/admin/model-services/${encodeURIComponent(serviceId)}${action === "delete" ? "" : `/${action}`}`, {
+                    method: action === "delete" ? "DELETE" : "POST",
                     headers: adminHeaders()
                 });
                 await loadAdminData();
-                showToast(action === "start" ? "启动请求已提交" : "停止请求已提交", "success");
+                showToast(action === "start" ? "启动请求已提交" : (action === "stop" ? "停止请求已提交" : "服务已删除"), "success");
             } catch (err) {
-                showToast(`${action === "start" ? "启动" : "停止"}失败：${err.message}`, "error");
+                const label = action === "start" ? "启动" : (action === "stop" ? "停止" : "删除");
+                showToast(`${label}失败：${err.message}`, "error");
             }
         });
 
@@ -500,6 +616,6 @@
         renderKeys();
         renderUserModels();
         runEntranceAnimation();
-        await loadModelPaths();
+        renderPublishedModels();
     });
 })();

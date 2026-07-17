@@ -1311,6 +1311,48 @@ class TextLLMMergingProblem(BaseMergingProblem):
             raise e
 
 
+def _resolve_best_genotype(results_root: Path, problem, result_x, result_f) -> list | None:
+    global_best_file = results_root / "global_best.json"
+    if global_best_file.exists():
+        try:
+            best = json.loads(global_best_file.read_text(encoding="utf-8")).get("best_genotype")
+            if best is not None:
+                return np.asarray(best).flatten().tolist()
+        except Exception:
+            pass
+
+    problem_best = getattr(problem, "best_x", None)
+    if problem_best is not None:
+        return np.asarray(problem_best).flatten().tolist()
+    if result_x is None:
+        return None
+
+    values = np.asarray(result_x)
+    if values.ndim <= 1:
+        return values.flatten().tolist()
+    index = int(np.argmin(result_f)) if result_f is not None else 0
+    return values[index].flatten().tolist()
+
+
+def _materialize_best_model(merger, *, best_x, final_output: str) -> str | None:
+    if not final_output:
+        return None
+    if best_x is None:
+        raise RuntimeError("best genotype is unavailable; final model was not materialized")
+
+    best_x = np.asarray(best_x, dtype=np.float32)
+    best_cfg = merger.create_individual_configuration(best_x)
+    final_merged = Path(merger.merge_model_from_configuration(best_cfg))
+    out_dir = Path(final_output)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    if final_merged.resolve() != out_dir.resolve():
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        shutil.move(str(final_merged), str(out_dir))
+    logger.info("[main] best model saved to %s", out_dir)
+    return str(out_dir)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="VLM/LLM 进化融合搜索（text 或 vlm 模式）")
     p.add_argument("--run-id", type=str, default="vlm_search")
@@ -1606,35 +1648,10 @@ def main():
         except Exception:
             pass
 
-    # 保存最优到 final_vlm_output
-    try:
-        best_x = None
-        global_best_file = results_root / "global_best.json"
-        if global_best_file.exists():
-            try:
-                data = json.loads(global_best_file.read_text(encoding="utf-8"))
-                best_x = data.get("best_genotype")
-            except Exception:
-                pass
-        if best_x is None and result_X is not None:
-            if hasattr(result_X, "__len__") and len(result_X) > 0:
-                idx = int(np.argmin(result_F)) if result_F is not None else 0
-                best_x = np.array(result_X[idx]).flatten().tolist()
-            else:
-                best_x = np.array(result_X).flatten().tolist()
-        if best_x is not None and args.final_vlm_output:
-            best_x = np.asarray(best_x, dtype=np.float32)
-            best_cfg = merger.create_individual_configuration(best_x)
-            final_merged = merger.merge_model_from_configuration(best_cfg)
-            out_dir = Path(args.final_vlm_output)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            if Path(final_merged).resolve() != out_dir.resolve() and out_dir.exists():
-                shutil.rmtree(out_dir, ignore_errors=True)
-            if Path(final_merged).resolve() != out_dir.resolve():
-                shutil.move(str(final_merged), str(out_dir))
-            logger.info("[main] best model saved to %s", out_dir)
-    except Exception as e:
-        logger.warning("[main] post-process best model failed: %s", e)
+    # 保存最优到 final_vlm_output。该产物是 runner 成功收尾的前置条件，
+    # 因此任何缺失或 I/O 失败都必须让子进程返回非零。
+    best_x = _resolve_best_genotype(results_root, problem, result_X, result_F)
+    _materialize_best_model(merger, best_x=best_x, final_output=args.final_vlm_output)
 
     logger.info("搜索完成，结果目录 %s", results_root)
 

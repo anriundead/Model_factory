@@ -119,7 +119,7 @@
                     </button>
                 </div>
                 <ol class="gateway-publication-flow" aria-label="模型发布流程">
-                    <li><span class="gateway-flow-index">01</span><span><strong>选择模型</strong><small>确认输出目录与调用名称</small></span></li>
+                    <li><span class="gateway-flow-index">01</span><span><strong>选择正式资产</strong><small>仅可选择已发布且兼容的资产</small></span></li>
                     <li><span class="gateway-flow-index">02</span><span><strong>配置资源</strong><small>设置 GPU、TP 与显存比例</small></span></li>
                     <li><span class="gateway-flow-index">03</span><span><strong>管理员手动启动</strong><small>服务不会在重启后自动恢复</small></span></li>
                     <li><span class="gateway-flow-index">04</span><span><strong>API Key 验证</strong><small>在下方发送一次兼容请求</small></span></li>
@@ -127,10 +127,15 @@
                 <div class="gateway-admin-layout">
                     <form id="gateway-create-service-form" class="gateway-form">
                         <div class="gateway-field">
-                            <label for="gateway-model-path">模型路径</label>
-                            <input id="gateway-model-path" name="model_path" list="gateway-model-paths" required placeholder="/data/models_pool/.../output">
-                            <datalist id="gateway-model-paths"></datalist>
+                            <label for="gateway-published-model">正式发布资产</label>
+                            <select id="gateway-published-model" name="model_id" required disabled>
+                                <option value="">连接 Admin Token 后加载</option>
+                            </select>
                         </div>
+                        <div id="gateway-published-summary" class="gateway-published-summary" aria-live="polite">
+                            <span>类型：待选择</span><span>兼容性：待检查</span>
+                        </div>
+                        <div id="gateway-unavailable-models" class="gateway-unavailable-models" aria-live="polite"></div>
                         <div class="gateway-two-fields">
                             <div class="gateway-field">
                                 <label for="gateway-display-name">显示名称</label>

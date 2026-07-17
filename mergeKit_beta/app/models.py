@@ -94,7 +94,7 @@ class Model(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     path = db.Column(db.String(1024), unique=True, nullable=False, index=True)  # 绝对路径
     name = db.Column(db.String(256), nullable=False)
-    source = db.Column(db.String(32), nullable=False)  # base | merged | fine_tuned
+    source = db.Column(db.String(32), nullable=False)  # base | merged | fine_tuned | published
     parent_model_ids = db.Column(db.JSON, nullable=True)  # 父模型 id 列表（融合时）
     task_id = db.Column(db.String(36), nullable=True, index=True)  # 产出该模型的任务 id
 

@@ -4,6 +4,7 @@
 所有函数均需在 Flask 应用上下文中调用（如 request 或 worker 线程内已 push 的 app context）。
 """
 from datetime import datetime
+import os
 
 from app.extensions import db
 from app.models import Task, Model, TestSet, EvaluationResult, Tag, EvolutionStep
@@ -74,6 +75,63 @@ def task_mark_stopped(task_id: str, error: str = "任务已手动停止") -> boo
     task.updated_at = datetime.utcnow()
     db.session.commit()
     return True
+
+
+_PUBLICATION_TASK_STATUSES = {
+    "queued", "materializing", "validating", "registration_pending",
+    "completed", "failed", "canceled",
+}
+
+
+def task_set_status(
+    task_id: str,
+    status: str,
+    *,
+    error: str | None = None,
+    config_patch: dict | None = None,
+    model_path: str | None = None,
+) -> Task | None:
+    """Persist a model-publication state without replacing its request snapshot."""
+    if status not in _PUBLICATION_TASK_STATUSES:
+        raise ValueError("invalid publication task status: %s" % status)
+    task = db.session.get(Task, task_id)
+    if task is None:
+        return None
+    config = dict(task.config or {})
+    config.update(config_patch or {})
+    task.status = status
+    task.config = config
+    task.updated_at = datetime.utcnow()
+    if error is not None:
+        task.error = error[:2000]
+    if model_path is not None:
+        task.model_path = model_path
+    if status in {"completed", "failed", "canceled"}:
+        task.finished_at = datetime.utcnow()
+    db.session.commit()
+    return task
+
+
+def publication_task_by_idempotency_key(key: str) -> Task | None:
+    """Small SQLite-portable lookup for the JSON idempotency key."""
+    for task in db.session.query(Task).filter_by(task_type="model_publication").all():
+        if isinstance(task.config, dict) and task.config.get("idempotency_key") == key:
+            return task
+    return None
+
+
+def publication_tasks_for_recovery() -> list[Task]:
+    return db.session.query(Task).filter(
+        Task.task_type == "model_publication",
+        Task.status.in_(("queued", "materializing", "running", "validating")),
+    ).all()
+
+
+def active_publication_tasks() -> list[Task]:
+    return db.session.query(Task).filter(
+        Task.task_type == "model_publication",
+        Task.status.in_(("queued", "materializing", "validating", "registration_pending", "running")),
+    ).all()
 
 
 def evolution_steps_delete_for_task(task_id: str) -> int:
@@ -190,10 +248,77 @@ def model_register(
     return model
 
 
+def model_register_published(path: str, manifest: dict) -> Model:
+    """Register a formal publication in the core ORM only."""
+    return model_register(
+        path=path,
+        name=manifest["display_name"],
+        source="published",
+        task_id=manifest["provenance"]["task_id"],
+        architecture=manifest["model"]["model_type"],
+        is_vlm=manifest["artifact_type"] == "vlm",
+        size_bytes=manifest["files"]["total_bytes"],
+    )
+
+
+def model_register_recovered_publication(path: str, manifest: dict) -> Model:
+    """Register a recovered formal asset and close its interrupted task."""
+    model = model_register_published(path, manifest)
+    task_id = str((manifest.get("provenance") or {}).get("task_id") or "").strip()
+    task = db.session.get(Task, task_id) if task_id else None
+    if task is not None and task.task_type == "model_publication" and task.status == "registration_pending":
+        task_set_status(
+            task_id,
+            "completed",
+            error="",
+            model_path=path,
+            config_patch={
+                "commit_in_progress": False,
+                "validation_enqueued": False,
+                "error_code": None,
+            },
+        )
+    return model
+
+
+def publication_task_is_active(task_id: str) -> bool | None:
+    """Return None when task state cannot be read so staging cleanup fails closed."""
+    publication_id = (task_id or "").strip()
+    active_statuses = {"queued", "materializing", "validating", "registration_pending", "running"}
+    try:
+        tasks = (
+            db.session.query(Task)
+            .filter(Task.task_type == "model_publication")
+            .filter(Task.status.in_(active_statuses))
+            .all()
+        )
+    except Exception:
+        return None
+    for task in tasks:
+        config = task.config if isinstance(task.config, dict) else {}
+        if task.task_type == "model_publication" and task.status in active_statuses and (
+            task.id == publication_id or config.get("publication_id") == publication_id
+        ):
+            return True
+    return False
+
+
 def model_get_by_path(path: str) -> Model | None:
     """按路径查询模型。"""
     path = path.rstrip("/")
     return db.session.query(Model).filter_by(path=path).first()
+
+
+def model_get_by_canonical_path(path: str) -> Model | None:
+    """Match historical slash and symlink-equivalent model registrations."""
+    raw = (path or "").strip().rstrip(os.sep)
+    if not raw:
+        return None
+    candidate = os.path.realpath(os.path.abspath(raw))
+    for model in db.session.query(Model).all():
+        if os.path.realpath(os.path.abspath(model.path.rstrip(os.sep))) == candidate:
+            return model
+    return None
 
 
 def model_get_by_id(model_id: str) -> Model | None:
@@ -209,6 +334,15 @@ def model_delete_by_path(path: str) -> bool:
     if not path:
         return False
     model = db.session.query(Model).filter_by(path=path).first()
+    if model is None:
+        return False
+    db.session.delete(model)
+    db.session.commit()
+    return True
+
+
+def model_delete_by_canonical_path(path: str) -> bool:
+    model = model_get_by_canonical_path(path)
     if model is None:
         return False
     db.session.delete(model)

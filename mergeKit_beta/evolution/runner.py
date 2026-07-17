@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +25,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from config import Config
+from app.model_inspection import model_weight_fingerprint
 from evolution.progress_io import write_progress_error
 
 MERGE_DIR = Config.MERGE_DIR
@@ -44,6 +46,100 @@ def _normalize_mmlu_subsets(hf_dataset: str, hf_subsets: list) -> list:
     if not hf_subsets or "mmlu" not in (hf_dataset or "").lower():
         return hf_subsets or []
     return [MMLU_SUBSET_TO_HF_CONFIG.get(s, s) for s in hf_subsets if s]
+
+
+def _is_vlm_mode(eval_mode: str, hf_dataset: str) -> bool:
+    return eval_mode == "vlm" or "cmmmu" in hf_dataset.lower()
+
+
+def _serialize_vlm_base(inspection, recorded: object = None) -> dict:
+    value = dict(recorded) if isinstance(recorded, dict) else {}
+    fingerprint = None
+    if (
+        value.get("source_path") == inspection.path
+        and value.get("config_sha256") == inspection.config_sha256
+        and isinstance(value.get("weights_sha256"), str)
+        and len(value["weights_sha256"]) == 64
+        and isinstance(value.get("weight_files"), list)
+        and value["weight_files"]
+    ):
+        fingerprint = {
+            key: value[key]
+            for key in ("source_path", "weights_sha256", "weight_bytes", "weight_files")
+            if key in value
+        }
+    if fingerprint is None:
+        fingerprint = model_weight_fingerprint(inspection.path)
+    value.update({
+        "source_path": inspection.path,
+        "model_type": inspection.model_type,
+        "architectures": list(inspection.architectures),
+        "processor_class": inspection.processor_class,
+        "image_token_ids": dict(inspection.image_token_ids),
+        "visual_weight_count": inspection.visual_weight_count,
+        "language_weight_count": inspection.language_weight_count,
+        "language_signature": list(inspection.language_signature),
+        "config_sha256": inspection.config_sha256,
+        **fingerprint,
+    })
+    return value
+
+
+def _fingerprint_recipe_parents(model_paths: list[str], recorded: object = None) -> list[dict]:
+    fingerprints = [model_weight_fingerprint(path) for path in model_paths]
+    if recorded is not None and recorded != fingerprints:
+        raise ValueError("source_fingerprint_mismatch: parent weights changed during evolution")
+    return fingerprints
+
+
+def build_recipe_vlm_fields(meta: dict, inspection) -> dict:
+    recipe = dict(meta)
+    recipe["status"] = "success"
+    recipe["recipe_schema_version"] = 2
+    recipe["parent_fingerprints"] = _fingerprint_recipe_parents(
+        list(recipe.get("model_paths") or []),
+        recipe.get("parent_fingerprints"),
+    )
+    if inspection is None:
+        recipe["artifact_type"] = "text"
+        recipe["capabilities"] = ["text_generation"]
+        return recipe
+    recipe["artifact_type"] = "vlm"
+    recipe["capabilities"] = ["text_generation", "vision_language"]
+    recipe.setdefault("vlm_path", inspection.path)
+    recipe["vlm_base"] = _serialize_vlm_base(inspection, recipe.get("vlm_base"))
+    return recipe
+
+
+def resolve_vlm_preflight(meta: dict):
+    eval_mode = meta.get("eval_mode") or "text"
+    vlm_mode = _is_vlm_mode(eval_mode, meta.get("hf_dataset") or "")
+    if not vlm_mode:
+        return vlm_mode, eval_mode, meta.get("vlm_path") or "", None
+
+    from app.model_inspection import assert_language_compatible, resolve_vlm_base
+
+    inspection = resolve_vlm_base(meta)
+    assert_language_compatible(meta.get("model_paths") or [], inspection)
+    return vlm_mode, "vlm", inspection.path, inspection
+
+
+def _write_json_atomically(path: str, value: dict) -> None:
+    directory = os.path.dirname(path) or "."
+    fd, temporary_path = tempfile.mkstemp(prefix=".%s." % os.path.basename(path), dir=directory)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
+        raise
 
 logging.basicConfig(
     level=logging.INFO,
@@ -479,7 +575,7 @@ def _do_success_path(
 ) -> None:
     """
     完全融合成功路径：复制 final_vlm 到命名目录、写 fusion_info/README/配方、创建 output 链接、
-    清理中间目录，并更新 metadata.json 为 success。任一步骤失败会抛异常，由调用方决定是否仍写 metadata。
+    清理中间目录，并更新 metadata.json 为 success。任一步骤失败都会抛异常。
     """
     output_dir = os.path.join(merge_dir, "output")
     if not os.path.isdir(final_vlm_output) or not os.listdir(final_vlm_output):
@@ -492,12 +588,16 @@ def _do_success_path(
                 logger.info("已清理空的中间模型目录: %s", final_vlm_output)
             except Exception as e:
                 logger.warning("清理空目录失败（可忽略）: %s", e)
-        _ensure_metadata_success(meta_path, logger)
-        return
+        raise RuntimeError("final_vlm_output is missing or empty")
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
     model_paths = meta.get("model_paths") or []
+    vlm_inspection = None
+    if _is_vlm_mode(meta.get("eval_mode") or "text", meta.get("hf_dataset") or ""):
+        from app.model_inspection import resolve_vlm_base
+
+        vlm_inspection = resolve_vlm_base(meta)
 
     def _safe_name(s):
         return re.sub(r"[^\w\-.]", "_", (os.path.basename(s) if s else "unknown").strip())[:64]
@@ -534,7 +634,8 @@ def _do_success_path(
             except Exception:
                 pass
 
-    fusion_info = {
+    fusion_info = build_recipe_vlm_fields(meta, vlm_inspection)
+    fusion_info.update({
         "task_id": task_id,
         "output_dir_name": named_dir_name,
         "custom_name": meta.get("custom_name", ""),
@@ -558,9 +659,8 @@ def _do_success_path(
         "current_best_acc": current_best_acc,
         "final_test_acc": final_test_acc,
         "final_test_duration": final_test_duration,
-    }
-    with open(os.path.join(named_dir, "fusion_info.json"), "w", encoding="utf-8") as f:
-        json.dump(fusion_info, f, ensure_ascii=False, indent=2)
+    })
+    _write_json_atomically(os.path.join(named_dir, "fusion_info.json"), fusion_info)
     readme_lines = [
         "# 融合输出",
         "",
@@ -589,8 +689,7 @@ def _do_success_path(
     recipes_dir = getattr(Config, "RECIPES_DIR", None) or os.path.join(PROJECT_ROOT, "recipes")
     os.makedirs(recipes_dir, exist_ok=True)
     recipe_path = os.path.join(recipes_dir, "%s.json" % task_id)
-    with open(recipe_path, "w", encoding="utf-8") as f:
-        json.dump(fusion_info, f, ensure_ascii=False, indent=2)
+    _write_json_atomically(recipe_path, fusion_info)
     logger.info("已保存配方到 %s", recipe_path)
 
     if os.path.lexists(output_dir):
@@ -678,16 +777,22 @@ def main():
     max_samples = int(meta.get("max_samples", 64))
     dtype = meta.get("dtype") or "bfloat16"
     ray_num_gpus = int(meta.get("ray_num_gpus") or 1)
-    eval_mode = meta.get("eval_mode") or "text"
-    vlm_path = meta.get("vlm_path") or ""
     testset_id = (meta.get("testset_id") or "").strip()
+    meta["parent_fingerprints"] = _fingerprint_recipe_parents(
+        model_paths,
+        meta.get("parent_fingerprints"),
+    )
+    vlm_mode, eval_mode, resolved_vlm_path, vlm_inspection = resolve_vlm_preflight(meta)
+    if vlm_inspection is not None:
+        meta["vlm_base"] = _serialize_vlm_base(vlm_inspection, meta.get("vlm_base"))
+    _write_metadata_safe(task_id, merge_dir, meta, logger)
 
     logger.info("=" * 80)
     logger.info("进化融合 Runner 启动")
     logger.info("=" * 80)
     logger.info("任务ID: %s", task_id)
     logger.info("模型路径: %s", model_paths)
-    logger.info("VLM路径: %s", vlm_path or "(无)")
+    logger.info("VLM路径: %s", resolved_vlm_path or "(无)")
     logger.info("数据集: %s, 子集: %s, 分割: %s, 最终分割: %s", hf_dataset, hf_subsets, hf_split, hf_split_final or "(同训练)")
     logger.info("参数: pop_size=%s, n_iter=%s, max_samples=%s", pop_size, n_iter, max_samples)
     logger.info("精度: %s, GPU并行数: %s", dtype, ray_num_gpus)
@@ -702,7 +807,7 @@ def main():
     logger.info("Runner 日志: %s", bridge_log_path)
     logger.info("-" * 80)
 
-    default_prompt_yaml = "eval/prompt.yaml" if eval_mode == "vlm" else PROMPT_MMLU
+    default_prompt_yaml = "eval/prompt.yaml" if vlm_mode else PROMPT_MMLU
     resolver = TestsetYamlResolver(getattr(Config, "TESTSET_DATA_PATH", "") or "")
     resolved_prompt_yaml = resolver.resolve(hf_dataset, hf_subsets, testset_id)
     if resolved_prompt_yaml:
@@ -843,8 +948,8 @@ def main():
     final_acc_file = os.path.join(merge_dir, "final_test_acc.json")
     if hf_split_final and hf_split_final != hf_split:
         cmd.extend(["--hf-split-final", hf_split_final, "--final-acc-file", final_acc_file])
-    if vlm_path:
-        cmd.extend(["--vlm-path", vlm_path])
+    if resolved_vlm_path:
+        cmd.extend(["--vlm-path", resolved_vlm_path])
 
     logger.info("启动 run_vlm_search.py 子进程...")
     logger.debug("命令: %s", " ".join(cmd))
@@ -1252,7 +1357,8 @@ def main():
             except Exception as e:
                 logger.warning("最终评测异常（不阻断主流程）: %s", e)
 
-        # 完全融合成功：复制到命名目录、写 fusion_info、更新 metadata；任一步骤失败仍尽量将任务标为成功
+        # 完全融合成功：复制到命名目录、写 fusion_info、更新 metadata。
+        # 收尾失败时保留现场并让外层写 error，禁止无模型任务被标记成功。
         try:
             _do_success_path(
                 merge_dir=merge_dir,
@@ -1266,7 +1372,7 @@ def main():
             )
         except Exception as e:
             logger.exception("收尾步骤异常: %s", e)
-            _ensure_metadata_success(meta_path, logger, message="任务完成（收尾步骤部分失败，模型在 final_vlm）")
+            raise
 
         # progress.json 终态与 metadata success 对齐，避免前端仍显示 running
         try:

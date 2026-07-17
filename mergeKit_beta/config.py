@@ -30,6 +30,9 @@ class Config:
     _extra = os.path.join(os.path.dirname(LOCAL_MODELS_PATH), "Models-local_dir")
     LOCAL_MODELS_EXTRA_PATHS = [os.path.abspath(_extra)] if os.path.isdir(_extra) else []
     MERGE_DIR = configured_merge_dir()
+    PUBLISHED_MODELS_PATH = os.path.abspath(
+        os.environ.get("MERGEKIT_PUBLISHED_MODELS_PATH", "/data/PublishedModels")
+    )
     LOGS_DIR = os.path.join(PROJECT_ROOT, "logs", "merge")
     # 测试集仓库：用户下载的 HF 数据集在此登记，测试集列表与评估页共用
     TESTSET_REPO = os.path.join(PROJECT_ROOT, "testset_repo")

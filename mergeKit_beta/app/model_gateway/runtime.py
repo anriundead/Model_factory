@@ -11,6 +11,9 @@ import subprocess
 import time
 import urllib.request
 
+from sqlalchemy import update
+from sqlalchemy.orm import Session
+
 from app.extensions import db
 from app.model_gateway.auth import hash_secret
 from app.model_gateway.models import ServingModelService, ServingRequest
@@ -20,6 +23,13 @@ from core.process_manager import ProcessManager
 RUNTIME_STATES = ("starting", "running", "stopping")
 RECOVERY_REASON = "system_restarted_manual_recovery_required"
 INFLIGHT_REQUEST_STATES = ("running", "streaming", "cancel_requested")
+MAX_LIFECYCLE_ERROR_LENGTH = 2048
+
+
+class ServiceStateError(ValueError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 def should_recover_services_on_start() -> bool:
@@ -71,8 +81,37 @@ def allowed_model_roots(config) -> list[str]:
         getattr(config, "MODEL_POOL_PATH", ""),
         getattr(config, "LOCAL_MODELS_PATH", ""),
         getattr(config, "MERGE_DIR", ""),
+        getattr(config, "PUBLISHED_MODELS_PATH", ""),
         *(getattr(config, "LOCAL_MODELS_EXTRA_PATHS", None) or []),
     ]
+
+
+def _validate_formal_service_asset(service: ServingModelService, config) -> None:
+    """Revalidate formal assets before they reserve a GPU or spawn vLLM."""
+    from app.model_publication import PublicationError, current_serving_compatibility, validate_formal_published_model
+    from app.models import Model
+
+    root = getattr(config, "PUBLISHED_MODELS_PATH", "")
+    formal_path = bool(root and _is_under(service.model_path, root))
+    if not service.model_id:
+        if formal_path:
+            raise PublicationError("asset_unavailable", "asset_unavailable: published asset is not bound to a core model")
+        return
+    core_session = Session(bind=db.engine)
+    try:
+        model = core_session.get(Model, service.model_id)
+        if not model or model.source != "published":
+            raise PublicationError("asset_unavailable", "asset_unavailable: formal published model is unavailable")
+        if _real(service.model_path) != _real(model.path):
+            raise PublicationError("asset_identity_mismatch", "asset_identity_mismatch: service path does not match its formal model")
+        manifest = validate_formal_published_model(model, root, full_hash=True)
+        core_session.rollback()
+    finally:
+        core_session.close()
+    serving = current_serving_compatibility(manifest)
+    if serving.get("status") != "ready":
+        code = serving.get("reason_code") or serving.get("status") or "asset_unavailable"
+        raise PublicationError(code, "%s: published asset is not selectable" % code)
 
 
 def validate_gpu_availability(
@@ -241,6 +280,68 @@ def _with_model_gateway_pythonpath(env: dict[str, str], config) -> dict[str, str
     return env
 
 
+def _bounded_lifecycle_error(exc: BaseException) -> str:
+    try:
+        message = str(exc).strip() or exc.__class__.__name__
+    except Exception:
+        message = exc.__class__.__name__
+    return message[:MAX_LIFECYCLE_ERROR_LENGTH]
+
+
+def _reload_service(service_id: str) -> ServingModelService | None:
+    db.session.expire_all()
+    return db.session.get(ServingModelService, service_id)
+
+
+def _cas_service_transition(service_id: str, expected_status: str, **values) -> ServingModelService | None:
+    changed = db.session.execute(
+        update(ServingModelService)
+        .where(ServingModelService.id == service_id, ServingModelService.status == expected_status)
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    if changed.rowcount != 1:
+        db.session.rollback()
+        return None
+    db.session.commit()
+    return _reload_service(service_id)
+
+
+def _record_start_failure(service_id: str, exc: BaseException) -> None:
+    """Best-effort compensation using only a fresh Gateway transaction."""
+    session = None
+    try:
+        session = Session(bind=db.engines["model_gateway"])
+        session.execute(
+            update(ServingModelService)
+            .where(
+                ServingModelService.id == service_id,
+                ServingModelService.status.in_(("starting", "running")),
+            )
+            .values(
+                status="failed",
+                vllm_pid=None,
+                vllm_pgid=None,
+                last_error=_bounded_lifecycle_error(exc),
+                stopped_at=datetime.utcnow(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        session.commit()
+    except Exception:
+        if session is not None:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
 def start_service(service_id: str, config=None, timeout_s: int = 120) -> ServingModelService:
     from config import Config
 
@@ -248,81 +349,148 @@ def start_service(service_id: str, config=None, timeout_s: int = 120) -> Serving
     service = db.session.get(ServingModelService, service_id)
     if not service:
         raise ValueError("serving model service not found")
+    if service.status == "deleted":
+        raise ServiceStateError("service_deleted", "deleted service is terminal")
     if service.status == "running":
         return service
+    if service.status not in ("stopped", "failed"):
+        raise ServiceStateError("service_state_conflict", "service lifecycle transition is already in progress")
 
-    validate_model_path(service.model_path, allowed_model_roots(config))
-    validate_gpu_availability(
-        service,
-        max_used_mib=getattr(config, "MERGEKIT_MODEL_GATEWAY_GPU_MAX_USED_MIB", 1024),
-        min_free_mib=getattr(config, "MERGEKIT_MODEL_GATEWAY_GPU_MIN_FREE_MIB", 4096),
+    claimed = db.session.execute(
+        update(ServingModelService)
+        .where(
+            ServingModelService.id == service_id,
+            ServingModelService.status.in_(("stopped", "failed")),
+        )
+        .values(status="starting", last_error=None)
+        .execution_options(synchronize_session=False)
     )
-    if not service.vllm_port:
-        service.vllm_port = find_free_port(
-            getattr(config, "MERGEKIT_MODEL_GATEWAY_PORT_START", 18000),
-            getattr(config, "MERGEKIT_MODEL_GATEWAY_PORT_END", 18999),
-            _reserved_ports(exclude_service_id=service.id),
-        )
-    service.vllm_host = "127.0.0.1"
-    _ensure_internal_key(service)
-    service.status = "starting"
-    service.last_error = None
-    db.session.add(service)
+    if claimed.rowcount != 1:
+        db.session.rollback()
+        db.session.expire_all()
+        current = db.session.get(ServingModelService, service_id)
+        if current and current.status == "running":
+            return current
+        if current and current.status == "deleted":
+            raise ServiceStateError("service_deleted", "deleted service is terminal")
+        raise ServiceStateError("service_state_conflict", "service lifecycle transition is already in progress")
     db.session.commit()
+    db.session.expire_all()
+    service = db.session.get(ServingModelService, service_id)
 
-    log_dir = getattr(config, "MERGEKIT_MODEL_GATEWAY_LOG_DIR", os.path.join(os.getcwd(), "logs", "model_gateway"))
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f"{service.id}.log")
-    env = _with_model_gateway_pythonpath(os.environ.copy(), config)
-    env["MERGEKIT_MODEL_GATEWAY_SERVICE_ID"] = service.id
-    env["MERGEKIT_MODEL_GATEWAY_INTERNAL_API_KEY"] = service.internal_api_key
-    gpu_ids = service.gpu_ids or []
-    if gpu_ids:
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpu_ids)
-
-    cmd = build_vllm_command(service, config)
-    with open(log_path, "ab") as log_file:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=log_file,
-            env=env,
-            cwd=getattr(config, "PROJECT_ROOT", None) or os.getcwd(),
-            **ProcessManager.create_process_group_kwargs(),
-        )
-
-    service.vllm_pid = proc.pid
+    proc = None
+    proc_pgid = None
     try:
-        service.vllm_pgid = os.getpgid(proc.pid)
-    except Exception:
-        service.vllm_pgid = proc.pid
-    db.session.add(service)
-    db.session.commit()
+        _validate_formal_service_asset(service, config)
+        validate_model_path(service.model_path, allowed_model_roots(config))
+        validate_gpu_availability(
+            service,
+            max_used_mib=getattr(config, "MERGEKIT_MODEL_GATEWAY_GPU_MAX_USED_MIB", 1024),
+            min_free_mib=getattr(config, "MERGEKIT_MODEL_GATEWAY_GPU_MIN_FREE_MIB", 4096),
+        )
+        if not service.vllm_port:
+            service.vllm_port = find_free_port(
+                getattr(config, "MERGEKIT_MODEL_GATEWAY_PORT_START", 18000),
+                getattr(config, "MERGEKIT_MODEL_GATEWAY_PORT_END", 18999),
+                _reserved_ports(exclude_service_id=service.id),
+            )
+        service.vllm_host = "127.0.0.1"
+        _ensure_internal_key(service)
 
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            service.status = "failed"
-            service.last_error = f"vLLM exited early with code {proc.returncode}"
-            service.stopped_at = datetime.utcnow()
-            db.session.add(service)
-            db.session.commit()
-            return service
-        if _healthcheck(service):
-            service.status = "running"
-            service.started_at = datetime.utcnow()
-            db.session.add(service)
-            db.session.commit()
-            return service
-        time.sleep(2)
+        log_dir = getattr(config, "MERGEKIT_MODEL_GATEWAY_LOG_DIR", os.path.join(os.getcwd(), "logs", "model_gateway"))
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"{service.id}.log")
+        env = _with_model_gateway_pythonpath(os.environ.copy(), config)
+        env["MERGEKIT_MODEL_GATEWAY_SERVICE_ID"] = service.id
+        env["MERGEKIT_MODEL_GATEWAY_INTERNAL_API_KEY"] = service.internal_api_key
+        gpu_ids = service.gpu_ids or []
+        if gpu_ids:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpu_ids)
 
-    _terminate_process_group(service.vllm_pgid or service.vllm_pid, service.vllm_pid, timeout_s=10)
-    service.status = "failed"
-    service.last_error = "vLLM healthcheck timeout"
-    service.stopped_at = datetime.utcnow()
-    db.session.add(service)
-    db.session.commit()
-    return service
+        cmd = build_vllm_command(service, config)
+        runtime_values = {
+            "vllm_host": service.vllm_host,
+            "vllm_port": service.vllm_port,
+            "internal_api_key": service.internal_api_key,
+            "internal_api_key_hash": service.internal_api_key_hash,
+        }
+        db.session.rollback()
+        with open(log_path, "ab") as log_file:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=log_file,
+                env=env,
+                cwd=getattr(config, "PROJECT_ROOT", None) or os.getcwd(),
+                **ProcessManager.create_process_group_kwargs(),
+            )
+
+        try:
+            proc_pgid = os.getpgid(proc.pid)
+        except Exception:
+            proc_pgid = proc.pid
+        service = _cas_service_transition(
+            service_id,
+            "starting",
+            **runtime_values,
+            vllm_pid=proc.pid,
+            vllm_pgid=proc_pgid,
+        )
+        if service is None:
+            raise ServiceStateError("service_state_conflict", "service lifecycle state changed during start")
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                service = _cas_service_transition(
+                    service_id,
+                    "starting",
+                    status="failed",
+                    vllm_pid=None,
+                    vllm_pgid=None,
+                    last_error=f"vLLM exited early with code {proc.returncode}",
+                    stopped_at=datetime.utcnow(),
+                )
+                if service is None:
+                    raise ServiceStateError("service_state_conflict", "service lifecycle state changed during start")
+                return service
+            if _healthcheck(service):
+                service = _cas_service_transition(
+                    service_id,
+                    "starting",
+                    status="running",
+                    started_at=datetime.utcnow(),
+                )
+                if service is None:
+                    raise ServiceStateError("service_state_conflict", "service lifecycle state changed during start")
+                return service
+            time.sleep(2)
+
+        _terminate_process_group(proc_pgid, proc.pid, timeout_s=10)
+        service = _cas_service_transition(
+            service_id,
+            "starting",
+            status="failed",
+            vllm_pid=None,
+            vllm_pgid=None,
+            last_error="vLLM healthcheck timeout",
+            stopped_at=datetime.utcnow(),
+        )
+        if service is None:
+            raise ServiceStateError("service_state_conflict", "service lifecycle state changed during start")
+        return service
+    except Exception as exc:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        if proc is not None:
+            try:
+                _terminate_process_group(proc_pgid or proc.pid, proc.pid, timeout_s=10)
+            except Exception:
+                pass
+        _record_start_failure(service_id, exc)
+        raise
 
 
 def _pid_alive(pid: int | None) -> bool:
@@ -405,48 +573,92 @@ def _terminate_service_processes(pids: list[int], timeout_s: int) -> None:
 
 
 def stop_service(service_id: str, timeout_s: int = 30) -> ServingModelService:
-    service = db.session.get(ServingModelService, service_id)
+    service = _reload_service(service_id)
     if not service:
         raise ValueError("serving model service not found")
+    if service.status == "deleted":
+        raise ServiceStateError("service_deleted", "deleted service is terminal")
+    if service.status == "stopped":
+        return service
+    if service.status in ("starting", "stopping"):
+        raise ServiceStateError("service_state_conflict", "service lifecycle transition is already in progress")
+    if service.status == "failed":
+        stopped = _cas_service_transition(
+            service_id,
+            "failed",
+            status="stopped",
+            vllm_pid=None,
+            vllm_pgid=None,
+            stopped_at=datetime.utcnow(),
+        )
+        if stopped is not None:
+            return stopped
+        current = _reload_service(service_id)
+        if current and current.status == "deleted":
+            raise ServiceStateError("service_deleted", "deleted service is terminal")
+        raise ServiceStateError("service_state_conflict", "service lifecycle state changed during stop")
+    if service.status != "running":
+        raise ServiceStateError("service_state_conflict", "service cannot be stopped from its current state")
+
+    service = _cas_service_transition(service_id, "running", status="stopping")
+    if service is None:
+        current = _reload_service(service_id)
+        if current and current.status == "deleted":
+            raise ServiceStateError("service_deleted", "deleted service is terminal")
+        raise ServiceStateError("service_state_conflict", "service lifecycle state changed during stop")
 
     stored_pid = service.vllm_pid
     pids = _find_marked_service_pids(service.id)
     if stored_pid and _pid_alive(stored_pid):
         if not _pid_has_service_marker(stored_pid, service.id):
-            service.status = "failed"
-            service.last_error = "stored PID does not match serving service marker; manual action required"
-            db.session.add(service)
-            db.session.commit()
-            return service
+            failed = _cas_service_transition(
+                service_id,
+                "stopping",
+                status="failed",
+                last_error="stored PID does not match serving service marker; manual action required",
+                stopped_at=datetime.utcnow(),
+            )
+            if failed is not None:
+                return failed
+            raise ServiceStateError("service_state_conflict", "service lifecycle state changed during stop")
         if stored_pid not in pids:
             pids.append(stored_pid)
 
     if not pids:
-        service.status = "stopped"
-        service.vllm_pid = None
-        service.vllm_pgid = None
-        service.stopped_at = datetime.utcnow()
-        db.session.add(service)
-        db.session.commit()
-        return service
-
-    service.status = "stopping"
-    db.session.add(service)
-    db.session.commit()
+        stopped = _cas_service_transition(
+            service_id,
+            "stopping",
+            status="stopped",
+            vllm_pid=None,
+            vllm_pgid=None,
+            stopped_at=datetime.utcnow(),
+        )
+        if stopped is not None:
+            return stopped
+        raise ServiceStateError("service_state_conflict", "service lifecycle state changed during stop")
 
     _terminate_service_processes(pids, timeout_s=timeout_s)
 
     if _find_marked_service_pids(service.id):
-        service.status = "failed"
-        service.last_error = "vLLM process did not exit after stop request; manual action required"
-        db.session.add(service)
-        db.session.commit()
-        return service
+        failed = _cas_service_transition(
+            service_id,
+            "stopping",
+            status="failed",
+            last_error="vLLM process did not exit after stop request; manual action required",
+            stopped_at=datetime.utcnow(),
+        )
+        if failed is not None:
+            return failed
+        raise ServiceStateError("service_state_conflict", "service lifecycle state changed during stop")
 
-    service.status = "stopped"
-    service.vllm_pid = None
-    service.vllm_pgid = None
-    service.stopped_at = datetime.utcnow()
-    db.session.add(service)
-    db.session.commit()
-    return service
+    stopped = _cas_service_transition(
+        service_id,
+        "stopping",
+        status="stopped",
+        vllm_pid=None,
+        vllm_pgid=None,
+        stopped_at=datetime.utcnow(),
+    )
+    if stopped is not None:
+        return stopped
+    raise ServiceStateError("service_state_conflict", "service lifecycle state changed during stop")

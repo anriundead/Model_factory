@@ -1,0 +1,193 @@
+{
+  "id": "4424f954",
+  "type": "merge_evolutionary",
+  "status": "success",
+  "task_id": "4424f954",
+  "custom_name": "Task 7 provenance v2 VLM CMMMU recipe",
+  "model_paths": [
+    "/data/Models/Qwen2.5-VL-7B-TextOnly",
+    "/data/Models/HuatuoGPT-Vision-TextOnly"
+  ],
+  "items": null,
+  "vlm_path": "/data/Models/Qwen2.5-VL-7B-Instruct",
+  "eval_mode": "vlm",
+  "hf_dataset": "m-a-p/CMMMU",
+  "hf_subset": "health_and_medicine",
+  "hf_subsets": [
+    "health_and_medicine"
+  ],
+  "hf_subset_group": "",
+  "hf_split": "val",
+  "hf_split_final": "test",
+  "pop_size": 2,
+  "n_iter": 1,
+  "max_evals": 2,
+  "skip_final_eval": true,
+  "batch_size": 1,
+  "max_samples": 4,
+  "dtype": "bfloat16",
+  "ray_num_gpus": 2,
+  "created_at": 1784236161.4072113,
+  "parent_fingerprints": [
+    {
+      "source_path": "/data/Models/Qwen2.5-VL-7B-TextOnly",
+      "weights_sha256": "bbd1eba5e92ab7f12ffbea66410c6b1fe29d755124738cde415bfbea0a2c4b2b",
+      "weight_bytes": 15231271808,
+      "weight_files": [
+        {
+          "path": "model-00001-of-00003.safetensors",
+          "size_bytes": 5285054728,
+          "sha256": "1a64e1b0ddadb19a76ff589cf2f3ec7c84ad21ce59b3dec87fbbc3858bfc7d67"
+        },
+        {
+          "path": "model-00002-of-00003.safetensors",
+          "size_bytes": 5263077248,
+          "sha256": "01bd78087b21af80755739abfb0f31217151b940e5fb7e8afc02d37913ad913a"
+        },
+        {
+          "path": "model-00003-of-00003.safetensors",
+          "size_bytes": 4683139832,
+          "sha256": "f9d65ce823bb52365ab318b79c28eae8ccbbd5da497d06fe9683610c4eed91ed"
+        }
+      ],
+      "index_bytes": 27751,
+      "index_files": [
+        {
+          "path": "model.safetensors.index.json",
+          "size_bytes": 27751,
+          "sha256": "ba8e7783710be9a98e68dd558af242f234a88fea9e8d6101dfbd6fd33f33e2a3"
+        }
+      ]
+    },
+    {
+      "source_path": "/data/Models/HuatuoGPT-Vision-TextOnly",
+      "weights_sha256": "58c94a89620f96f3634c6a6b518f4d0e862efdf4b1c0bfc20016584b12ef31ae",
+      "weight_bytes": 15231271800,
+      "weight_files": [
+        {
+          "path": "model-00001-of-00003.safetensors",
+          "size_bytes": 5285040184,
+          "sha256": "3cff7f158a14e96b60b70f430b960df37b124c5b621de211f9e66cc4621262d5"
+        },
+        {
+          "path": "model-00002-of-00003.safetensors",
+          "size_bytes": 5263091784,
+          "sha256": "6e21a4f30b7ba8308a42758aa2ac6a4791a995cdc04f6990597550718efc1c47"
+        },
+        {
+          "path": "model-00003-of-00003.safetensors",
+          "size_bytes": 4683139832,
+          "sha256": "04985b563fd08dc69929c51eea19a0c8de81f0ccdf3b3b963bca2d56fe7af2b8"
+        }
+      ],
+      "index_bytes": 27718,
+      "index_files": [
+        {
+          "path": "model.safetensors.index.json",
+          "size_bytes": 27718,
+          "sha256": "912ff8ae0bbcede5fc837cb78e1df7e75c78544ae906adb61e5396f940a31f3c"
+        }
+      ]
+    }
+  ],
+  "vlm_base": {
+    "source_path": "/data/Models/Qwen2.5-VL-7B-Instruct",
+    "model_type": "qwen2_5_vl",
+    "architectures": [
+      "Qwen2_5_VLForConditionalGeneration"
+    ],
+    "processor_class": "Qwen2_5_VLProcessor",
+    "image_token_ids": {
+      "image_token_id": 151655,
+      "vision_start_token_id": 151652,
+      "vision_token_id": 151654,
+      "video_token_id": 151656
+    },
+    "visual_weight_count": 390,
+    "language_weight_count": 339,
+    "language_signature": [
+      3584,
+      28,
+      152064
+    ],
+    "config_sha256": "77d9ec7321cc572e3579e2c84799c9cadaded63c49ce93b101733349fc330c43",
+    "weights_sha256": "e6181ea3119f7bbe299d8b0ab439eb1b0885008948ded2544e18d56b920be760",
+    "weight_bytes": 16584414560,
+    "weight_files": [
+      {
+        "path": "model-00001-of-00005.safetensors",
+        "size_bytes": 3900233256,
+        "sha256": "e97b877e47fde53a6c6e77aafb36e58e91ee9d95c4a3eeac6f1b5c0e6a1c986e"
+      },
+      {
+        "path": "model-00002-of-00005.safetensors",
+        "size_bytes": 3864726320,
+        "sha256": "a9a300a43b4724eee2abe7c18ceb26768d0ab011eb0cad19d9bfd2476a24d024"
+      },
+      {
+        "path": "model-00003-of-00005.safetensors",
+        "size_bytes": 3864726424,
+        "sha256": "111223d173e00bbee81cba1216fad28668df3476706b7fd26f4d5b50f8b3a507"
+      },
+      {
+        "path": "model-00004-of-00005.safetensors",
+        "size_bytes": 3864733680,
+        "sha256": "ef47f634fa57d46ee134edcc09f34085a47da1e16c12a2abe0d67118be6d72ed"
+      },
+      {
+        "path": "model-00005-of-00005.safetensors",
+        "size_bytes": 1089994880,
+        "sha256": "0c859795ad3a627a9b95bcb762e059d5b768a4a36fdd4affeff269d93fdecc67"
+      }
+    ],
+    "index_bytes": 57619,
+    "index_files": [
+      {
+        "path": "model.safetensors.index.json",
+        "size_bytes": 57619,
+        "sha256": "73b333b0b16e5286ddba615d2caebcd495cf7e616f52eb217a81781393d79de9"
+      }
+    ]
+  },
+  "ray_num_gpus_effective": 1,
+  "evolution_tp2_mode": "forced_off",
+  "chosen_tp_size": 1,
+  "tp2_pairs": "",
+  "gpu_free_gib_snapshot": [
+    23.43,
+    23.54
+  ],
+  "tp_decision_reason": "forced_tp1",
+  "eval_batch_size_initial": 1,
+  "timings": {
+    "total_task_time": 101.42176605400164,
+    "total_merge_time": 52.0,
+    "total_eval_time": 15.9,
+    "total_overhead_time": 33.52176605400164,
+    "avg_step_time": 33.942710518836975,
+    "avg_merge_time": 26.0,
+    "avg_eval_time": 7.95,
+    "step_count": 2
+  },
+  "recipe_schema_version": 2,
+  "artifact_type": "vlm",
+  "capabilities": [
+    "text_generation",
+    "vision_language"
+  ],
+  "output_dir_name": "Qwen2.5-VL-7B-TextOnly_HuatuoGPT-Vision-TextOnly_20260716-211205",
+  "parent_names": [
+    "Qwen2.5-VL-7B-TextOnly",
+    "HuatuoGPT-Vision-TextOnly"
+  ],
+  "best_genotype": [
+    0.390743353558069,
+    0.4229049526310821
+  ],
+  "hf_split_train": "",
+  "hf_split_test": "",
+  "completed_at": "2026-07-16T21:12:10.546107",
+  "current_best_acc": 1.0,
+  "final_test_acc": "skipped",
+  "final_test_duration": null
+}

@@ -641,7 +641,18 @@ def cleanup_recipe_temp_dirs(parent_task_id, suffixes):
                 _logger.warning("[cleanup] 删除临时目录失败 %s: %s", temp_dir, e)
 
 
-def run_recipe_apply_task(task_id, params, update_progress_callback, task_control=None, skip_register=False):
+def run_recipe_apply_task(
+    task_id,
+    params,
+    update_progress_callback,
+    task_control=None,
+    skip_register=False,
+    output_dir_override=None,
+    metadata_type_override=None,
+    metadata_extra=None,
+    metadata_sync_db=True,
+    metadata_filename_override=None,
+):
     """
     按配方执行一次合并（固定 genotype，不进化）。用于「根据配方直接融合出最终模型」或中间物化。
     params: recipe_id, custom_name（可选）
@@ -682,17 +693,22 @@ def run_recipe_apply_task(task_id, params, update_progress_callback, task_contro
     density = 0.5
 
     task_dir = os.path.join(MERGE_DIR, task_id)
-    output_dir = os.path.join(task_dir, "output")
+    output_dir = os.path.abspath(output_dir_override) if output_dir_override else os.path.join(task_dir, "output")
     yaml_config_dir = os.path.join(task_dir, "yaml_configs")
     config_yaml_path = os.path.join(yaml_config_dir, "config.yaml")
     os.makedirs(task_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(yaml_config_dir, exist_ok=True)
 
-    meta_path = os.path.join(task_dir, "metadata.json")
+    metadata_filename = metadata_filename_override or "metadata.json"
+    if os.path.basename(metadata_filename) != metadata_filename:
+        raise ValueError("metadata filename override must be a basename")
+    if metadata_filename_override and metadata_sync_db:
+        raise ValueError("alternate recipe metadata must not sync to the task database")
+    meta_path = os.path.join(task_dir, metadata_filename)
     metadata = {
         "id": task_id,
-        "type": "recipe_apply",
+        "type": metadata_type_override or "recipe_apply",
         "recipe_id": recipe_id,
         "custom_name": custom_name,
         "model_paths": model_paths,
@@ -700,12 +716,22 @@ def run_recipe_apply_task(task_id, params, update_progress_callback, task_contro
         "dtype": dtype,
         "status": "pending",
     }
-    _write_metadata(task_id, task_dir, metadata)
+    if isinstance(metadata_extra, dict):
+        metadata.update(metadata_extra)
+
+    def _write_recipe_metadata(value):
+        if metadata_filename_override:
+            with open(meta_path, "w", encoding="utf-8") as handle:
+                json.dump(value, handle, ensure_ascii=False, indent=2)
+            return
+        _write_metadata(task_id, task_dir, value, sync_db=metadata_sync_db)
+
+    _write_recipe_metadata(metadata)
 
     def _write_error_status(err_msg):
         metadata["status"] = "error"
         metadata["error"] = err_msg
-        _write_metadata(task_id, task_dir, metadata)
+        _write_recipe_metadata(metadata)
 
     try:
         import subprocess
@@ -817,7 +843,7 @@ def run_recipe_apply_task(task_id, params, update_progress_callback, task_contro
         metadata["status"] = "success"
         metadata["model_path"] = output_dir
         metadata["metrics"] = {"output_path": output_dir}
-        _write_metadata(task_id, task_dir, metadata)
+        _write_recipe_metadata(metadata)
         update_progress_callback(100, "配方融合完成")
         return {"status": "success", "output_path": output_dir}
     except Exception as e:
@@ -1873,50 +1899,12 @@ def _load_model_config_json(model_path: str) -> dict | None:
 
 
 def _model_is_vlm(model_path: str) -> bool:
-    """
-    尽可能通用地判断一个模型目录是否包含视觉塔（VLM）。
-    注意：某些 *-TextOnly 导出在 config.json 上会退化为纯文本模型；此时仅靠 config 可能无法 100% 识别。
-    """
-    if not model_path or not os.path.isdir(model_path):
+    from app.model_inspection import inspect_model
+
+    try:
+        return inspect_model(model_path).is_vlm
+    except (OSError, ValueError):
         return False
-
-    # 目录名启发式（兜底）
-    dir_name = os.path.basename(model_path.rstrip(os.sep)).lower()
-    vlm_dir_keywords = (
-        "vl", "vision", "vlm", "_vl-", "-vl-", "-vl_", "qwen2.5vl", "qwen2vl",
-        "llava", "cogvlm", "minicpm-v", "minicpm_v", "visual", "qwen2_vl", "qwen2.5_vl",
-        "internvl", "omni", "multimodal",
-    )
-    if any(k in dir_name for k in vlm_dir_keywords):
-        return True
-
-    cfg = _load_model_config_json(model_path)
-    if not cfg:
-        return False
-
-    # 最强信号：显式 vision_config
-    if cfg.get("vision_config") is not None:
-        return True
-
-    # 常见视觉 token id
-    if any(cfg.get(k) is not None for k in ("image_token_id", "vision_start_token_id", "vision_token_id", "video_token_id")):
-        return True
-
-    # model_type / architectures 信号（含嵌套 text_config/decoder_config）
-    model_type = (cfg.get("model_type") or "").lower()
-    for sub in ("text_config", "decoder_config"):
-        sub_cfg = cfg.get(sub)
-        if isinstance(sub_cfg, dict) and (sub_cfg.get("model_type") or ""):
-            model_type = model_type or (sub_cfg.get("model_type") or "").lower()
-
-    archs = cfg.get("architectures") or []
-    arch_str = " ".join(str(a) for a in archs).lower()
-    vlm_indicators = ("vision", "vl", "qwen2_vl", "qwen2.5_vl", "qwen2vl", "qwen2_5_vl", "qwen3_vl", "llava", "cogvlm", "minicpm-v", "internvl", "multimodal")
-    if any(v in model_type for v in vlm_indicators):
-        return True
-    if any(v in arch_str for v in vlm_indicators):
-        return True
-    return False
 
 
 def _infer_lmms_model_backend(model_path: str) -> str:
@@ -2897,6 +2885,7 @@ def run_lmms_eval_stream(
     hf_subset=None,
     hf_split=None,  # kept for future expansion; lmms-eval tasks usually encode split internally
     num_gpus=0,
+    absolute_limit=None,
 ):
     """
     VLM 评测：调用 lmms-eval CLI，并将其结果归一化为 { acc, f1, samples, time, context, per_task_acc }。
@@ -2936,10 +2925,16 @@ def run_lmms_eval_stream(
             callback(start_prog, f"加载 CMMMU({subset}) 数据集…")
             ds = load_dataset(hf_dataset, subset, split=split, trust_remote_code=True)
             n = len(ds)
-            k = _resolve_eval_dataset_cap(n, limit)
+            if absolute_limit is None:
+                k = _resolve_eval_dataset_cap(n, limit)
+            elif type(absolute_limit) is int and absolute_limit > 0:
+                k = min(n, absolute_limit)
+            else:
+                raise ValueError("absolute_limit must be a positive integer")
             ds = ds.select(range(k))
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
+            device_map = "auto" if device == "cuda" and int(num_gpus or 0) > 1 else device
             torch_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
             callback(start_prog + 5, "加载 VLM 权重…")
             vlm = None
@@ -2948,10 +2943,11 @@ def run_lmms_eval_stream(
                 vlm = AutoModelForImageTextToText.from_pretrained(
                     model_path,
                     torch_dtype=torch_dtype,
-                    device_map=device,
+                    device_map=device_map,
                     trust_remote_code=True,
                 )
                 vlm.eval()
+                input_device = getattr(vlm, "device", torch.device(device))
                 try:
                     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
                 except Exception as e_proc:
@@ -3001,9 +2997,9 @@ def run_lmms_eval_stream(
                             _moved[k] = v
                             continue
                         if getattr(v, "dtype", None) is not None and str(v.dtype).startswith("torch.int"):
-                            _moved[k] = v.to(device)
+                            _moved[k] = v.to(input_device)
                         else:
-                            _moved[k] = v.to(device, dtype=torch_dtype)
+                            _moved[k] = v.to(input_device, dtype=torch_dtype)
                     inputs = _moved
                     with torch.no_grad():
                         out_ids = vlm.generate(**inputs, max_new_tokens=32)

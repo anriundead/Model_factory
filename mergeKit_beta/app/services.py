@@ -297,8 +297,11 @@ class ModelPathMixin(BaseService):
             from app.models import Model
             from app.repositories import model_list_by_sources, model_register
 
-            rows = model_list_by_sources(["base", "merged"])
+            rows = model_list_by_sources(["base", "merged", "published"])
             for row in rows:
+                # Published assets are reconciled from their manifests, not base/merge scans.
+                if row.source == "published":
+                    continue
                 keep = False
                 canonical_path = None
 
@@ -465,35 +468,12 @@ class ModelCompatibilityMixin(ModelPathMixin):
             return None
 
     def model_is_vlm(self, model_path: str) -> bool:
-        if not model_path or not os.path.isdir(model_path):
+        from app.model_inspection import inspect_model
+
+        try:
+            return inspect_model(model_path).is_vlm
+        except (OSError, ValueError):
             return False
-        dir_name = os.path.basename(model_path.rstrip(os.sep)).lower()
-        vlm_dir_keywords = (
-            "vl", "vision", "vlm", "_vl-", "-vl-", "-vl_", "qwen2.5vl", "qwen2vl",
-            "llava", "cogvlm", "minicpm-v", "minicpm_v", "visual", "qwen2_vl", "qwen2.5_vl", "qwen3_5",
-        )
-        if any(k in dir_name for k in vlm_dir_keywords):
-            return True
-        cfg = self._load_model_config(model_path)
-        if not cfg:
-            return False
-        if cfg.get("vision_config") is not None:
-            return True
-        if any(cfg.get(k) is not None for k in ("image_token_id", "vision_start_token_id", "vision_token_id")):
-            return True
-        model_type = (cfg.get("model_type") or "").lower()
-        for sub in ("text_config", "decoder_config"):
-            sub_cfg = cfg.get(sub)
-            if isinstance(sub_cfg, dict) and (sub_cfg.get("model_type") or ""):
-                model_type = model_type or (sub_cfg.get("model_type") or "").lower()
-        archs = cfg.get("architectures") or []
-        arch_str = " ".join(str(a) for a in archs).lower()
-        vlm_indicators = ("vision", "vl", "qwen2_vl", "qwen2.5_vl", "qwen2vl", "qwen3_5", "llava", "cogvlm", "minicpm-v", "visual")
-        if any(v in model_type for v in vlm_indicators):
-            return True
-        if any(v in arch_str for v in vlm_indicators):
-            return True
-        return False
 
     def get_model_type(self, model_path: str):
         cfg = self._load_model_config(model_path)
@@ -1075,8 +1055,49 @@ class HistoryMixin(BaseService):
 
 
 class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
+    _ACTIVE_PUBLICATION_STATUSES = {"queued", "materializing", "validating", "registration_pending", "running"}
+
     def kill_process_tree_by_pid(self, pid):
         ProcessManager.kill_process_tree(pid)
+
+    def _memory_task_type(self, task: dict | None) -> str:
+        if not isinstance(task, dict):
+            return ""
+        return str(task.get("type") or (task.get("original_data") or {}).get("type") or "").strip()
+
+    def _publication_stop_denied(self, task_id: str | None = None) -> dict | None:
+        publication_message = "Use the admin model publication cancel endpoint."
+        if task_id:
+            task = self.state.tasks.get(task_id)
+            if self._memory_task_type(task) == "model_publication":
+                return {"ok": False, "error_code": "publication_cancel_required", "message": publication_message}
+        else:
+            for task in self.state.tasks.values():
+                if (
+                    isinstance(task, dict)
+                    and task.get("status") in self._ACTIVE_PUBLICATION_STATUSES
+                    and self._memory_task_type(task) == "model_publication"
+                ):
+                    return {"ok": False, "error_code": "publication_cancel_required", "message": publication_message}
+        app = getattr(self, "app", None)
+        if not app:
+            return None
+        try:
+            with app.app_context():
+                from app.extensions import db
+                from app.models import Task
+                from app.repositories import active_publication_tasks
+
+                if task_id:
+                    row = db.session.get(Task, task_id)
+                    if row is not None and row.task_type == "model_publication":
+                        return {"ok": False, "error_code": "publication_cancel_required", "message": publication_message}
+                elif active_publication_tasks():
+                    return {"ok": False, "error_code": "publication_cancel_required", "message": publication_message}
+        except Exception as exc:
+            self.logger.warning("[stop] publication guard lookup failed: %s", exc)
+            return {"ok": False, "error_code": "publication_cancel_required", "message": publication_message}
+        return None
 
     def _mark_task_stopped_on_disk(self, task_id: str, message: str = "任务已手动停止"):
         task_dir = os.path.join(self.state.merge_dir, task_id)
@@ -1160,9 +1181,12 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
         return ids
 
     def stop_task_with_cleanup(self, task_id: str, message: str = "任务已手动停止") -> dict:
-        if task_id not in self.state.tasks:
-            return {"ok": False, "message": "任务不存在"}
         with self.state.scheduler_lock:
+            denied = self._publication_stop_denied(task_id)
+            if denied is not None:
+                return denied
+            if task_id not in self.state.tasks:
+                return {"ok": False, "message": "任务不存在"}
             task = self.state.tasks[task_id]
             task["status"] = "stopped"
             task["message"] = message
@@ -1189,10 +1213,13 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
         return {"ok": True, "task_id": task_id, **cleanup}
 
     def stop_all_active_tasks(self, message: str = "任务已手动停止") -> dict:
-        stopped_ids = self._collect_active_task_ids()
         killed_pids = set()
 
         with self.state.scheduler_lock:
+            denied = self._publication_stop_denied()
+            if denied is not None:
+                return denied
+            stopped_ids = self._collect_active_task_ids()
             run_proc = self.state.running_task_info.get("process")
             if run_proc and run_proc.pid not in killed_pids:
                 try:
@@ -1493,16 +1520,25 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                 self.state.task_queue.task_done()
                 continue
             try:
+                task_type = data.get("type", "merge")
                 with self.state.scheduler_lock:
+                    if self.state.tasks[task_id].get("status") == "stopped":
+                        continue
                     self.state.tasks[task_id]["status"] = "running"
                     self.state.tasks[task_id]["message"] = "正在初始化..."
-                    task_control = {"aborted": False, "process": None}
+                    task_control = self.state.tasks[task_id].get("control") if task_type == "model_publication" else None
+                    if not isinstance(task_control, dict):
+                        task_control = {"aborted": False, "process": None}
+                    task_control.setdefault("aborted", False)
+                    task_control.setdefault("process", None)
+                    task_control["lock"] = self.state.scheduler_lock
                     self.state.tasks[task_id]["control"] = task_control
                     self.state.running_task_info["id"] = task_id
                     self.state.running_task_info["priority"] = priority_score
 
                 merge_dir = os.path.join(self.state.merge_dir, task_id)
-                self._db_mark_running(task_id, log_path=merge_dir)
+                if task_type != "model_publication":
+                    self._db_mark_running(task_id, log_path=merge_dir)
 
                 def update_progress(p, msg):
                     if self.state.tasks.get(task_id, {}).get("status") in ["interrupted", "stopped"]:
@@ -1512,7 +1548,6 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                     if task_control.get("process") and self.state.running_task_info.get("id") == task_id:
                         self.state.running_task_info["process"] = task_control["process"]
 
-                task_type = data.get("type", "merge")
                 self.logger.info(
                     "[worker] 任务开始 task_id=%s type=%s custom_name=%s",
                     task_id,
@@ -1544,6 +1579,8 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                         "[worker] 配方应用 recipe_id=%s",
                         data.get("recipe_id", ""),
                     )
+                elif task_type == "model_publication":
+                    self.logger.info("[worker] model publication task_id=%s", task_id)
 
                 if task_type == "merge_evolutionary":
                     import merge_manager as _mm
@@ -1682,6 +1719,16 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                         self.logger.info("[worker] 配方融合完成 task_id=%s output=%s", task_id, result.get("output_path", ""))
                     else:
                         self.logger.warning("[worker] 配方融合失败 task_id=%s error=%s", task_id, result.get("error", ""))
+                elif task_type == "model_publication":
+                    from app.model_publication_tasks import run_model_publication_task, run_publication_validation
+
+                    with self.app.app_context():
+                        if data.get("validation_gpu_ids"):
+                            result = run_publication_validation(
+                                task_id, data["validation_gpu_ids"], update_progress, task_control
+                            )
+                        else:
+                            result = run_model_publication_task(task_id, data, update_progress, task_control)
                 else:
                     import importlib as _importlib
                     _data = dict(data)
@@ -1732,7 +1779,18 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
 
                 if self.state.tasks[task_id]["status"] not in ["interrupted", "queued", "stopped"]:
                     self.state.tasks[task_id]["result"] = result
-                    if result.get("status") == "success":
+                    if task_type == "model_publication" and result.get("status") == "validating":
+                        self.state.tasks[task_id]["status"] = "validating"
+                        self.state.tasks[task_id]["message"] = result.get("error") or "Awaiting explicit GPU validation"
+                        if result.get("error_code"):
+                            self.state.tasks[task_id]["validation_enqueued"] = False
+                    elif task_type == "model_publication" and result.get("status") == "registration_pending":
+                        self.state.tasks[task_id]["status"] = "registration_pending"
+                        self.state.tasks[task_id]["message"] = result.get("error") or "Awaiting publication reconciliation"
+                    elif task_type == "model_publication" and result.get("status") == "canceled":
+                        self.state.tasks[task_id]["status"] = "error"
+                        self.state.tasks[task_id]["message"] = "Canceled"
+                    elif result.get("status") == "success":
                         self.state.tasks[task_id]["status"] = "completed"
                         self.state.tasks[task_id]["progress"] = 100
                         self.state.tasks[task_id]["message"] = "任务完成"
@@ -1758,7 +1816,19 @@ class TaskQueueMixin(HistoryMixin, ModelCompatibilityMixin):
                 if self.state.tasks.get(task_id, {}).get("status") not in ["interrupted", "queued", "stopped"]:
                     self.state.tasks[task_id]["status"] = "error"
                     self.state.tasks[task_id]["message"] = "系统内部错误: %s" % str(e)
-                    self._db_update_completion(task_id, "error", data.get("type", "merge"), None)
+                    durable = False
+                    if data.get("type") == "model_publication":
+                        try:
+                            with self.app.app_context():
+                                from app.extensions import db
+                                from app.models import Task
+
+                                task = db.session.get(Task, task_id)
+                                durable = task is not None and task.status in {"validating", "registration_pending", "canceled", "completed"}
+                        except Exception:
+                            durable = False
+                    if not durable:
+                        self._db_update_completion(task_id, "error", data.get("type", "merge"), None)
             finally:
                 self._post_task_gpu_cleanup(task_id)
                 self.state.task_queue.task_done()
@@ -2853,6 +2923,36 @@ class RecipeMixin(AutomationMixin, ModelRepoMixin):
 
 
 class Services(RecipeMixin, TaskQueueMixin, TestsetMixin):
+    def recover_publication_tasks_on_startup(self):
+        """Requeue safe work; leave explicit-GPU and reconciliation states alone."""
+        app = getattr(self, "app", None)
+        if not app:
+            return
+        try:
+            with app.app_context():
+                from app.repositories import publication_tasks_for_recovery, task_set_status
+
+                for task in publication_tasks_for_recovery():
+                    config = dict(task.config or {})
+                    if task.status == "queued":
+                        created_at = time.time()
+                        self.state.tasks[task.id] = {
+                            "progress": 0, "message": "Queued for publication recovery", "status": "queued",
+                            "created_at": created_at, "original_data": config, "priority": "common",
+                        }
+                        self.state.task_queue.put((self.state.priority_map.get("common", 10), created_at, task.id, config))
+                    elif task.status == "validating":
+                        if config.get("validation_enqueued"):
+                            task_set_status(task.id, "validating", config_patch={"validation_enqueued": False})
+                    else:
+                        # Do not delete staging: Task 3 recovery keeps inactive staging diagnosable.
+                        task_set_status(
+                            task.id, "failed", error="publication interrupted by process restart",
+                            config_patch={"error_code": "interrupted"},
+                        )
+        except Exception as exc:
+            self.logger.warning("[startup-heal] publication recovery failed: %s", exc)
+
     def heal_stale_merge_tasks_on_startup(self):
         """启动自愈：修正重启后遗留的 merge/merge_evolutionary running/queued 脏状态。"""
         app = getattr(self, "app", None)
@@ -2951,4 +3051,5 @@ class Services(RecipeMixin, TaskQueueMixin, TestsetMixin):
     def start_task_worker(self):
         self.heal_stale_eval_tasks_on_startup()
         self.heal_stale_merge_tasks_on_startup()
+        self.recover_publication_tasks_on_startup()
         self.start_worker()

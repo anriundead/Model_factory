@@ -215,6 +215,42 @@ def register_routes(app, state, services, dataset_service):
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
 
+    def _delete_formal_published_model(path=None, model_id=None):
+        from .extensions import db
+        from .model_publication import PublicationError, delete_registered_published_asset
+        from .models import Model
+        from sqlalchemy.orm import Session
+
+        core_session = Session(bind=db.engine)
+        try:
+            model = core_session.get(Model, model_id) if model_id else None
+            if model is None and path:
+                real_path = os.path.realpath(os.path.abspath(path.rstrip(os.sep)))
+                model = next(
+                    (row for row in core_session.query(Model).filter(Model.source == "published").all()
+                     if os.path.realpath(os.path.abspath(row.path.rstrip(os.sep))) == real_path),
+                    None,
+                )
+            model_path = model.path if model is not None and model.source == "published" else None
+            core_session.rollback()
+        finally:
+            core_session.close()
+        if model_path is None:
+            return None
+        denied = _publication_admin()
+        if denied:
+            return denied
+        try:
+            result = delete_registered_published_asset(
+                os.path.basename(os.path.realpath(os.path.abspath(model_path.rstrip(os.sep)))),
+                app.config.get("PUBLISHED_MODELS_PATH") or getattr(state.config, "PUBLISHED_MODELS_PATH", ""),
+            )
+        except PublicationError as exc:
+            return jsonify({"error": {"code": exc.code, "message": str(exc)}}), 409 if exc.code == "asset_in_use" else 400
+        except Exception:
+            return jsonify({"error": {"code": "asset_delete_failed", "message": "published asset deletion failed"}}), 500
+        return jsonify({"status": "success", **result})
+
     @app.route("/api/models/delete", methods=["POST"])
     def delete_model():
         try:
@@ -227,6 +263,10 @@ def register_routes(app, state, services, dataset_service):
             resolved_path = services.resolve_model_path(path)
             if not resolved_path:
                  return jsonify({"status": "error", "message": "模型不存在或路径无效"}), 404
+
+            published_response = _delete_formal_published_model(path=resolved_path)
+            if published_response is not None:
+                return published_response
             
             extra_paths = getattr(state.config, "LOCAL_MODELS_EXTRA_PATHS", None) or []
             allowed_bases = [
@@ -650,7 +690,8 @@ def register_routes(app, state, services, dataset_service):
 
     @app.route("/api/history", methods=["GET"])
     def list_history():
-        return jsonify({"status": "success", "history": services.get_all_history()})
+        history = services.get_all_history() or []
+        return jsonify({"status": "success", "history": [_public_history_item(item) for item in history]})
 
     @app.route("/api/history/<task_id>", methods=["DELETE"])
     def delete_history(task_id):
@@ -665,16 +706,42 @@ def register_routes(app, state, services, dataset_service):
 
     @app.route("/api/history/<task_id>", methods=["GET"])
     def get_history_detail(task_id):
-        path = os.path.join(state.merge_dir, task_id, "metadata.json")
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return jsonify({"status": "success", "data": json.load(f)})
+        publication = _publication_task_lookup(task_id)
+        if publication is not None and publication.task_type == "model_publication":
+            return jsonify({"status": "success", "data": _public_publication_view(publication)})
+        metadata = _history_metadata(task_id)
+        redacted = _public_publication_disk_view(task_id, metadata=metadata)
+        if redacted is not None:
+            return jsonify({"status": "success", "data": redacted})
+        if metadata is not None:
+            return jsonify({"status": "success", "data": metadata})
         return jsonify({"status": "error", "message": "Not found"}), 404
 
     @app.route("/api/status/<task_id>")
     def get_status(task_id):
         task = state.tasks.get(task_id)
         if task is not None:
+            task_type = task.get("type") or (task.get("original_data") or {}).get("type")
+            if task_type == "model_publication":
+                result = task.get("result") if isinstance(task.get("result"), dict) else {}
+                safe_result = {
+                    key: result.get(key)
+                    for key in ("status", "publication_id", "error_code")
+                    if result.get(key) is not None
+                }
+                status = task.get("status")
+                is_active = status == "queued" or (
+                    status == "running" and state.running_task_info.get("id") == task_id
+                )
+                response = {
+                    key: task.get(key)
+                    for key in ("status", "progress")
+                    if task.get(key) is not None
+                }
+                response["is_active"] = is_active
+                if safe_result:
+                    response["result"] = safe_result
+                return jsonify(response)
             resp = {k: v for k, v in task.items() if k not in ("control", "original_data")}
             # 运行态可信来源：仅当前 worker 正在执行的任务，或仍在当前进程队列中的任务
             is_active = False
@@ -778,7 +845,13 @@ def register_routes(app, state, services, dataset_service):
                 except Exception:
                     pass
             return jsonify(resp)
+        publication = _publication_task_lookup(task_id)
+        if publication is not None and publication.task_type == "model_publication":
+            return jsonify(_public_publication_view(publication))
         disk = services.status_from_disk(task_id)
+        redacted = _public_publication_disk_view(task_id, disk=disk)
+        if redacted is not None:
+            return jsonify(redacted)
         if disk is not None:
             disk.setdefault("is_active", False)
             return jsonify(disk)
@@ -788,12 +861,16 @@ def register_routes(app, state, services, dataset_service):
     def stop_task(task_id):
         result = services.stop_task_with_cleanup(task_id)
         if not result.get("ok"):
+            if result.get("error_code") == "publication_cancel_required":
+                return jsonify({"status": "error", "error": {"code": result["error_code"], "message": result.get("message", "停止失败")}}), 409
             return jsonify({"status": "error", "message": result.get("message", "停止失败")}), 404
         return jsonify({"status": "success", **result})
 
     @app.route("/api/stop_all", methods=["POST"])
     def stop_all_tasks():
         result = services.stop_all_active_tasks()
+        if not result.get("ok", True) and result.get("error_code") == "publication_cancel_required":
+            return jsonify({"status": "error", "error": {"code": result["error_code"], "message": result.get("message", "停止失败")}}), 409
         return jsonify({"status": "success", **result})
 
     @app.route("/api/resume/<task_id>", methods=["POST"])
@@ -807,6 +884,9 @@ def register_routes(app, state, services, dataset_service):
             priority = state.priority_map.get(task.get("priority", "cutin"), 20)
             task["status"] = "queued"
             task["message"] = "已手动恢复..."
+            control = task.setdefault("control", {})
+            control["aborted"] = False
+            control["process"] = None
             state.task_queue.put((priority, task["created_at"], task_id, task["original_data"]))
         return jsonify({"status": "success"})
 
@@ -848,6 +928,9 @@ def register_routes(app, state, services, dataset_service):
         model_id = (model_id or "").strip()
         if not model_id:
             return jsonify({"status": "error", "message": "模型 ID 无效"}), 400
+        published_response = _delete_formal_published_model(model_id=model_id)
+        if published_response is not None:
+            return published_response
         models = services.model_repo_load_raw()
         if not isinstance(models, dict):
             return jsonify({"status": "error", "message": "仓库数据异常"}), 500
@@ -858,6 +941,10 @@ def register_routes(app, state, services, dataset_service):
             path = services.model_get_path_by_id(model_id)
             if not path:
                 return jsonify({"status": "error", "message": "模型不存在"}), 404
+        published_response = _delete_formal_published_model(path=path)
+        if published_response is not None:
+            return published_response
+        if not m:
             if os.path.isdir(path):
                 try:
                     shutil.rmtree(path)
@@ -1897,3 +1984,325 @@ def register_routes(app, state, services, dataset_service):
     @app.route("/fusion_history")
     def fusion_history_page():
         return render_template("fusion_history.html")
+
+    # Formal publication endpoints intentionally live in the model factory, not
+    # the Gateway. Gateway owns service lifecycle only.
+    def _publication_admin():
+        from .model_gateway.auth import require_admin_token
+
+        try:
+            require_admin_token(app.config, request.headers.get("Authorization"))
+        except RuntimeError:
+            return jsonify({"error": {"code": "admin_unconfigured", "message": "admin access unavailable"}}), 503
+        except PermissionError:
+            return jsonify({"error": {"code": "unauthorized", "message": "admin access required"}}), 401
+        return None
+
+    def _publication_task_view(task):
+        config = task.config if isinstance(task.config, dict) else {}
+        return {
+            "id": task.id,
+            "status": task.status,
+            "publication_id": config.get("publication_id"),
+            "display_name": config.get("display_name"),
+            "source_type": config.get("source_type"),
+            "error_code": config.get("error_code"),
+            "error": task.error,
+        }
+
+    def _public_publication_view(task):
+        config = task.config if isinstance(task.config, dict) else {}
+        return {
+            "status": task.status,
+            "is_active": False,
+            "publication_id": config.get("publication_id"),
+            "display_name": config.get("display_name"),
+            "error_code": config.get("error_code"),
+        }
+
+    def _public_history_item(item):
+        if not isinstance(item, dict):
+            return item
+        task_type = (item.get("type") or item.get("task_type") or "").strip()
+        if task_type != "model_publication":
+            return item
+        config = item.get("config") if isinstance(item.get("config"), dict) else {}
+        display_name = item.get("display_name") or item.get("custom_name") or config.get("display_name")
+        redacted = {
+            "id": item.get("id"),
+            "type": "model_publication",
+            "status": item.get("status"),
+            "created_at": item.get("created_at"),
+            "fusion_method": item.get("fusion_method") or "Publication",
+            "publication_id": item.get("publication_id") or config.get("publication_id"),
+            "display_name": display_name,
+        }
+        error_code = item.get("error_code") or config.get("error_code")
+        if error_code is not None:
+            redacted["error_code"] = error_code
+        return {key: value for key, value in redacted.items() if value is not None}
+
+    def _history_metadata(task_id):
+        path = os.path.join(state.merge_dir, task_id, "metadata.json")
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _publication_task_lookup(task_id):
+        try:
+            from .extensions import db
+            from .models import Task
+
+            return db.session.get(Task, task_id)
+        except Exception:
+            return None
+
+    def _public_publication_disk_view(task_id, *, disk=None, metadata=None):
+        metadata = metadata if metadata is not None else _history_metadata(task_id)
+        if not isinstance(metadata, dict) or metadata.get("type") != "model_publication":
+            return None
+        result = disk.get("result") if isinstance(disk, dict) and isinstance(disk.get("result"), dict) else {}
+        return {
+            "status": (disk or {}).get("status") or metadata.get("status") or "error",
+            "is_active": False,
+            "publication_id": result.get("publication_id") or metadata.get("publication_id"),
+            "display_name": metadata.get("display_name"),
+            "error_code": result.get("error_code") or metadata.get("error_code"),
+        }
+
+    def _queue_publication_locked(task_id, data):
+        created_at = time.time()
+        previous = state.tasks.get(task_id) or {}
+        queued = {
+            "progress": 0,
+            "message": "Queued for publication",
+            "status": "queued",
+            "created_at": created_at,
+            "original_data": data,
+            "priority": "common",
+            "validation_enqueued": bool(data.get("validation_enqueued")),
+        }
+        if isinstance(previous.get("control"), dict):
+            queued["control"] = previous["control"]
+        state.tasks[task_id] = queued
+        priority_map = getattr(state, "priority_map", {"common": 10})
+        state.task_queue.put((priority_map.get("common", 10), created_at, task_id, data))
+
+    def _queue_publication(task_id, data):
+        with state.scheduler_lock:
+            _queue_publication_locked(task_id, data)
+
+    @app.route("/api/model-publications", methods=["POST"])
+    def create_model_publication():
+        denied = _publication_admin()
+        if denied:
+            return denied
+        idempotency_key = (request.headers.get("Idempotency-Key") or "").strip()
+        if not idempotency_key:
+            return jsonify({"error": {"code": "idempotency_key_required", "message": "Idempotency-Key is required"}}), 400
+        data = request.get_json(silent=True) or {}
+        source_type = (data.get("source_type") or "").strip()
+        display_name = (data.get("display_name") or "").strip()
+        if source_type not in {"recipe", "existing_model"} or not display_name:
+            return jsonify({"error": {"code": "invalid_request", "message": "source_type and display_name are required"}}), 400
+        request_fingerprint = json.dumps(
+            {key: data.get(key) for key in ("source_type", "recipe_path", "model_id", "display_name", "vlm_base_model_id")},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        from .repositories import model_get_by_id, publication_task_by_idempotency_key, task_upsert
+
+        existing = publication_task_by_idempotency_key(idempotency_key)
+        if existing is not None:
+            old = existing.config if isinstance(existing.config, dict) else {}
+            if old.get("request_fingerprint") != request_fingerprint:
+                return jsonify({"error": {"code": "idempotency_conflict", "message": "Idempotency-Key was used for another request"}}), 409
+            return jsonify({"status": "success", "task": _publication_task_view(existing)}), 200
+
+        task_data = {
+            "type": "model_publication",
+            "source_type": source_type,
+            "display_name": display_name,
+            "publication_id": uuid.uuid4().hex,
+            "idempotency_key": idempotency_key,
+            "request_fingerprint": request_fingerprint,
+            "publication_root": app.config.get("PUBLISHED_MODELS_PATH") or getattr(state.config, "PUBLISHED_MODELS_PATH", None),
+            "vlm_base_model_id": data.get("vlm_base_model_id"),
+        }
+        if source_type == "recipe":
+            recipe_path = (data.get("recipe_path") or "").strip()
+            if (
+                not recipe_path
+                or os.path.isabs(recipe_path)
+                or os.path.dirname(recipe_path)
+                or os.path.splitext(recipe_path)[1].lower() != ".json"
+            ):
+                return jsonify({"error": {"code": "invalid_recipe", "message": "recipe_path must be one managed recipe filename"}}), 400
+            recipes_root = os.path.realpath(os.path.abspath(state.recipes_dir))
+            candidate = os.path.realpath(os.path.abspath(os.path.join(recipes_root, recipe_path)))
+            if os.path.commonpath((recipes_root, candidate)) != recipes_root or not os.path.isfile(candidate):
+                return jsonify({"error": {"code": "invalid_recipe", "message": "recipe_path is not managed"}}), 400
+            import merge_manager
+
+            canonical = os.path.realpath(os.path.join(os.path.realpath(merge_manager.RECIPES_DIR), recipe_path))
+            if candidate != canonical:
+                return jsonify({"error": {"code": "invalid_recipe", "message": "recipe_path is not canonical"}}), 400
+            task_data["recipe_path"] = candidate
+            task_data["recipe_id"] = os.path.splitext(os.path.basename(candidate))[0]
+            vlm_base_model_id = (data.get("vlm_base_model_id") or "").strip()
+            if vlm_base_model_id:
+                vlm_base = model_get_by_id(vlm_base_model_id)
+                if vlm_base is None or not os.path.isdir(vlm_base.path):
+                    return jsonify({"error": {"code": "vlm_base_missing", "message": "vlm_base_model_id is not a managed model"}}), 400
+        else:
+            model = model_get_by_id((data.get("model_id") or "").strip())
+            if model is None or not os.path.isdir(model.path):
+                return jsonify({"error": {"code": "invalid_model", "message": "model_id is not a managed model"}}), 400
+            task_data["model_id"] = model.id
+        with state.scheduler_lock:
+            existing = publication_task_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                old = existing.config if isinstance(existing.config, dict) else {}
+                if old.get("request_fingerprint") != request_fingerprint:
+                    return jsonify({"error": {"code": "idempotency_conflict", "message": "Idempotency-Key was used for another request"}}), 409
+                return jsonify({"status": "success", "task": _publication_task_view(existing)}), 200
+            task_id = uuid.uuid4().hex
+            task_data["task_id"] = task_id
+            task = task_upsert(task_id, "model_publication", task_data)
+            _queue_publication_locked(task_id, task_data)
+        return jsonify({"status": "success", "task": _publication_task_view(task)}), 202
+
+    @app.route("/api/model-publications/<task_id>")
+    def get_model_publication(task_id):
+        denied = _publication_admin()
+        if denied:
+            return denied
+        from .extensions import db
+        from .models import Task
+
+        task = db.session.get(Task, task_id)
+        if task is None or task.task_type != "model_publication":
+            return jsonify({"error": {"code": "not_found", "message": "publication task not found"}}), 404
+        return jsonify({"status": "success", "task": _publication_task_view(task)})
+
+    @app.route("/api/model-publications/<task_id>/cancel", methods=["POST"])
+    def cancel_model_publication(task_id):
+        denied = _publication_admin()
+        if denied:
+            return denied
+        from .extensions import db
+        from .models import Task
+        from .repositories import task_set_status
+
+        from .model_publication_tasks import remove_publication_staging
+
+        with state.scheduler_lock:
+            db.session.expire_all()
+            task = db.session.get(Task, task_id)
+            if task is None or task.task_type != "model_publication":
+                return jsonify({"error": {"code": "not_found", "message": "publication task not found"}}), 404
+            config = dict(task.config or {})
+            if config.get("commit_in_progress"):
+                return jsonify({"error": {"code": "commit_in_progress", "message": "atomic commit has started"}}), 409
+            memory_task = state.tasks.get(task_id) or {}
+            running = (
+                memory_task.get("status") == "running"
+                and state.running_task_info.get("id") == task_id
+            )
+            if (task.status == "queued" and not running) or (task.status == "validating" and not running):
+                remove_publication_staging({**config, "task_id": task_id})
+                task = task_set_status(
+                    task_id,
+                    "canceled",
+                    error="canceled: publication canceled",
+                    config_patch={"error_code": "canceled"},
+                )
+                if task_id in state.tasks:
+                    state.tasks[task_id]["status"] = "stopped"
+                return jsonify({"status": "success", "task": _publication_task_view(task)})
+            if task.status in {"queued", "materializing", "validating"} and running:
+                control = memory_task.setdefault("control", {})
+                control["aborted"] = True
+                process = control.get("process")
+                if process is not None:
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
+                return jsonify({"status": "success", "task": _publication_task_view(task)})
+            return jsonify({"error": {"code": "invalid_publication_state", "message": "publication cannot be canceled"}}), 409
+
+    @app.route("/api/model-publications/<task_id>/validate", methods=["POST"])
+    def validate_model_publication(task_id):
+        denied = _publication_admin()
+        if denied:
+            return denied
+        from .extensions import db
+        from .models import Task
+        from .model_publication import PublicationError
+        from .model_publication_tasks import _normalize_gpu_ids
+        from .repositories import task_set_status
+
+        try:
+            gpu_ids = _normalize_gpu_ids((request.get_json(silent=True) or {}).get("gpu_ids"))
+        except PublicationError as exc:
+            return jsonify({"error": {"code": exc.code, "message": str(exc)}}), 400
+        with state.scheduler_lock:
+            db.session.expire_all()
+            task = db.session.get(Task, task_id)
+            if task is None or task.task_type != "model_publication":
+                return jsonify({"error": {"code": "not_found", "message": "publication task not found"}}), 404
+            config = dict(task.config or {})
+            memory_task = state.tasks.get(task_id) or {}
+            if config.get("validation_enqueued") or memory_task.get("validation_enqueued"):
+                return jsonify({"error": {"code": "validation_in_progress", "message": "publication validation is already queued"}}), 409
+            if task.status != "validating":
+                return jsonify({"error": {"code": "invalid_publication_state", "message": "publication is not awaiting validation"}}), 409
+            task = task_set_status(task_id, "validating", config_patch={"validation_enqueued": True})
+            data = dict(task.config or {})
+            data.update({"type": "model_publication", "task_id": task_id, "validation_gpu_ids": gpu_ids})
+            _queue_publication_locked(task_id, data)
+        return jsonify({"status": "accepted", "task": _publication_task_view(task)}), 202
+
+    @app.route("/api/model-publications/<publication_id>/manifest")
+    def get_model_publication_manifest(publication_id):
+        denied = _publication_admin()
+        if denied:
+            return denied
+        root = app.config.get("PUBLISHED_MODELS_PATH") or getattr(state.config, "PUBLISHED_MODELS_PATH", "")
+        from .model_publication import (
+            PublicationError,
+            _asset_dir,
+            _publication_root,
+            validate_published_asset,
+        )
+
+        try:
+            path = _asset_dir(_publication_root(root), publication_id)
+            manifest = validate_published_asset(path, full_hash=False)
+            return jsonify({"status": "success", "manifest": manifest})
+        except PublicationError as exc:
+            status = 404 if exc.code == "publication_missing" else 400
+            return jsonify({"error": {"code": exc.code, "message": str(exc)}}), status
+
+    @app.route("/api/model-publications/<publication_id>", methods=["DELETE"])
+    def delete_model_publication(publication_id):
+        denied = _publication_admin()
+        if denied:
+            return denied
+        from .model_publication import PublicationError, delete_registered_published_asset
+
+        root = app.config.get("PUBLISHED_MODELS_PATH") or getattr(state.config, "PUBLISHED_MODELS_PATH", "")
+
+        try:
+            result = delete_registered_published_asset(publication_id, root)
+        except PublicationError as exc:
+            return jsonify({"error": {"code": exc.code, "message": str(exc)}}), 409 if exc.code == "asset_in_use" else 400
+        except Exception:
+            return jsonify({"error": {"code": "asset_delete_failed", "message": "published asset deletion failed"}}), 500
+        return jsonify({"status": "success", **result})

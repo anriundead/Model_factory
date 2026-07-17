@@ -87,8 +87,8 @@ class ServingRoutesTestCase(unittest.TestCase):
             shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(self.app.config["MERGEKIT_MODEL_GATEWAY_RESEARCH_ROOT"], ignore_errors=True)
 
-    def make_model_dir(self):
-        path = os.path.join(self.app.config["MERGE_DIR"], "task-a", "output")
+    def make_model_dir(self, task_name="task-a"):
+        path = os.path.join(self.app.config["MERGE_DIR"], task_name, "output")
         os.makedirs(path)
         for name, body in {
             "config.json": "{}",
@@ -166,7 +166,7 @@ class TestAdminRoutes(ServingRoutesTestCase):
         self.assertEqual(resp.status_code, 401)
         self.assertEqual(resp.get_json()["error"]["code"], "unauthorized")
 
-    def test_admin_can_create_service_and_api_key(self):
+    def test_admin_rejects_path_based_service_creation_and_can_create_api_key(self):
         from app.model_gateway.models import ServingApiKey, ServingModelService
 
         model_path = self.make_model_dir()
@@ -189,10 +189,10 @@ class TestAdminRoutes(ServingRoutesTestCase):
             json={"owner_label": "demo-user", "model_allowlist": ["qwen-demo"]},
         )
 
-        self.assertEqual(service_resp.status_code, 201)
+        self.assertEqual(service_resp.status_code, 400)
         self.assertEqual(key_resp.status_code, 201)
         self.assertTrue(key_resp.get_json()["api_key"].startswith("mk_live_"))
-        self.assertEqual(self.db.session.query(ServingModelService).count(), 1)
+        self.assertEqual(self.db.session.query(ServingModelService).count(), 0)
         stored_key = self.db.session.query(ServingApiKey).one()
         self.assertNotEqual(stored_key.key_hash, key_resp.get_json()["api_key"])
 
@@ -243,6 +243,59 @@ class TestAdminRoutes(ServingRoutesTestCase):
         self.assertEqual(start_resp.get_json()["service"]["status"], "running")
         self.assertEqual(stop_resp.status_code, 200)
         self.assertEqual(stop_resp.get_json()["service"]["status"], "stopped")
+
+    def test_admin_maps_formal_start_conflict_to_stable_409(self):
+        from app.model_publication import PublicationError
+
+        with patch(
+            "app.model_gateway.routes.start_service",
+            side_effect=PublicationError("version_changed", "version changed"),
+        ):
+            response = self.client.post(
+                "/api/model-gateway/admin/model-services/formal-service/start",
+                headers=self.admin_headers(),
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"]["code"], "version_changed")
+
+    def test_admin_rejects_start_and_stop_for_deleted_service(self):
+        from app.model_gateway.models import ServingModelService
+
+        start_target = ServingModelService(
+            model_path=self.make_model_dir("deleted-start"),
+            display_name="Deleted start",
+            served_model_name="deleted-start",
+            status="deleted",
+        )
+        stop_target = ServingModelService(
+            model_path=self.make_model_dir("deleted-stop"),
+            display_name="Deleted stop",
+            served_model_name="deleted-stop",
+            status="deleted",
+        )
+        self.db.session.add_all([start_target, stop_target])
+        self.db.session.commit()
+
+        with patch("app.model_gateway.runtime.validate_gpu_availability"), \
+            patch("app.model_gateway.runtime.subprocess.Popen") as popen, \
+            patch("app.model_gateway.runtime._healthcheck", return_value=True), \
+            patch("app.model_gateway.runtime._find_marked_service_pids") as find_pids:
+            started = self.client.post(
+                f"/api/model-gateway/admin/model-services/{start_target.id}/start",
+                headers=self.admin_headers(),
+            )
+            stopped = self.client.post(
+                f"/api/model-gateway/admin/model-services/{stop_target.id}/stop",
+                headers=self.admin_headers(),
+            )
+
+        self.assertEqual(started.status_code, 409)
+        self.assertEqual(started.get_json()["error"]["code"], "service_deleted")
+        self.assertEqual(stopped.status_code, 409)
+        self.assertEqual(stopped.get_json()["error"]["code"], "service_deleted")
+        popen.assert_not_called()
+        find_pids.assert_not_called()
 
 
 class TestResearchRoutes(ServingRoutesTestCase):
@@ -653,6 +706,7 @@ class TestOpenAiCompatibleRoutes(ServingRoutesTestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["object"], "list")
         self.assertEqual(resp.get_json()["data"][0]["id"], "qwen-demo")
+        self.assertNotIn("model_path", resp.get_data(as_text=True))
 
     def test_chat_completions_proxies_to_vllm_and_records_usage(self):
         from app.model_gateway.models import ServingRequest, ServingUsageRecord

@@ -137,6 +137,8 @@ class ModelGatewayPortalPageTestCase(unittest.TestCase):
         self.assertIn("async function submitDirectChat(turn)", script)
         self.assertIn('api("/v1/chat/completions"', script)
         self.assertIn("MAX_MODEL_CONTEXT_MESSAGES", script)
+        self.assertNotIn("/api/model-publications", script)
+        self.assertNotIn("/api/model-gateway/admin", script)
 
     def test_research_client_uses_selected_sources_or_direct_chat_without_fallback(self):
         script = self._research_script()
@@ -361,7 +363,7 @@ class ModelGatewayPortalPageTestCase(unittest.TestCase):
             "gateway-copy-curl",
             "/v1/chat/completions",
             "/v1/requests/",
-            "选择模型",
+            "选择正式资产",
             "管理员手动启动",
             "API Key 验证",
         ):

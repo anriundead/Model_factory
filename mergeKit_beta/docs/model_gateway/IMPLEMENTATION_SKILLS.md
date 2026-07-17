@@ -10,6 +10,7 @@
 | Frontend design | `/home/a/.codex/skills/frontend-design/SKILL.md` | Research workspace hierarchy and Mergenetic visual language. |
 | Design taste | `/home/a/.codex/skills/taste-skill/SKILL.md` | Anti-template visual review. |
 | GSAP core/performance | `/home/a/.codex/skills/gsap-core/SKILL.md`, `/home/a/.codex/skills/gsap-performance/SKILL.md` | Compositor-safe motion and reduced motion. |
+| Model publication pipeline (Task 0) | `/home/a/.codex/skills/using-git-worktrees/SKILL.md`, `/home/a/.codex/skills/subagent-driven-development/SKILL.md`; `/home/a/.codex/skills/test-driven-development/SKILL.md`, `/home/a/.codex/skills/ponytail/SKILL.md`; `/home/a/.codex/skills/systematic-debugging/SKILL.md`; `/home/a/.codex/skills/frontend-design/SKILL.md`, `/home/a/.codex/skills/taste-skill/SKILL.md`, `/home/a/.codex/skills/gsap-core/SKILL.md`, `/home/a/.codex/skills/gsap-performance/SKILL.md`; `/home/a/.codex/skills/verification-before-completion/SKILL.md`; `/home/a/.codex/skills/requesting-code-review/SKILL.md` | Worktree/execution planning; TDD/backend; debugging; frontend; verification; review. |
 
 ## Admin Portal Visual Batch (2026-07-14)
 
@@ -81,3 +82,21 @@
   at build completion. The parser has no GPU, no published port and only the
   private Worker network. Real fixture checks use disposable files and do not
   start a model, research task, fusion, evaluation or GPU workload.
+
+## Model Publication Real Acceptance (2026-07-17)
+
+- Active skills: `using-superpowers`, `executing-plans`, `ponytail`,
+  `systematic-debugging`, `test-driven-development`,
+  `verification-before-completion`, and `requesting-code-review` from the paths
+  listed above.
+- Scope: formal text/VLM publication, real Gateway text inference, bounded VLM
+  evolution, manifest provenance, restart recovery and deletion guards.
+- Runtime safety: all work ran in worktree
+  `.worktrees/model-publication-pipeline`, Compose project
+  `mergekit_publication_task7`, and host port `5057`. GPU 0 was the only model
+  validation device; physical GPU 2 was protected and the main service remained
+  healthy with restart count zero.
+- Review closure: repeated `requesting-code-review` passes found and closed false-success
+  postprocessing, weak source provenance, index-based GPU identity, legacy schema
+  compatibility, existing-model copy races and metadata backfill coupling. The final
+  focused re-review reported no Critical, Important or Minor findings.

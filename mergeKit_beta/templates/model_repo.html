@@ -49,14 +49,31 @@
                 <div id="model-repo-base" class="models-grid"><div class="loading-state"><div class="spinner"></div><p>加载中...</p></div></div>
             </section>
             <section class="section apple-card">
-                <div class="section-header"><h3>融合模型</h3> <span class="helper-text">Merged Models</span></div>
+                <div class="section-header"><h3>历史融合输出</h3> <span class="helper-text">Historical Outputs</span></div>
                 <p class="limit-desc" style="margin-bottom: 12px;">点击卡片在弹窗中查看父代、融合参数与使用数据集。</p>
                 <div id="model-repo-merged" class="models-grid"><div class="loading-state"><div class="spinner"></div><p>加载中...</p></div></div>
             </section>
             <section class="section apple-card">
                 <div class="section-header"><h3>融合配方</h3> <span class="helper-text">Recipes</span></div>
-                <p class="limit-desc" style="margin-bottom: 12px;">已保存的完全融合配方，点击查看详情或使用配方直接融合。</p>
+                <p class="limit-desc" style="margin-bottom: 12px;">已保存的完全融合配方。物化后才会成为可供 Gateway 使用的正式资产。</p>
                 <div id="model-repo-recipes" class="models-grid"><div class="loading-state"><div class="spinner"></div><p>加载中...</p></div></div>
+            </section>
+            <section class="section apple-card" aria-labelledby="publication-title">
+                <div class="section-header"><h3 id="publication-title">正式发布</h3> <span class="helper-text">Publication</span></div>
+                <p class="limit-desc" style="margin-bottom: 12px;">配方先物化、再由管理员指定验证 GPU；发布完成后仍需在 Gateway 创建并手动启动服务。</p>
+                <form id="publication-create-form" class="publication-form">
+                    <label>管理员 Token<input id="publication-admin-token" type="password" autocomplete="off" required placeholder="Bearer token"></label>
+                    <label>融合配方<select id="publication-recipe" required><option value="">加载配方中...</option></select></label>
+                    <label>发布名称<input id="publication-display-name" type="text" required placeholder="正式资产名称"></label>
+                    <button type="submit" class="ios-btn ios-btn-confirm"><i class="ri-upload-cloud-2-line" aria-hidden="true"></i>物化并发布</button>
+                </form>
+                <div id="publication-live-status" class="publication-live-status" aria-live="polite"></div>
+                <div id="publication-status-list" class="publication-status-list" aria-live="polite"><p class="limit-desc">尚未提交发布任务。</p></div>
+            </section>
+            <section class="section apple-card" aria-labelledby="published-assets-title">
+                <div class="section-header"><h3 id="published-assets-title">正式资产</h3> <span class="helper-text">Gateway inventory</span></div>
+                <p class="limit-desc" style="margin-bottom: 12px;">仅列出已发布资产。状态为 blocked 或 stale 时不能创建 Gateway 服务。</p>
+                <div id="publication-assets-list" class="publication-assets-list" aria-live="polite"><p class="limit-desc">输入管理员 Token 后加载正式资产。</p></div>
             </section>
         </main>
         <footer><p>Copyright © 2025 Nine Heavens. 保留所有权利。</p></footer>
@@ -100,6 +117,63 @@
             </div>
         </div>
     </div>
+    <div id="publication-validate-overlay" class="modal-overlay" style="display:none; opacity:0;" aria-hidden="true">
+        <div class="ios-modal publication-validation-dialog" role="dialog" aria-modal="true" aria-labelledby="publication-validate-title" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3 id="publication-validate-title">显式验证 GPU</h3>
+                <p id="publication-validate-copy" class="limit-desc" style="margin-top: 12px;">验证任务需要管理员明确选择 GPU。</p>
+            </div>
+            <form id="publication-validate-form" class="publication-validation-form">
+                <fieldset>
+                    <legend>选择验证 GPU</legend>
+                    <label><input type="checkbox" name="publication-gpu" value="0"> GPU 0</label>
+                    <label><input type="checkbox" name="publication-gpu" value="1"> GPU 1</label>
+                    <label><input type="checkbox" name="publication-gpu" value="3"> GPU 3</label>
+                </fieldset>
+                <div id="publication-validate-error" class="publication-live-status" aria-live="polite"></div>
+                <div class="modal-actions">
+                    <button id="publication-validate-cancel" type="button" class="ios-btn ios-btn-cancel">取消</button>
+                    <button type="submit" class="ios-btn ios-btn-confirm">开始验证</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    <style>
+        .sticky-header { margin: 0 0 40px; }
+        #publication-title, #published-assets-title { scroll-margin-top: 116px; }
+        .publication-form { display:grid; grid-template-columns: minmax(180px, .8fr) minmax(180px, 1fr) minmax(180px, 1fr) auto; gap:10px; align-items:end; }
+        .publication-form label, .publication-validation-form fieldset { display:grid; gap:6px; font-size:.86rem; font-weight:600; color:var(--text-primary, #1d1d1f); }
+        .publication-form input, .publication-form select { min-width:0; border:1px solid var(--border-color, #d2d2d7); border-radius:6px; padding:10px; background:var(--card-background, #fff); color:inherit; }
+        .publication-form input:focus-visible, .publication-form select:focus-visible, .publication-validation-form input:focus-visible { outline:3px solid rgba(0,122,255,.24); outline-offset:2px; }
+        .publication-form button { min-height:42px; white-space:nowrap; }
+        .publication-live-status { min-height:1.4em; margin-top:10px; color:var(--error, #ff3b30); font-size:.88rem; overflow-wrap:anywhere; }
+        .publication-status-list, .publication-assets-list { display:grid; gap:8px; }
+        .publication-task, .publication-asset { border:1px solid var(--border-color, #d2d2d7); border-radius:6px; padding:12px; display:grid; gap:9px; background:rgba(255,255,255,.52); }
+        .publication-task-head, .publication-asset-head, .publication-task-actions { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+        .publication-task-name { font-weight:600; overflow-wrap:anywhere; }
+        .publication-state { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.78rem; color:var(--secondary-text, #6e6e73); }
+        .publication-rail { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:2px; background:var(--border-color, #d2d2d7); padding:2px; }
+        .publication-rail span { min-height:5px; background:#e5e5ea; }
+        .publication-rail span.is-current { background:var(--accent-color, #007aff); }
+        .publication-rail span.is-gateway { background:#e5e5ea; }
+        .publication-task.is-terminal-failed, .publication-task.is-terminal-unknown { border-color:var(--error, #ff3b30); }
+        .publication-task.is-terminal-failed .publication-state, .publication-task.is-terminal-unknown .publication-state { color:var(--error, #ff3b30); font-weight:600; }
+        .publication-task.is-terminal-canceled { border-color:#8e8e93; border-style:dashed; }
+        .publication-task.is-terminal-canceled .publication-state { color:#636366; font-weight:600; }
+        .publication-task-actions button { border:1px solid var(--border-color, #d2d2d7); border-radius:5px; background:#fff; color:inherit; padding:7px 10px; cursor:pointer; }
+        .publication-task-actions button:hover { border-color:var(--accent-color, #007aff); transform:translateY(-1px); }
+        .publication-task-actions button:active { transform:translateY(1px); }
+        .publication-asset.blocked { opacity:.72; border-style:dashed; }
+        .publication-validation-form { display:grid; gap:16px; padding:0 20px 20px; }
+        .publication-validation-form fieldset { border:1px solid var(--border-color, #d2d2d7); border-radius:6px; padding:12px; }
+        .publication-validation-form fieldset label { font-weight:400; }
+        #publication-validate-overlay { box-sizing:border-box; padding:12px; overflow-y:auto; }
+        .publication-validation-dialog { width:min(100%, 460px); max-width:460px; max-height:calc(100dvh - 24px); margin:auto; overflow-y:auto; }
+        @media (max-width: 840px) { .publication-form { grid-template-columns:1fr 1fr; } }
+        @media (max-width: 560px) { .publication-form { grid-template-columns:1fr; } .publication-rail { grid-template-columns:repeat(5, minmax(24px, 1fr)); } }
+        @media (prefers-reduced-motion: reduce) { .publication-task-actions button { transition:none; } .publication-task-actions button:hover { transform:none; } }
+    </style>
+    <script src="/static/model_publication_ui.js"></script>
     <script>
         document.getElementById('menu-btn').onclick = function() { document.getElementById('history-sidebar').classList.add('open'); document.getElementById('sidebar-overlay').classList.add('show'); };
         document.getElementById('close-sidebar').onclick = function() { document.getElementById('history-sidebar').classList.remove('open'); document.getElementById('sidebar-overlay').classList.remove('show'); };
@@ -285,6 +359,263 @@
         };
 
         var recipesData = [];
+        var publicationState = { taskIds: [], tasks: {}, validationTaskId: null, assets: [], storageWarning: false };
+        var publicationStorageKey = 'mergeneticPublicationTaskIdsV1';
+        var publicationStages = ['recipe', 'materializing', 'validating', 'published', 'gateway'];
+        var publicationGeneration = PublicationUI.createGenerationGate();
+        var publicationPoller = PublicationUI.createPollScheduler({
+            setTimer: window.setTimeout.bind(window),
+            clearTimer: window.clearTimeout.bind(window),
+            normalDelay: 3000,
+            retryBaseDelay: 1000,
+            retryMaxDelay: 12000
+        });
+        var publicationStorage;
+        try { publicationStorage = PublicationUI.safeStorage(window.localStorage); }
+        catch (error) { publicationStorage = PublicationUI.safeStorage(null); publicationState.storageWarning = true; }
+        var publicationValidationTrigger = null;
+        var publicationBackground = document.getElementById('main-app');
+        var publicationHeader = document.querySelector('.sticky-header');
+
+        function publicationToken() { return (document.getElementById('publication-admin-token').value || '').trim(); }
+        function publicationHeaders(snapshot) { return { 'Authorization': 'Bearer ' + snapshot.token, 'Content-Type': 'application/json' }; }
+        function publicationMessage(message) { document.getElementById('publication-live-status').textContent = message || ''; }
+        function publicationStorageWarning(message) { return (message ? message + ' ' : '') + '本地任务记录不可用；本次任务仍会在当前页面轮询。'; }
+        function publicationErrorMessage(error) { return error && error.message ? error.message : '请求失败'; }
+        function publicationRequest(url, options, snapshot) {
+            return fetch(url, options || {}).then(function(response) {
+                return response.json().catch(function() { return {}; }).then(function(data) {
+                    if (!publicationGeneration.isCurrent(snapshot)) {
+                        var stale = new Error('stale token response'); stale.stale = true; throw stale;
+                    }
+                    if (!response.ok) {
+                        var error = new Error((data.error && data.error.message) || ('HTTP ' + response.status));
+                        error.status = response.status;
+                        error.code = data.error && data.error.code;
+                        throw error;
+                    }
+                    return data;
+                });
+            });
+        }
+        function publicationSaveTaskIds() {
+            var ids = publicationState.taskIds.slice(0, 24);
+            var ok = ids.length ? publicationStorage.set(publicationStorageKey, JSON.stringify(ids)) : publicationStorage.remove(publicationStorageKey);
+            if (!ok) publicationState.storageWarning = true;
+            return ok;
+        }
+        function publicationLoadTaskIds() {
+            var result = publicationStorage.get(publicationStorageKey);
+            if (!result.ok) { publicationState.storageWarning = true; publicationState.taskIds = []; return; }
+            try {
+                var stored = JSON.parse(result.value || '[]');
+                publicationState.taskIds = Array.isArray(stored) ? stored.filter(function(id) { return typeof id === 'string'; }).slice(0, 24) : [];
+            } catch (error) {
+                publicationState.taskIds = [];
+                if (!publicationStorage.remove(publicationStorageKey)) publicationState.storageWarning = true;
+            }
+        }
+        function publicationIsActive(status) { return PublicationUI.lifecycleForStatus(status).kind === 'active'; }
+        function publicationHasNonterminalTask() {
+            return publicationState.taskIds.some(function(id) { return !publicationState.tasks[id] || publicationIsActive(publicationState.tasks[id].status); });
+        }
+        function renderPublicationTasks() {
+            var list = document.getElementById('publication-status-list');
+            if (!publicationState.taskIds.length) { list.innerHTML = '<p class="limit-desc">尚未提交发布任务。</p>'; return; }
+            list.innerHTML = '';
+            publicationState.taskIds.forEach(function(taskId) {
+                var task = publicationState.tasks[taskId] || { id: taskId, status: 'loading', display_name: taskId };
+                var item = document.createElement('article');
+                var lifecycle = PublicationUI.lifecycleForStatus(task.status);
+                item.className = 'publication-task' + (['failed', 'canceled', 'unknown'].indexOf(lifecycle.kind) !== -1 ? ' is-terminal-' + lifecycle.kind : '');
+                var head = document.createElement('div'); head.className = 'publication-task-head';
+                var name = document.createElement('strong'); name.className = 'publication-task-name'; name.textContent = task.display_name || task.publication_id || task.id;
+                var state = document.createElement('span'); state.className = 'publication-state'; state.textContent = task.status || 'loading';
+                head.appendChild(name); head.appendChild(state); item.appendChild(head);
+                var rail = document.createElement('div'); rail.className = 'publication-rail'; rail.setAttribute('aria-label', '发布生命周期：recipe, materializing, validating, published, gateway');
+                publicationStages.forEach(function(stage, index) {
+                    var segment = document.createElement('span');
+                    if (index === lifecycle.segment) segment.classList.add('is-current');
+                    if (index === 4) segment.classList.add('is-gateway');
+                    segment.title = stage;
+                    rail.appendChild(segment);
+                });
+                item.appendChild(rail);
+                var detail = document.createElement('p'); detail.className = 'limit-desc';
+                detail.textContent = task.error || task.error_code || (task.status === 'validating' ? '等待管理员选择验证 GPU。' : '');
+                item.appendChild(detail);
+                var actions = document.createElement('div'); actions.className = 'publication-task-actions';
+                if (['queued', 'running', 'materializing'].indexOf(task.status) !== -1) {
+                    var cancel = document.createElement('button'); cancel.type = 'button'; cancel.dataset.publicationCancel = task.id; cancel.textContent = '取消任务'; actions.appendChild(cancel);
+                }
+                if (task.status === 'validating') {
+                    var validate = document.createElement('button'); validate.type = 'button'; validate.dataset.publicationValidate = task.id; validate.textContent = '选择 GPU 验证'; actions.appendChild(validate);
+                }
+                if (actions.childNodes.length) item.appendChild(actions);
+                list.appendChild(item);
+            });
+        }
+        function renderPublicationAssets() {
+            var list = document.getElementById('publication-assets-list');
+            if (!publicationToken()) { list.innerHTML = '<p class="limit-desc">输入管理员 Token 后加载正式资产。</p>'; return; }
+            if (!publicationState.assets.length) { list.innerHTML = '<p class="limit-desc">暂无正式资产。</p>'; return; }
+            list.innerHTML = '';
+            publicationState.assets.forEach(function(asset) {
+                var item = document.createElement('article');
+                item.className = 'publication-asset' + (asset.selectable ? '' : ' blocked');
+                var head = document.createElement('div'); head.className = 'publication-asset-head';
+                var name = document.createElement('strong'); name.textContent = asset.display_name || asset.model_id; head.appendChild(name);
+                var state = document.createElement('span'); state.className = 'publication-state'; state.textContent = asset.selectable ? 'published / ready' : 'published / ' + (asset.blocked_reason_code || 'blocked'); head.appendChild(state);
+                item.appendChild(head);
+                var detail = document.createElement('p'); detail.className = 'limit-desc';
+                detail.textContent = '类型：' + (asset.artifact_type || 'text') + '；能力：' + (asset.artifact_type === 'vlm' ? '文本生成、视觉语言' : '文本生成') + '；兼容性：' + (asset.selectable ? 'ready' : (asset.blocked_reason_code || 'blocked'));
+                item.appendChild(detail); list.appendChild(item);
+            });
+        }
+        async function loadPublicationAssets(snapshot) {
+            snapshot = snapshot || publicationGeneration.snapshot();
+            if (!snapshot.token) { renderPublicationAssets(); return; }
+            try {
+                var data = await publicationRequest('/api/model-gateway/admin/publishable-models', { headers: publicationHeaders(snapshot) }, snapshot);
+                publicationState.assets = data.models || [];
+                renderPublicationAssets();
+            } catch (error) {
+                if (error.stale || !publicationGeneration.isCurrent(snapshot)) return;
+                publicationState.assets = [];
+                var list = document.getElementById('publication-assets-list');
+                list.innerHTML = '<p class="limit-desc">正式资产加载失败。</p><button type="button" class="publication-assets-retry">重试</button>';
+                if (error.status === 401 || error.status === 403) publicationPoller.stop();
+                publicationMessage(error.status === 401 || error.status === 403 ? '管理员 Token 无效，请更正后重试。' : ('正式资产加载失败：' + publicationErrorMessage(error)));
+            }
+        }
+        function loadPublicationRecipes(recipes) {
+            var select = document.getElementById('publication-recipe');
+            select.innerHTML = '';
+            var empty = document.createElement('option'); empty.value = ''; empty.textContent = recipes.length ? '选择要物化的配方' : '暂无可发布配方'; select.appendChild(empty);
+            recipes.forEach(function(recipe) { var option = document.createElement('option'); option.value = String(recipe.recipe_id || '') + '.json'; option.textContent = recipe.custom_name || recipe.recipe_id || '未命名配方'; select.appendChild(option); });
+            select.disabled = !recipes.length;
+        }
+        async function refreshPublicationTask(taskId, snapshot) {
+            var data = await publicationRequest('/api/model-publications/' + encodeURIComponent(taskId), { headers: publicationHeaders(snapshot) }, snapshot);
+            return data.task;
+        }
+        async function loadPublicationTasks(snapshot) {
+            snapshot = snapshot || publicationGeneration.snapshot();
+            if (!publicationState.taskIds.length) { renderPublicationTasks(); return; }
+            if (!snapshot.token) { renderPublicationTasks(); publicationMessage('输入管理员 Token 后查看发布任务状态。'); return; }
+            var ids = publicationState.taskIds.slice();
+            await publicationPollController.poll(ids, function(id) { return refreshPublicationTask(id, snapshot); }, snapshot);
+        }
+        function schedulePublicationPoll(transient, snapshot) {
+            snapshot = snapshot || publicationGeneration.snapshot();
+            publicationPoller.schedule(function() {
+                if (publicationGeneration.isCurrent(snapshot)) loadPublicationTasks(snapshot);
+            }, !!transient);
+        }
+        var publicationPollController = PublicationUI.createPollController({
+            poller: publicationPoller,
+            isCurrent: function(snapshot) { return publicationGeneration.isCurrent(snapshot); },
+            hasNonterminalTask: publicationHasNonterminalTask,
+            acceptTask: function(id, task) { publicationState.tasks[id] = task; },
+            removeTask: function(id) {
+                delete publicationState.tasks[id];
+                publicationState.taskIds = publicationState.taskIds.filter(function(taskId) { return taskId !== id; });
+            },
+            saveTaskIds: publicationSaveTaskIds,
+            render: renderPublicationTasks,
+            onAuth: function() { publicationMessage('管理员 Token 无效，请更正后重试。'); },
+            onTransient: function() { publicationMessage('任务状态暂时不可用，正在重试。'); },
+            schedule: schedulePublicationPoll
+        });
+        function publicationDialogFocusables() {
+            return Array.from(document.querySelectorAll('#publication-validate-overlay input:not([disabled]), #publication-validate-overlay button:not([disabled])'));
+        }
+        function publicationTrapFocus(event) {
+            if (event.key === 'Escape') { event.preventDefault(); closePublicationValidation(); return; }
+            if (event.key !== 'Tab') return;
+            var focusable = publicationDialogFocusables();
+            if (!focusable.length) { event.preventDefault(); return; }
+            var first = focusable[0]; var last = focusable[focusable.length - 1];
+            if (event.shiftKey && (document.activeElement === first || !event.currentTarget.contains(document.activeElement))) { event.preventDefault(); last.focus(); }
+            else if (!event.shiftKey && (document.activeElement === last || !event.currentTarget.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
+        }
+        function openPublicationValidation(taskId, trigger) {
+            publicationState.validationTaskId = taskId;
+            publicationValidationTrigger = trigger || document.activeElement;
+            document.querySelectorAll('input[name="publication-gpu"]').forEach(function(input) { input.checked = false; });
+            document.getElementById('publication-validate-error').textContent = '';
+            document.getElementById('publication-validate-copy').textContent = '任务 ' + taskId + ' 正在等待验证。GPU 2 不在可选范围内。';
+            var overlay = document.getElementById('publication-validate-overlay'); overlay.style.display = 'flex'; overlay.style.opacity = '1'; overlay.classList.add('show'); overlay.setAttribute('aria-hidden', 'false');
+            publicationBackground.inert = true;
+            publicationHeader.inert = true;
+            window.setTimeout(function() { var focusable = publicationDialogFocusables(); if (focusable.length) focusable[0].focus(); }, 0);
+        }
+        function closePublicationValidation() {
+            var overlay = document.getElementById('publication-validate-overlay'); overlay.style.display = 'none'; overlay.classList.remove('show'); overlay.setAttribute('aria-hidden', 'true');
+            publicationBackground.inert = false;
+            publicationHeader.inert = false;
+            publicationState.validationTaskId = null;
+            if (publicationValidationTrigger && publicationValidationTrigger.isConnected) publicationValidationTrigger.focus();
+            publicationValidationTrigger = null;
+        }
+        function publicationTokenChanged() {
+            if (!publicationGeneration.changeToken(publicationToken())) return;
+            publicationPoller.stop();
+            publicationState.tasks = {};
+            publicationState.assets = [];
+            if (publicationState.validationTaskId) closePublicationValidation();
+            renderPublicationTasks();
+            renderPublicationAssets();
+            publicationMessage('');
+            var snapshot = publicationGeneration.snapshot();
+            if (snapshot.token) { loadPublicationTasks(snapshot); loadPublicationAssets(snapshot); }
+        }
+        function bindPublicationControls() {
+            publicationLoadTaskIds();
+            var tokenInput = document.getElementById('publication-admin-token');
+            tokenInput.addEventListener('input', publicationTokenChanged);
+            tokenInput.addEventListener('change', publicationTokenChanged);
+            document.getElementById('publication-assets-list').addEventListener('click', function(event) { if (event.target.closest('.publication-assets-retry')) loadPublicationAssets(); });
+            document.getElementById('publication-create-form').addEventListener('submit', async function(event) {
+                event.preventDefault();
+                var recipe = document.getElementById('publication-recipe').value;
+                var displayName = document.getElementById('publication-display-name').value.trim();
+                if (!publicationToken() || !recipe || !displayName) { publicationMessage('请填写管理员 Token、配方和发布名称。'); return; }
+                var idempotencyKey = window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : ('publication-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+                var snapshot = publicationGeneration.snapshot();
+                try {
+                    var data = await publicationRequest('/api/model-publications', { method: 'POST', headers: Object.assign(publicationHeaders(snapshot), { 'Idempotency-Key': idempotencyKey }), body: JSON.stringify({ source_type: 'recipe', recipe_path: recipe, display_name: displayName }) }, snapshot);
+                    var task = data.task;
+                    var stored = PublicationUI.acceptSubmission(publicationState, task, publicationSaveTaskIds, function() { schedulePublicationPoll(false, snapshot); });
+                    renderPublicationTasks();
+                    publicationMessage(stored ? '发布任务已提交。' : publicationStorageWarning('发布任务已提交。'));
+                } catch (error) { if (!error.stale && publicationGeneration.isCurrent(snapshot)) publicationMessage(error.status === 409 ? '幂等键冲突，请重新提交。' : ('提交失败：' + publicationErrorMessage(error))); }
+            });
+            document.getElementById('publication-status-list').addEventListener('click', async function(event) {
+                var cancel = event.target.closest('[data-publication-cancel]'); var validate = event.target.closest('[data-publication-validate]');
+                if (validate) { openPublicationValidation(validate.dataset.publicationValidate, validate); return; }
+                if (!cancel) return;
+                var snapshot = publicationGeneration.snapshot();
+                try { await publicationRequest('/api/model-publications/' + encodeURIComponent(cancel.dataset.publicationCancel) + '/cancel', { method: 'POST', headers: publicationHeaders(snapshot) }, snapshot); publicationMessage('取消请求已提交。'); await loadPublicationTasks(snapshot); }
+                catch (error) { if (!error.stale && publicationGeneration.isCurrent(snapshot)) publicationMessage(error.status === 409 ? '该任务当前不能取消。' : ('取消失败：' + publicationErrorMessage(error))); }
+            });
+            document.getElementById('publication-validate-cancel').addEventListener('click', closePublicationValidation);
+            document.getElementById('publication-validate-overlay').addEventListener('click', function(event) { if (event.target === this) closePublicationValidation(); });
+            document.getElementById('publication-validate-overlay').addEventListener('keydown', publicationTrapFocus);
+            document.getElementById('publication-validate-form').addEventListener('submit', async function(event) {
+                event.preventDefault();
+                var gpuIds = Array.from(document.querySelectorAll('input[name="publication-gpu"]:checked')).map(function(input) { return Number(input.value); });
+                var errorEl = document.getElementById('publication-validate-error');
+                if (!gpuIds.length) { errorEl.textContent = '必须明确选择至少一个验证 GPU。'; return; }
+                var taskId = publicationState.validationTaskId; var snapshot = publicationGeneration.snapshot();
+                try { await publicationRequest('/api/model-publications/' + encodeURIComponent(taskId) + '/validate', { method: 'POST', headers: publicationHeaders(snapshot), body: JSON.stringify({ gpu_ids: gpuIds }) }, snapshot); closePublicationValidation(); publicationMessage('验证已进入队列。'); await loadPublicationTasks(snapshot); }
+                catch (error) { if (!error.stale && publicationGeneration.isCurrent(snapshot)) errorEl.textContent = error.status === 409 ? '验证已经在队列中或任务状态已变化。' : ('验证失败：' + publicationErrorMessage(error)); }
+            });
+            publicationGeneration.changeToken(publicationToken());
+            renderPublicationTasks(); renderPublicationAssets();
+            if (publicationState.storageWarning) publicationMessage(publicationStorageWarning(''));
+        }
+
         function showRecipeDetail(recipeId) {
             fetch('/api/recipes/' + recipeId).then(r=>r.json()).then(d=>{
                 if (d.status !== 'success' || !d.recipe) {
@@ -366,10 +697,12 @@
                 var recipesResp = await fetch('/api/recipes');
                 var recipes = await recipesResp.json();
                 if (!recipes || recipes.status !== 'success' || !recipes.recipes || recipes.recipes.length === 0) {
+                    loadPublicationRecipes([]);
                     if (recipesEl) recipesEl.innerHTML = '<p class="limit-desc">暂无配方</p>';
                     return;
                 }
                 recipesData = recipes.recipes;
+                loadPublicationRecipes(recipesData);
                 recipesEl.innerHTML = recipes.recipes.map(function(r, i) {
                     var fullName = (r.custom_name || r.recipe_id || '未命名').toString();
                     var name = fullName.slice(0, 30);
@@ -387,9 +720,11 @@
                 if (baseEl) baseEl.innerHTML = '<p class="limit-desc">加载失败</p>';
                 if (mergedEl) mergedEl.innerHTML = '<p class="limit-desc">加载失败</p>';
                 if (recipesEl) recipesEl.innerHTML = '<p class="limit-desc">加载失败</p>';
+                loadPublicationRecipes([]);
             }
         }
-        document.getElementById('model-repo-refresh').onclick = function() { loadModelRepo(); };
+        bindPublicationControls();
+        document.getElementById('model-repo-refresh').onclick = function() { loadModelRepo(); loadPublicationTasks(); loadPublicationAssets(); };
         document.addEventListener('visibilitychange', function() { if (document.visibilityState === 'visible') loadModelRepo(); });
         loadModelRepo();
     </script>
