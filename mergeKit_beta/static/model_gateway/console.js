@@ -257,6 +257,8 @@
             setPublishedModelSummary(summary, [["类型", "待选择"], ["路径", "待选择"], ["兼容性", "待检查"]]);
             return;
         }
+        const maxModelLen = $("gateway-max-model-len");
+        if (maxModelLen) maxModelLen.value = model.artifact_type === "text" ? "65536" : "16384";
         setPublishedModelSummary(summary, [
             ["类型", model.artifact_type || "text"],
             ["路径", model.model_path || "不可用"],
@@ -358,6 +360,7 @@
                 gpu_memory_utilization: Number($("gateway-gpu-memory").value || 0.85),
                 dtype: $("gateway-dtype").value,
                 max_num_seqs: Number($("gateway-max-seqs").value || 8),
+                max_model_len: Number($("gateway-max-model-len").value || 16384),
                 trust_remote_code: $("gateway-trust-remote-code").checked
             };
             try {
@@ -372,6 +375,7 @@
                 $("gateway-tp").value = "1";
                 $("gateway-gpu-memory").value = "0.85";
                 $("gateway-max-seqs").value = "8";
+                $("gateway-max-model-len").value = "65536";
                 await loadAdminData();
                 showToast("服务配置已创建", "success");
             } catch (err) {

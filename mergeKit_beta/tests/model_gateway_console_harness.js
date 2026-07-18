@@ -48,7 +48,7 @@ const ids = [
     "gateway-stat-models", "gateway-runtime-text", "gateway-refresh-services",
     "gateway-create-service-form", "gateway-display-name", "gateway-served-name",
     "gateway-gpu-ids", "gateway-tp", "gateway-gpu-memory", "gateway-dtype",
-    "gateway-max-seqs", "gateway-trust-remote-code", "gateway-user-api-key",
+    "gateway-max-seqs", "gateway-max-model-len", "gateway-trust-remote-code", "gateway-user-api-key",
     "gateway-chat-model", "gateway-refresh-v1-models", "gateway-chat-form",
     "gateway-chat-input", "gateway-max-tokens", "gateway-temperature", "gateway-top-p",
     "gateway-cancel-request-id", "gateway-chat-output", "gateway-usage-line",
@@ -76,6 +76,12 @@ const document = {
 };
 
 const candidates = [{
+    model_id: "text-model",
+    display_name: "Text Model",
+    artifact_type: "text",
+    model_path: "/data/PublishedModels/text-model",
+    selectable: true
+}, {
     model_id: "model-x",
     display_name: "Model X",
     artifact_type: "vlm<script>",
@@ -114,6 +120,11 @@ vm.runInNewContext(
     { filename: "console.js" }
 );
 
+const consoleSource = fs.readFileSync(require.resolve("../static/model_gateway/console.js"), "utf8");
+const consoleTemplate = fs.readFileSync(require.resolve("../templates/model_gateway/console.html"), "utf8");
+assert.match(consoleSource, /max_model_len/);
+assert.match(consoleTemplate, /gateway-max-model-len/);
+
 (async () => {
     await document.domReady();
     elements["gateway-admin-token"].value = "admin";
@@ -130,6 +141,12 @@ vm.runInNewContext(
     ]);
     assert.strictEqual(summary.innerHTML, "", "summary must be built with DOM text nodes");
     assert.strictEqual(summary.children[0].children.length, 0, "candidate text must not create markup");
+    select.value = "text-model";
+    await select.dispatch("change");
+    assert.strictEqual(elements["gateway-max-model-len"].value, "65536");
+    select.value = "model-x";
+    await select.dispatch("change");
+    assert.strictEqual(elements["gateway-max-model-len"].value, "16384");
     select.value = "";
     await select.dispatch("change");
     assert.deepStrictEqual(summary.children.map((child) => child.textContent), [

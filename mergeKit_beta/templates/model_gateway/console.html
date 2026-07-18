@@ -174,6 +174,15 @@
                                 <input id="gateway-max-seqs" name="max_num_seqs" type="number" min="1" value="8">
                             </div>
                         </div>
+                        <div class="gateway-field">
+                            <label for="gateway-max-model-len">上下文上限</label>
+                            <select id="gateway-max-model-len" name="max_model_len">
+                                <option value="65536">64K（文本模型稳妥值）</option>
+                                <option value="32768">32K（更保守）</option>
+                                <option value="16384">16K（最低显存压力）</option>
+                            </select>
+                            <small>限制单次上下文，避免直接使用模型声明的超大长度耗尽 KV Cache。</small>
+                        </div>
                         <label class="gateway-check">
                             <input id="gateway-trust-remote-code" name="trust_remote_code" type="checkbox">
                             <span>允许模型加载自定义代码</span>

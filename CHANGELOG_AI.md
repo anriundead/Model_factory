@@ -1,7 +1,15 @@
 # AI 辅助开发记录
 
 > 本文件记录 AI 辅助分析、设计、实现和验收状态，不替代正式产品 CHANGELOG、Git 历史或发布说明。
-> 最后更新：2026-07-17（Asia/Shanghai）
+> 最后更新：2026-07-18（Asia/Shanghai）
+
+## 2026-07-18：Gateway 上下文上限与 vLLM 启动失败修复
+
+- 根因：文本服务创建时前端未提交 `max_model_len`，vLLM 继承 Qwen 模型的 128K 默认值，单卡 KV Cache 只能容纳约 102K tokens，启动因此退出。
+- 修复：管理员服务表单提交文本 64K/VLM 16K；后端对遗漏参数应用安全默认值并拒绝超过首发上限的值。
+- 修复：已知 KV Cache 启动失败写入脱敏、可操作的 `last_error`，不把 vLLM 日志正文写入数据库。
+- 回归：主工作树容器 `unittest` 为 `361` 项通过；Gateway runtime 重点测试、前端 harness、JS 语法和 `git diff --check` 通过。
+- 待完成：主容器重建后使用 GPU 0 做一次真实 7B 启动和 OpenAI-compatible 对话验收；测试结束停止服务并撤销临时 Key。
 
 ## 当前版本状态
 

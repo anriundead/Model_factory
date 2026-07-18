@@ -47,6 +47,13 @@ class RuntimeTestCase(unittest.TestCase):
 
 
 class TestRuntimeValidation(RuntimeTestCase):
+    def test_safe_default_max_model_len_is_bounded_by_service_type(self):
+        from app.model_gateway.runtime import safe_default_max_model_len
+
+        self.assertEqual(safe_default_max_model_len("text"), 65536)
+        self.assertEqual(safe_default_max_model_len("vlm"), 16384)
+        self.assertEqual(safe_default_max_model_len("unknown"), 16384)
+
     def test_pid_alive_treats_a_zombie_process_as_exited(self):
         from app.model_gateway.runtime import _pid_alive
 
@@ -170,6 +177,24 @@ class TestRuntimeValidation(RuntimeTestCase):
 
 
 class TestRuntimeCommand(RuntimeTestCase):
+    def test_vllm_kv_cache_failure_is_explained_without_persisting_log_content(self):
+        from app.model_gateway.runtime import describe_vllm_exit
+
+        log_path = os.path.join(self.tmp, "vllm.log")
+        with open(log_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "ValueError: The model's max seq len (128000) is larger than "
+                "the maximum number of tokens that can be stored in KV cache (102368)."
+            )
+
+        message = describe_vllm_exit(log_path, 1)
+
+        self.assertEqual(
+            message,
+            "vLLM exited early: configured context length exceeds available KV cache; "
+            "lower max_model_len or increase GPU memory utilization",
+        )
+
     def test_build_vllm_command_uses_loopback_and_whitelisted_args(self):
         from app.model_gateway.models import ServingModelService
         from app.model_gateway.runtime import build_vllm_command

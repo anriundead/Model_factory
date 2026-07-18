@@ -35,7 +35,7 @@ from app.model_gateway.models import (
 from app.model_gateway.documents import save_upload, validate_public_source_url
 from app.model_gateway.queue import enqueue_research_file, enqueue_research_job
 from app.model_gateway.quotas import QuotaExceeded, release_quota, reserve_quota
-from app.model_gateway.runtime import ServiceStateError, start_service, stop_service
+from app.model_gateway.runtime import ServiceStateError, effective_max_model_len, start_service, stop_service
 
 
 model_gateway_bp = Blueprint("model_gateway", __name__)
@@ -352,6 +352,7 @@ def admin_create_model_service():
                 if serving.get("status") != "ready":
                     code = serving.get("reason_code") or "asset_unavailable"
                     raise PublicationError(code, "published asset is not selectable")
+                max_model_len = effective_max_model_len(manifest.get("artifact_type"), max_model_len)
                 model_snapshot = {"id": model.id, "path": model.path}
                 core_session.rollback()
             finally:
@@ -391,6 +392,8 @@ def admin_create_model_service():
                 gateway_session.close()
     except PublicationError as exc:
         return _asset_error(exc)
+    except ServiceStateError as exc:
+        return _error(400, exc.code, str(exc))
     except IntegrityError:
         return _error(409, "served_model_name_exists", "served_model_name already exists")
     return jsonify({"status": "success", "service": service_payload}), 201

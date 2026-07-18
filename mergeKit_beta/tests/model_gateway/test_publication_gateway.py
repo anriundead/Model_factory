@@ -172,6 +172,13 @@ class TestPublishedServiceLifecycle(PublicationGatewayTestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.get_json()["service"]["model_path"], self.published_text.path)
+        self.assertEqual(response.get_json()["service"]["max_model_len"], 65536)
+
+    def test_create_rejects_context_above_safe_text_limit(self):
+        response = self._create(max_model_len=128000)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error"]["code"], "invalid_max_model_len")
 
     def test_create_uses_full_hash_validation(self):
         from app.model_gateway.routes import _formal_published_asset

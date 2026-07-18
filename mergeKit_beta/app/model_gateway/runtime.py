@@ -24,12 +24,47 @@ RUNTIME_STATES = ("starting", "running", "stopping")
 RECOVERY_REASON = "system_restarted_manual_recovery_required"
 INFLIGHT_REQUEST_STATES = ("running", "streaming", "cancel_requested")
 MAX_LIFECYCLE_ERROR_LENGTH = 2048
+TEXT_MAX_MODEL_LEN = 65536
+VLM_MAX_MODEL_LEN = 16384
 
 
 class ServiceStateError(ValueError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+def safe_default_max_model_len(model_type: str | None) -> int:
+    """Return the first-serving context cap for the model class."""
+    return TEXT_MAX_MODEL_LEN if (model_type or "").lower() == "text" else VLM_MAX_MODEL_LEN
+
+
+def effective_max_model_len(model_type: str | None, requested: int | None) -> int:
+    """Apply a bounded default before vLLM can inherit an unsafe model default."""
+    limit = safe_default_max_model_len(model_type)
+    value = limit if requested in (None, 0) else int(requested)
+    if value < 1024 or value > limit:
+        raise ServiceStateError(
+            "invalid_max_model_len",
+            f"max_model_len must be between 1024 and {limit} for this model type",
+        )
+    return value
+
+
+def describe_vllm_exit(log_path: str, returncode: int | None) -> str:
+    """Map known startup failures to a safe, actionable lifecycle message."""
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(max(0, os.fstat(handle.fileno()).st_size - 65536))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        tail = ""
+    if "maximum number of tokens that can be stored in KV cache" in tail:
+        return (
+            "vLLM exited early: configured context length exceeds available KV cache; "
+            "lower max_model_len or increase GPU memory utilization"
+        )
+    return f"vLLM exited early with code {returncode}"
 
 
 def should_recover_services_on_start() -> bool:
@@ -448,7 +483,7 @@ def start_service(service_id: str, config=None, timeout_s: int = 120) -> Serving
                     status="failed",
                     vllm_pid=None,
                     vllm_pgid=None,
-                    last_error=f"vLLM exited early with code {proc.returncode}",
+                    last_error=describe_vllm_exit(log_path, proc.returncode),
                     stopped_at=datetime.utcnow(),
                 )
                 if service is None:
